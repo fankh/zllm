@@ -2,11 +2,13 @@ use zllm::backend::dummy::DummyBackend;
 use zllm::backend::traits::Backend;
 use zllm::engine::hooks::registry::HookRegistry;
 use zllm::engine::hooks::traits::{HookAction, HookContext};
+use zllm::engine::memory_store::{MemoryCategory, MemoryMetadata, MemoryStore};
 use zllm::engine::reasoning_budget::{ReasoningBudget, ReasoningState, TokenImportanceScorer};
 use zllm::engine::runner::InferenceRunner;
 use zllm::engine::sampler::{SamplerConfig, sample};
 use zllm::memory::allocator::PagedAllocator;
 use zllm::memory::isolation::TenantMemoryPool;
+use std::sync::{Arc, RwLock};
 
 #[test]
 fn test_dummy_backend() {
@@ -208,10 +210,11 @@ fn test_runner_with_budget() {
     let config = SamplerConfig::default();
     let budget = ReasoningBudget::from_tenant_tier("free"); // max 2 loops
 
-    let result = runner.generate(&prompt, 5, &config, &budget);
+    let result = runner.generate(&prompt, 5, &config, &budget, "req-1", "tenant-a");
     assert!(result.tokens.len() <= 5);
     assert!(result.reasoning_loops_used <= 2); // budget enforced
     assert!(!result.early_exit);
+    assert_eq!(result.memories_captured, 1); // always captures reasoning state
 }
 
 #[test]
@@ -221,11 +224,182 @@ fn test_runner_premium_budget() {
 
     let prompt = vec![1u32; 10];
     let config = SamplerConfig::default();
-    let budget = ReasoningBudget::from_tenant_tier("premium"); // max 16 loops, adaptive
+    let budget = ReasoningBudget::from_tenant_tier("premium");
 
-    let result = runner.generate(&prompt, 5, &config, &budget);
+    let result = runner.generate(&prompt, 5, &config, &budget, "req-2", "tenant-a");
     assert!(result.tokens.len() <= 5);
-    // Premium with adaptive: actual loops depends on token importance
     assert!(result.reasoning_loops_used <= 16);
     assert!(result.avg_token_importance >= 0.0);
+    assert_eq!(result.memories_captured, 1);
+}
+
+// --- Memory Store Tests ---
+
+#[test]
+fn test_memory_store_persist() {
+    let mut store = MemoryStore::new(100, 50);
+
+    let vector = vec![1.0f32; 128];
+    let metadata = MemoryMetadata {
+        source_request_id: "req-1".into(),
+        tenant_id: "tenant-a".into(),
+        layer_captured: 12,
+        category: MemoryCategory::Finding,
+        tags: vec!["sqli".into()],
+        text_summary: "SQL injection found".into(),
+    };
+
+    store.store("finding-1".into(), vector, metadata);
+    assert_eq!(store.entry_count(), 1);
+
+    let entry = store.get("finding-1").unwrap();
+    assert_eq!(entry.metadata.category, MemoryCategory::Finding);
+    assert_eq!(entry.access_count, 1);
+}
+
+#[test]
+fn test_memory_store_query_by_category() {
+    let mut store = MemoryStore::new(100, 50);
+
+    store.store("f1".into(), vec![1.0; 64], MemoryMetadata {
+        source_request_id: "r1".into(),
+        tenant_id: "t1".into(),
+        layer_captured: 12,
+        category: MemoryCategory::Finding,
+        tags: vec![],
+        text_summary: "Finding 1".into(),
+    });
+    store.store("c1".into(), vec![2.0; 64], MemoryMetadata {
+        source_request_id: "r2".into(),
+        tenant_id: "t1".into(),
+        layer_captured: 8,
+        category: MemoryCategory::Context,
+        tags: vec![],
+        text_summary: "Context 1".into(),
+    });
+
+    let findings = store.query_by_category(&MemoryCategory::Finding);
+    assert_eq!(findings.len(), 1);
+    let contexts = store.query_by_category(&MemoryCategory::Context);
+    assert_eq!(contexts.len(), 1);
+}
+
+#[test]
+fn test_memory_store_similarity_query() {
+    let mut store = MemoryStore::new(100, 50);
+
+    // Store two vectors: one similar to query, one different
+    store.store("similar".into(), vec![1.0, 0.0, 1.0, 0.0], MemoryMetadata {
+        source_request_id: "r1".into(),
+        tenant_id: "t1".into(),
+        layer_captured: 12,
+        category: MemoryCategory::Finding,
+        tags: vec![],
+        text_summary: "Similar".into(),
+    });
+    store.store("different".into(), vec![0.0, 1.0, 0.0, 1.0], MemoryMetadata {
+        source_request_id: "r2".into(),
+        tenant_id: "t1".into(),
+        layer_captured: 12,
+        category: MemoryCategory::Context,
+        tags: vec![],
+        text_summary: "Different".into(),
+    });
+
+    let query = vec![1.0, 0.0, 1.0, 0.0]; // identical to "similar"
+    let results = store.query_by_similarity(&query, 2);
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].0.key, "similar"); // most similar first
+}
+
+#[test]
+fn test_memory_store_eviction() {
+    let mut store = MemoryStore::new(3, 10); // max 3 entries
+
+    for i in 0..5 {
+        store.store(format!("entry-{i}"), vec![i as f32; 64], MemoryMetadata {
+            source_request_id: format!("r{i}"),
+            tenant_id: "t1".into(),
+            layer_captured: 12,
+            category: MemoryCategory::Context,
+            tags: vec![],
+            text_summary: format!("Entry {i}"),
+        });
+    }
+
+    // Should never exceed max
+    assert!(store.entry_count() <= 3);
+}
+
+#[test]
+fn test_memory_injection_across_requests() {
+    let memory = Arc::new(RwLock::new(MemoryStore::new(100, 50)));
+    let backend1 = DummyBackend::new(32000, 4096, 32);
+    let runner = InferenceRunner::new(Box::new(backend1), 4096, 8)
+        .with_memory(memory.clone());
+
+    let config = SamplerConfig::default();
+    let budget = ReasoningBudget::from_tenant_tier("standard");
+
+    // Request 1: generates and captures reasoning state
+    let result1 = runner.generate(&vec![1u32; 10], 3, &config, &budget, "req-1", "tenant-a");
+    assert_eq!(result1.memories_captured, 1);
+
+    // Verify memory was stored
+    let store = memory.read().unwrap();
+    assert!(store.entry_count() >= 1);
+    let tenant_mems = store.query_by_tenant("tenant-a");
+    assert!(!tenant_mems.is_empty());
+    drop(store);
+
+    // Request 2: should inject memory from request 1
+    let result2 = runner.generate(&vec![2u32; 10], 3, &config, &budget, "req-2", "tenant-a");
+    assert_eq!(result2.memories_injected, 1); // injected from req-1
+    assert_eq!(result2.memories_captured, 1); // captured its own state
+}
+
+#[test]
+fn test_inspection_trace() {
+    let backend = DummyBackend::new(32000, 4096, 32);
+    let runner = InferenceRunner::new(Box::new(backend), 4096, 8)
+        .with_inspection(true);
+
+    let config = SamplerConfig::default();
+    let budget = ReasoningBudget::from_tenant_tier("free");
+
+    let result = runner.generate(&vec![1u32; 10], 3, &config, &budget, "req-trace", "tenant-a");
+    assert!(result.inspection_trace.is_some());
+
+    let trace = result.inspection_trace.unwrap();
+    assert_eq!(trace.request_id, "req-trace");
+    assert!(!trace.layers.is_empty());
+
+    // Should have snapshots for zone 1 (8) + zone 2 (reasoning) + zone 3 (16)
+    // Each layer in each zone produces a snapshot
+    assert!(trace.layers.len() >= 8); // at least zone 1
+
+    // Each snapshot should have valid data
+    for snap in &trace.layers {
+        assert!(snap.hidden_state_norm >= 0.0);
+        assert!(!snap.top_activations.is_empty());
+    }
+}
+
+#[test]
+fn test_inspection_trace_stored_in_memory() {
+    let memory = Arc::new(RwLock::new(MemoryStore::new(100, 50)));
+    let backend = DummyBackend::new(32000, 4096, 32);
+    let runner = InferenceRunner::new(Box::new(backend), 4096, 8)
+        .with_memory(memory.clone())
+        .with_inspection(true);
+
+    let config = SamplerConfig::default();
+    let budget = ReasoningBudget::from_tenant_tier("free");
+
+    runner.generate(&vec![1u32; 10], 3, &config, &budget, "req-t1", "tenant-a");
+
+    let store = memory.read().unwrap();
+    assert_eq!(store.trace_count(), 1);
+    let trace = store.get_trace_by_request("req-t1").unwrap();
+    assert_eq!(trace.request_id, "req-t1");
 }
