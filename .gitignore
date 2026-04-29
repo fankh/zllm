@@ -1,0 +1,9 @@
+/target
+*.pdb
+models/
+*.bin
+*.gguf
+*.safetensors
+.DS_Store
+.idea/
+.vscode/

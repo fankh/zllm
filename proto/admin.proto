@@ -1,0 +1,54 @@
+syntax = "proto3";
+package zllm.admin;
+
+service AdminService {
+  rpc CreateTenant(CreateTenantRequest) returns (CreateTenantResponse);
+  rpc ListTenants(ListTenantsRequest) returns (ListTenantsResponse);
+  rpc ConfigureHook(ConfigureHookRequest) returns (ConfigureHookResponse);
+  rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse);
+}
+
+message CreateTenantRequest {
+  string name = 1;
+  uint64 quota_mb = 2;
+  repeated string default_hooks = 3;
+}
+
+message CreateTenantResponse {
+  string tenant_id = 1;
+  string api_key = 2;
+}
+
+message ListTenantsRequest {}
+
+message ListTenantsResponse {
+  repeated TenantInfo tenants = 1;
+}
+
+message TenantInfo {
+  string tenant_id = 1;
+  string name = 2;
+  uint64 memory_used_mb = 3;
+  uint64 quota_mb = 4;
+}
+
+message ConfigureHookRequest {
+  string tenant_id = 1;
+  string hook_type = 2;         // "steering", "early_exit", "consistency"
+  uint32 target_layer = 3;
+  float threshold = 4;
+  bytes vector_data = 5;        // Steering vector binary data
+}
+
+message ConfigureHookResponse {
+  string hook_id = 1;
+  bool success = 2;
+}
+
+message GetMetricsRequest {
+  string tenant_id = 1;         // Empty = global metrics
+}
+
+message GetMetricsResponse {
+  string prometheus_text = 1;   // Prometheus exposition format
+}

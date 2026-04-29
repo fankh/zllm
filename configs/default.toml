@@ -1,0 +1,23 @@
+[server]
+grpc_port = 50051
+rest_port = 8080
+max_concurrent = 32
+
+[model]
+path = "models/llama3.1-8b-q4.bin"
+quantization = "q4"
+max_seq_len = 8192
+
+[engine]
+encoder_layers = 8
+reasoning_layers = 8
+max_loops = 16
+confidence_threshold = 0.9
+default_temperature = 1.0
+default_top_k = 50
+default_top_p = 0.9
+
+[memory]
+block_size = 16
+max_blocks = 65536
+max_tenants = 64
