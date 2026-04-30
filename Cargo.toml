@@ -42,6 +42,13 @@ prometheus = "0.14"
 # Streaming
 tokio-stream = "0.1"
 
+# ML inference (candle)
+candle-core = "0.10"
+candle-nn = "0.10"
+candle-transformers = "0.10"
+tokenizers = "0.21"
+hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "ureq"] }
+
 # Utilities
 bitvec = "1"
 rand = "0.9"
