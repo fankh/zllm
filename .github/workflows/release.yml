@@ -69,7 +69,7 @@ jobs:
         with:
           cuda: '12.5.0'
           method: 'network'
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev"]'
+          sub-packages: '["nvcc", "cudart"]'
 
       - name: Build (CPU)
         if: matrix.accel == 'cpu'
@@ -77,6 +77,12 @@ jobs:
 
       - name: Build (CUDA)
         if: matrix.accel == 'cuda'
+        env:
+          # No GPU on CI runners — must set compute cap explicitly so
+          # candle-kernels' build.rs doesn't call nvidia-smi. 89 = Ada
+          # Lovelace; the resulting PTX is forward-compatible to newer
+          # arches via JIT, but won't run on cards older than ~RTX 40.
+          CUDA_COMPUTE_CAP: '89'
         run: cargo build --release --locked --target ${{ matrix.target }} --features cuda
 
       - name: Build (Metal)
@@ -123,6 +129,11 @@ jobs:
   release:
     name: Create GitHub release
     needs: build
+    # Run even if some matrix builds failed — ship whatever subset succeeded.
+    # If literally zero artifacts were produced, the download/upload steps
+    # below will fail loudly (fail_on_unmatched_files: true), which is the
+    # correct behavior. Skip only on explicit workflow cancellation.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
