@@ -106,6 +106,14 @@ async fn main() -> anyhow::Result<()> {
             let cfg = config::ZllmConfig::load(&config)?;
             tracing::info!("Starting ZLLM server (REST: {}, gRPC: {})", cfg.server.rest_port, cfg.server.grpc_port);
 
+            // Shared memory store + goal manager (in-memory, no persistence).
+            let memory_store = std::sync::Arc::new(std::sync::RwLock::new(
+                engine::memory_store::MemoryStore::new(1024, 256),
+            ));
+            let goal_manager = std::sync::Arc::new(
+                control_plane::goal_manager::GoalManager::new(memory_store.clone()),
+            );
+
             // Start REST server
             let rest_router = server::rest::router();
             let rest_addr = format!("0.0.0.0:{}", cfg.server.rest_port);
@@ -113,11 +121,15 @@ async fn main() -> anyhow::Result<()> {
             // Start gRPC server
             let grpc_addr = format!("0.0.0.0:{}", cfg.server.grpc_port).parse()?;
             let grpc_service = server::grpc::ZllmInferenceService;
+            let goal_service = server::grpc::ZllmGoalService::new(goal_manager.clone());
 
             let grpc_handle = tokio::spawn(async move {
                 tonic::transport::Server::builder()
                     .add_service(
                         server::grpc::inference_proto::inference_service_server::InferenceServiceServer::new(grpc_service),
+                    )
+                    .add_service(
+                        server::grpc::control_proto::goal_service_server::GoalServiceServer::new(goal_service),
                     )
                     .serve(grpc_addr)
                     .await

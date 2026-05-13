@@ -54,5 +54,18 @@ bitvec = "1"
 rand = "0.9"
 uuid = { version = "1", features = ["v4"] }
 
+[features]
+default = []
+cuda = [
+    "candle-core/cuda",
+    "candle-nn/cuda",
+    "candle-transformers/cuda",
+]
+metal = [
+    "candle-core/metal",
+    "candle-nn/metal",
+    "candle-transformers/metal",
+]
+
 [build-dependencies]
 tonic-build = "0.12"

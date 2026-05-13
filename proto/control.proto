@@ -1,0 +1,90 @@
+syntax = "proto3";
+package zllm.control;
+
+// GoalService — installed-app control plane for agent goal/task/status state.
+// No tenant_id fields: single-user, single-scope.
+
+service GoalService {
+  rpc SetGoal(SetGoalRequest) returns (SetGoalResponse);
+  rpc ListGoals(ListGoalsRequest) returns (ListGoalsResponse);
+  rpc SetCurrentGoal(SetCurrentGoalRequest) returns (SetCurrentGoalResponse);
+  rpc AddTask(AddTaskRequest) returns (AddTaskResponse);
+  rpc UpdateTask(UpdateTaskRequest) returns (UpdateTaskResponse);
+  rpc SetStatus(SetStatusRequest) returns (SetStatusResponse);
+  rpc GetState(GetStateRequest) returns (GetStateResponse);
+}
+
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_STATUS_ACTIVE = 1;
+  TASK_STATUS_DONE = 2;
+  TASK_STATUS_BLOCKED = 3;
+}
+
+message Goal {
+  string goal_id = 1;
+  string text = 2;
+  bool is_current = 3;
+}
+
+message Task {
+  string task_id = 1;
+  string goal_id = 2;
+  string text = 3;
+  TaskStatus status = 4;
+}
+
+message Status {
+  string text = 1;
+  string goal_id = 2;
+}
+
+message SetGoalRequest {
+  string text = 1;
+}
+message SetGoalResponse {
+  string goal_id = 1;
+}
+
+message ListGoalsRequest {}
+message ListGoalsResponse {
+  repeated Goal goals = 1;
+}
+
+message SetCurrentGoalRequest {
+  string goal_id = 1;
+}
+message SetCurrentGoalResponse {
+  bool success = 1;
+}
+
+message AddTaskRequest {
+  string goal_id = 1;
+  string text = 2;
+}
+message AddTaskResponse {
+  string task_id = 1;
+}
+
+message UpdateTaskRequest {
+  string task_id = 1;
+  TaskStatus status = 2;
+}
+message UpdateTaskResponse {
+  bool success = 1;
+}
+
+message SetStatusRequest {
+  string text = 1;
+}
+message SetStatusResponse {
+  bool success = 1;
+}
+
+message GetStateRequest {}
+message GetStateResponse {
+  Goal current_goal = 1;
+  repeated Task active_tasks = 2;
+  Status latest_status = 3;
+  string prompt_prefix = 4;
+}
