@@ -60,20 +60,28 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install CUDA toolkit
+        # Linux: minimal install via Jimver (nvcc + cudart), the rest comes
+        # from apt below — Jimver's sub-packages parameter can't express
+        # CUDA 12's renamed `libcublas-*`/`libcurand-*` packages on Linux.
+        # Windows: Jimver knows the right NVIDIA component IDs and installs
+        # them cleanly, so list everything we need here.
         if: matrix.accel == 'cuda'
         uses: Jimver/cuda-toolkit@v0.2.18
         with:
           cuda: '12.5.0'
           method: 'network'
-          sub-packages: '["nvcc", "cudart"]'
+          sub-packages: ${{ runner.os == 'Windows'
+            && '["nvcc", "cudart", "nvrtc", "nvrtc_dev", "cublas", "cublas_dev", "curand", "curand_dev"]'
+            || '["nvcc", "cudart"]' }}
 
       - name: Install CUDA dev libs (Linux)
-        # Jimver's sub-packages can only express old `cuda-cublas-*` style
-        # names; CUDA 12 renamed these to `libcublas-*`/`libcurand-*`, so
-        # add them via apt directly. candle-kernels links -lcublas -lcurand
-        # -lcublasLt at build time, not just at runtime.
+        # candle-kernels links -lcublas -lcurand -lcublasLt -lnvrtc at build
+        # time. CUDA 12 split these out of the cuda-* apt namespace into
+        # libcublas-*/libcurand-* (but nvrtc kept the cuda-* prefix — NVIDIA
+        # was inconsistent in the rename). Install the -dev variants so the
+        # linker finds the .so symlinks.
         if: matrix.accel == 'cuda' && runner.os == 'Linux'
-        run: sudo apt-get install -y libcublas-dev-12-5 libcurand-dev-12-5
+        run: sudo apt-get install -y libcublas-dev-12-5 libcurand-dev-12-5 cuda-nvrtc-dev-12-5
 
       - name: Enable MSVC dev shell (Windows CUDA)
         # nvcc needs cl.exe on PATH to compile .cu files into host code.
