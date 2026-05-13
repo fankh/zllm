@@ -19,7 +19,6 @@ pub struct MemoryEntry {
 #[derive(Debug, Clone)]
 pub struct MemoryMetadata {
     pub source_request_id: String,
-    pub tenant_id: String,
     pub layer_captured: usize,
     pub category: MemoryCategory,
     pub tags: Vec<String>,
@@ -319,21 +318,6 @@ impl MemoryStore {
             .collect()
     }
 
-    /// Returns entries owned by the given tenant. **Deprecated**: tenant
-    /// isolation belongs in a gateway in front of the engine, not inside it.
-    /// New code should not call this — kept for backward compatibility with
-    /// existing tests and `build_injection_vector`.
-    #[deprecated(
-        note = "tenant isolation belongs in a gateway, not in the engine; new code should not depend on this"
-    )]
-    pub fn query_by_tenant(&self, tenant_id: &str) -> Vec<&MemoryEntry> {
-        let now = self.now();
-        self.entries
-            .values()
-            .filter(|e| e.metadata.tenant_id == tenant_id && !Self::is_expired(e, now))
-            .collect()
-    }
-
     pub fn query_by_tag(&self, tag: &str) -> Vec<&MemoryEntry> {
         let now = self.now();
         let Some(keys) = self.by_tag.get(tag) else {
@@ -371,22 +355,21 @@ impl MemoryStore {
     pub fn build_injection_vector(
         &self,
         query_vector: &Tensor,
-        tenant_id: &str,
         max_memories: usize,
         alpha: f32,
     ) -> Option<Tensor> {
         let now = self.now();
-        let tenant_memories: Vec<&MemoryEntry> = self
+        let live_memories: Vec<&MemoryEntry> = self
             .entries
             .values()
-            .filter(|e| e.metadata.tenant_id == tenant_id && !Self::is_expired(e, now))
+            .filter(|e| !Self::is_expired(e, now))
             .collect();
 
-        if tenant_memories.is_empty() {
+        if live_memories.is_empty() {
             return None;
         }
 
-        let mut scored: Vec<(&MemoryEntry, f32)> = tenant_memories
+        let mut scored: Vec<(&MemoryEntry, f32)> = live_memories
             .into_iter()
             .map(|entry| {
                 let sim = cosine_similarity(&entry.vector, query_vector);
@@ -433,7 +416,6 @@ impl MemoryStore {
     pub fn build_injection_vector_by_categories(
         &self,
         query_vector: &Tensor,
-        tenant_id: &str,
         weights: &[(MemoryCategory, f32, usize)],
     ) -> Option<Tensor> {
         let now = self.now();
@@ -446,7 +428,7 @@ impl MemoryStore {
             let cat_memories: Vec<&MemoryEntry> = keys
                 .iter()
                 .filter_map(|k| self.entries.get(k))
-                .filter(|e| e.metadata.tenant_id == tenant_id && !Self::is_expired(e, now))
+                .filter(|e| !Self::is_expired(e, now))
                 .collect();
 
             if cat_memories.is_empty() {
@@ -676,7 +658,6 @@ mod tests {
     fn meta(category: MemoryCategory) -> MemoryMetadata {
         MemoryMetadata {
             source_request_id: "test".into(),
-            tenant_id: "local".into(),
             layer_captured: 0,
             category,
             tags: vec![],
@@ -692,13 +673,13 @@ mod tests {
 
         let query = vec![1.0; 8];
         let with_both = s
-            .build_injection_vector(&query, "local", 8, 1.0)
+            .build_injection_vector(&query, 8, 1.0)
             .expect("expected injection");
 
         let mut s_real_only = MemoryStore::new(16, 4);
         s_real_only.store("real".into(), vec![1.0; 8], meta(MemoryCategory::Context));
         let expected = s_real_only
-            .build_injection_vector(&query, "local", 8, 1.0)
+            .build_injection_vector(&query, 8, 1.0)
             .expect("expected injection");
 
         assert_eq!(with_both, expected);
@@ -714,7 +695,6 @@ mod tests {
         let out = s
             .build_injection_vector_by_categories(
                 &q,
-                "local",
                 &[(MemoryCategory::Goal, 0.5, 1), (MemoryCategory::Context, 0.1, 1)],
             )
             .expect("expected vector");

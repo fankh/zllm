@@ -3,7 +3,6 @@ use std::collections::VecDeque;
 #[derive(Debug, Clone)]
 pub struct InferRequest {
     pub request_id: String,
-    pub tenant_id: String,
     pub prompt_tokens: Vec<u32>,
     pub max_tokens: usize,
 }

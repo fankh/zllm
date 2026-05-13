@@ -37,7 +37,6 @@ impl Hook for MemoryInjectHook {
                 let key = format!("{}:layer{}:auto", context.request_id, layer_idx);
                 let metadata = crate::engine::memory_store::MemoryMetadata {
                     source_request_id: context.request_id.clone(),
-                    tenant_id: context.tenant_id.clone(),
                     layer_captured: layer_idx,
                     category: crate::engine::memory_store::MemoryCategory::Context,
                     tags: vec![],
@@ -63,10 +62,13 @@ impl Hook for MemoryInjectHook {
         // state. Firing on every loop_idx would let the same memory accumulate
         // too much influence on the hidden state.
         if layer_idx == self.inject_layer && loop_idx == 0 {
+            // `context` is intentionally unread on the inject path now that
+            // tenancy is gone — keep the param for future use (request_id
+            // could be logged).
+            let _ = context;
             if let Ok(store) = self.memory.read() {
                 if let Some(injection) = store.build_injection_vector(
                     hidden_state,
-                    &context.tenant_id,
                     self.max_memories,
                     self.alpha,
                 ) {

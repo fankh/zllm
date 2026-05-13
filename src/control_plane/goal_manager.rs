@@ -4,7 +4,6 @@ use crate::engine::memory_store::{
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
-const LOCAL_SCOPE: &str = "local";
 const D_MODEL_PLACEHOLDER: usize = 4096;
 const TAG_CURRENT: &str = "current";
 
@@ -116,7 +115,6 @@ impl GoalManager {
 
         let metadata = MemoryMetadata {
             source_request_id: format!("goal:{goal_id}"),
-            tenant_id: LOCAL_SCOPE.to_string(),
             layer_captured: 0,
             category: MemoryCategory::Goal,
             tags: vec![format!("goal:{goal_id}"), TAG_CURRENT.to_string()],
@@ -204,7 +202,6 @@ impl GoalManager {
         let mut store = self.store.write().expect("memory store poisoned");
         let metadata = MemoryMetadata {
             source_request_id: format!("task:{task_id}"),
-            tenant_id: LOCAL_SCOPE.to_string(),
             layer_captured: 0,
             category: MemoryCategory::Task,
             tags: vec![
@@ -284,7 +281,6 @@ impl GoalManager {
         let key = "status:current".to_string();
         let metadata = MemoryMetadata {
             source_request_id: key.clone(),
-            tenant_id: LOCAL_SCOPE.to_string(),
             layer_captured: 0,
             category: MemoryCategory::Status,
             tags: vec![format!("goal:{goal_id}")],
@@ -493,7 +489,6 @@ mod tests {
                     vec![0.5; 8],
                     MemoryMetadata {
                         source_request_id: "test".into(),
-                        tenant_id: "local".into(),
                         layer_captured: 0,
                         category: MemoryCategory::Context,
                         tags: vec![],

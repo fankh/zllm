@@ -30,7 +30,7 @@ impl ReasoningBudget {
         true
     }
 
-    pub fn from_tenant_tier(tier: &str) -> Self {
+    pub fn from_tier(tier: &str) -> Self {
         match tier {
             "free" => Self {
                 max_loops: 2,

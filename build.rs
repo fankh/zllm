@@ -5,7 +5,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compile_protos(
             &[
                 "proto/inference.proto",
-                "proto/admin.proto",
                 "proto/control.proto",
             ],
             &["proto/"],

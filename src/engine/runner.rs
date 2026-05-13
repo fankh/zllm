@@ -58,7 +58,26 @@ impl InferenceRunner {
     }
 
     pub fn with_memory(mut self, memory: Arc<RwLock<MemoryStore>>) -> Self {
-        self.memory = memory;
+        self.memory = memory.clone();
+        // The default `MemoryInjectHook` registered in `new()` points at the
+        // old (now-orphaned) internal store. Re-register it against the
+        // supplied memory so captures actually land where callers expect.
+        // This also clears any other hooks the caller may have registered
+        // beforehand — callers wanting custom hooks should call
+        // `with_memory()` first, then `hooks_mut().register(...)` for their
+        // additions.
+        self.hook_registry.clear();
+        let inject_layer = 8usize.saturating_sub(1);
+        let capture_layer = 8 + self.reasoning_layers - 1;
+        self.hook_registry.register(Box::new(
+            crate::engine::hooks::memory_inject::MemoryInjectHook {
+                memory,
+                inject_layer,
+                capture_layer,
+                alpha: 0.3,
+                max_memories: 5,
+            },
+        ));
         self
     }
 
@@ -82,7 +101,6 @@ impl InferenceRunner {
         config: &SamplerConfig,
         budget: &ReasoningBudget,
         request_id: &str,
-        tenant_id: &str,
     ) -> GenerationResult {
         let seq_len = prompt_tokens.len();
         let mut state = ReasoningState::new(seq_len);
@@ -129,7 +147,7 @@ impl InferenceRunner {
 
         // Zone 2: Reasoning loops (budgeted)
         let mut early_exit = false;
-        let hook_context = HookContext::new(tenant_id, request_id);
+        let hook_context = HookContext::new(request_id);
 
         for loop_idx in 0..n_loops_needed {
             if !budget.should_continue(&state) {

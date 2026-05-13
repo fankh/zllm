@@ -26,21 +26,6 @@ enum Commands {
         #[arg(short, long, default_value = "configs/default.toml")]
         config: PathBuf,
     },
-    /// Run performance benchmarks
-    Bench {
-        #[arg(short, long, default_value = "configs/default.toml")]
-        config: PathBuf,
-    },
-    /// Manage hooks
-    Hooks {
-        #[command(subcommand)]
-        action: HookAction,
-    },
-    /// Manage tenants
-    Tenants {
-        #[command(subcommand)]
-        action: TenantAction,
-    },
     /// Generate text from a prompt (CPU inference)
     Generate {
         #[arg(short, long)]
@@ -57,36 +42,6 @@ enum Commands {
         top_k: usize,
         #[arg(long, default_value = "0.9")]
         top_p: f32,
-    },
-    /// Show live metrics
-    Metrics,
-}
-
-#[derive(Subcommand)]
-enum HookAction {
-    /// List registered hooks
-    List,
-    /// Add a hook
-    Add {
-        #[arg(long)]
-        r#type: String,
-        #[arg(long)]
-        layer: usize,
-        #[arg(long, default_value = "0.9")]
-        threshold: f32,
-    },
-}
-
-#[derive(Subcommand)]
-enum TenantAction {
-    /// List tenants
-    List,
-    /// Create a tenant
-    Create {
-        #[arg(long)]
-        name: String,
-        #[arg(long, default_value = "4096")]
-        quota_mb: u64,
     },
 }
 
@@ -150,26 +105,6 @@ async fn main() -> anyhow::Result<()> {
                 },
             }
         }
-        Commands::Bench { config: _ } => {
-            tracing::info!("Benchmark mode (stub)");
-            println!("Benchmark not yet implemented. Use 'zllm serve' first.");
-        }
-        Commands::Hooks { action } => match action {
-            HookAction::List => {
-                println!("No hooks registered (engine not running).");
-            }
-            HookAction::Add { r#type, layer, threshold } => {
-                println!("Hook added (stub): type={}, layer={layer}, threshold={threshold}", r#type);
-            }
-        },
-        Commands::Tenants { action } => match action {
-            TenantAction::List => {
-                println!("No tenants (engine not running).");
-            }
-            TenantAction::Create { name, quota_mb } => {
-                println!("Tenant created (stub): name={name}, quota={quota_mb}MB");
-            }
-        },
         Commands::Generate {
             model,
             tokenizer,
@@ -250,9 +185,6 @@ async fn main() -> anyhow::Result<()> {
             println!();
             println!();
             println!("--- {} tokens in {:.2}s ({:.1} tok/s) ---", generated, elapsed.as_secs_f64(), tok_per_sec);
-        }
-        Commands::Metrics => {
-            println!("Metrics endpoint: http://localhost:8080/metrics (start server first)");
         }
     }
 

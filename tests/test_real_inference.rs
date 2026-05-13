@@ -177,12 +177,9 @@ fn test_hooks_on_real_backend() {
     assert_eq!(registry.count(), 2);
 
     // Fire hooks with a dummy hidden state
-    let context = HookContext {
-        tenant_id: "test".into(),
-        request_id: "req-hook-test".into(),
-        tokens_generated: 10,
-        current_confidence: 0.5,
-    };
+    let mut context = HookContext::new("req-hook-test");
+    context.tokens_generated = 10;
+    context.current_confidence = 0.5;
 
     // Test steering hook (layer 8)
     let mut hidden = vec![1.0f32; 2048];
@@ -230,7 +227,6 @@ fn test_memory_store_with_real_tokens() {
         finding_vector.clone(),
         MemoryMetadata {
             source_request_id: "req-1".into(),
-            tenant_id: "security-team".into(),
             layer_captured: 12,
             category: MemoryCategory::Finding,
             tags: vec!["sqli".into(), "critical".into()],
@@ -244,7 +240,6 @@ fn test_memory_store_with_real_tokens() {
         vec![0.3f32; 2048],
         MemoryMetadata {
             source_request_id: "req-2".into(),
-            tenant_id: "security-team".into(),
             layer_captured: 12,
             category: MemoryCategory::Finding,
             tags: vec!["xss".into(), "medium".into()],
@@ -269,8 +264,8 @@ fn test_memory_store_with_real_tokens() {
     assert_eq!(similar[0].0.key, "finding-sqli-1"); // most similar
     println!("Most similar memory: {} (score: {:.3})", similar[0].0.key, similar[0].1);
 
-    // Build injection vector for tenant
-    let injection = store.build_injection_vector(&query, "security-team", 5, 0.3);
+    // Build injection vector from all live memories
+    let injection = store.build_injection_vector(&query, 5, 0.3);
     assert!(injection.is_some(), "Should build injection from 2 memories");
     let inj = injection.unwrap();
     assert_eq!(inj.len(), 2048);
@@ -282,7 +277,7 @@ fn test_memory_store_with_real_tokens() {
 #[test]
 fn test_reasoning_budget_real_dimensions() {
     // Llama 3.2 1B: 16 layers, 2048 hidden, 8 reasoning layers
-    let budget = ReasoningBudget::from_tenant_tier("standard"); // max 8 loops
+    let budget = ReasoningBudget::from_tier("standard"); // max 8 loops
 
     // Memory per loop for 512 tokens, 2048 hidden, 8 reasoning layers
     let mem_per_loop = ReasoningBudget::estimate_memory_per_loop(512, 2048, 8);
@@ -296,7 +291,7 @@ fn test_reasoning_budget_real_dimensions() {
     assert!(total_mb <= budget.max_memory_mb, "Total should fit within budget");
 
     // Free tier: 2 loops * 16 MB = 32 MB (fits in 64 MB budget)
-    let free = ReasoningBudget::from_tenant_tier("free");
+    let free = ReasoningBudget::from_tier("free");
     let free_total = mem_per_loop * free.max_loops;
     println!("Free tier reasoning memory: {} MB (budget: {} MB)", free_total, free.max_memory_mb);
     assert!(free_total <= free.max_memory_mb);
@@ -337,7 +332,6 @@ fn test_full_pipeline_with_memory() {
             vec![0.42f32; 2048], // simulated hidden state from analysis
             MemoryMetadata {
                 source_request_id: "req-1".into(),
-                tenant_id: "team-a".into(),
                 layer_captured: 8,
                 category: MemoryCategory::Finding,
                 tags: vec!["buffer-overflow".into()],
@@ -359,18 +353,18 @@ fn test_full_pipeline_with_memory() {
     // Retrieve memory
     {
         let store = memory.read().unwrap();
-        let tenant_memories = store.query_by_tenant("team-a");
-        assert_eq!(tenant_memories.len(), 1);
-        println!("Retrieved memory: {}", tenant_memories[0].metadata.text_summary);
+        let findings = store.query_by_category(&MemoryCategory::Finding);
+        assert_eq!(findings.len(), 1);
+        println!("Retrieved memory: {}", findings[0].metadata.text_summary);
 
         let tag_memories = store.query_by_tag("buffer-overflow");
         assert_eq!(tag_memories.len(), 1);
 
         // Build injection from previous analysis
         let query = vec![0.4f32; 2048];
-        let injection = store.build_injection_vector(&query, "team-a", 5, 0.3);
+        let injection = store.build_injection_vector(&query, 5, 0.3);
         assert!(injection.is_some());
-        println!("Memory injection vector built from {} entries", tenant_memories.len());
+        println!("Memory injection vector built from {} entries", findings.len());
     }
 }
 

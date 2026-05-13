@@ -18,7 +18,6 @@ pub enum HookAction {
 /// switch to atomics if that ever becomes a need.
 #[derive(Debug, Clone)]
 pub struct HookContext {
-    pub tenant_id: String,
     pub request_id: String,
     pub tokens_generated: usize,
     pub current_confidence: f32,
@@ -34,9 +33,8 @@ impl HookContext {
     /// from filling the store inside a single inference call.
     pub const DEFAULT_STORES_PER_REQUEST: u32 = 4;
 
-    pub fn new(tenant_id: impl Into<String>, request_id: impl Into<String>) -> Self {
+    pub fn new(request_id: impl Into<String>) -> Self {
         Self {
-            tenant_id: tenant_id.into(),
             request_id: request_id.into(),
             tokens_generated: 0,
             current_confidence: 0.0,
