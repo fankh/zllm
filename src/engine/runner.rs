@@ -29,10 +29,28 @@ pub struct GenerationResult {
 
 impl InferenceRunner {
     pub fn new(backend: Box<dyn Backend>, d_model: usize, reasoning_layers: usize) -> Self {
+        let memory = Arc::new(RwLock::new(MemoryStore::new(1024, 256)));
+        let mut hook_registry = HookRegistry::new();
+        // Register the default MemoryInjectHook so cross-request memory
+        // works out of the box. v0.2 collapsed the previous inline
+        // inject/capture in this file into this single chokepoint —
+        // configure inject at the end of Zone 1 and capture at the end
+        // of Zone 2.
+        let inject_layer = 8usize.saturating_sub(1);
+        let capture_layer = 8 + reasoning_layers - 1;
+        hook_registry.register(Box::new(
+            crate::engine::hooks::memory_inject::MemoryInjectHook {
+                memory: memory.clone(),
+                inject_layer,
+                capture_layer,
+                alpha: 0.3,
+                max_memories: 5,
+            },
+        ));
         Self {
             backend,
-            hook_registry: HookRegistry::new(),
-            memory: Arc::new(RwLock::new(MemoryStore::new(1024, 256))),
+            hook_registry,
+            memory,
             d_model,
             reasoning_layers,
             enable_inspection: false,
@@ -75,8 +93,14 @@ impl InferenceRunner {
         );
 
         let mut layer_snapshots: Vec<LayerSnapshot> = Vec::new();
-        let mut memories_injected = 0usize;
-        let mut memories_captured = 0usize;
+        let memories_injected = 0usize;
+        let memories_captured = 0usize;
+        // Note: in v0.2 the inline inject/capture at the Zone 1/Zone 2 boundary
+        // was removed. Memory inject + capture is now driven by the
+        // `MemoryInjectHook` registered by default in `InferenceRunner::new()`
+        // — see the hook for the inject/capture layer indices. `memories_*`
+        // counters stay at zero in this code path; if you need accurate hook
+        // counters they should move into HookContext (atomic counters).
 
         // Zone 1: Encode (always runs once)
         let mut hidden = vec![0.1f32; seq_len * self.d_model];
@@ -85,22 +109,6 @@ impl InferenceRunner {
 
             if self.enable_inspection {
                 layer_snapshots.push(LayerSnapshot::from_hidden_state(layer_idx, 0, &hidden));
-            }
-        }
-
-        // Inject: retrieve relevant memories and add to hidden state after encoding
-        if let Ok(store) = self.memory.read() {
-            if let Some(injection) = store.build_injection_vector(
-                &hidden,
-                tenant_id,
-                5,    // max 5 memories
-                0.3,  // alpha = 0.3
-            ) {
-                for (h, v) in hidden.iter_mut().zip(injection.iter()) {
-                    *h += v;
-                }
-                memories_injected += 1;
-                tracing::debug!("Injected memory context for tenant {tenant_id}");
             }
         }
 
@@ -121,12 +129,7 @@ impl InferenceRunner {
 
         // Zone 2: Reasoning loops (budgeted)
         let mut early_exit = false;
-        let hook_context = HookContext {
-            tenant_id: tenant_id.to_string(),
-            request_id: request_id.to_string(),
-            tokens_generated: 0,
-            current_confidence: 0.0,
-        };
+        let hook_context = HookContext::new(tenant_id, request_id);
 
         for loop_idx in 0..n_loops_needed {
             if !budget.should_continue(&state) {
@@ -164,20 +167,10 @@ impl InferenceRunner {
             state.record_loop(memory_per_loop, confidence);
         }
 
-        // Capture: store final reasoning state as memory for future requests
-        if let Ok(mut store) = self.memory.write() {
-            let capture_key = format!("{request_id}:reasoning_final");
-            let metadata = crate::engine::memory_store::MemoryMetadata {
-                source_request_id: request_id.to_string(),
-                tenant_id: tenant_id.to_string(),
-                layer_captured: 8 + self.reasoning_layers - 1,
-                category: crate::engine::memory_store::MemoryCategory::Context,
-                tags: vec![],
-                text_summary: format!("Reasoning state after {} loops", state.loops_used),
-            };
-            store.store(capture_key, hidden.clone(), metadata);
-            memories_captured += 1;
-        }
+        // Capture is now handled by `MemoryInjectHook` firing at
+        // `capture_layer` inside the reasoning loop. The inline
+        // capture-at-end-of-Zone-2 path was removed in v0.2 to give us a
+        // single chokepoint that honors HookContext.stores_remaining.
 
         // Zone 3: Output layers (always runs once)
         for layer_idx in 8 + self.reasoning_layers..32 {

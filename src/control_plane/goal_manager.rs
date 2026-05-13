@@ -1,10 +1,22 @@
-use crate::engine::memory_store::{MemoryCategory, MemoryMetadata, MemoryStore};
+use crate::engine::memory_store::{
+    MemoryCategory, MemoryMetadata, MemoryStore, StoreOptions,
+};
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
 const LOCAL_SCOPE: &str = "local";
 const D_MODEL_PLACEHOLDER: usize = 4096;
 const TAG_CURRENT: &str = "current";
+
+/// Status entries decay after one hour — they're rolling snapshots, not
+/// durable state. Goals and active tasks are pinned and have no TTL.
+const STATUS_TTL_SECONDS: u64 = 3600;
+
+/// Pinned store for Goals and active Tasks — never evictable until the
+/// pin is cleared (e.g. `update_task` to `Done`).
+fn pinned_no_ttl() -> StoreOptions {
+    StoreOptions { pinned: true, ttl_seconds: None }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStatus {
@@ -97,7 +109,8 @@ impl GoalManager {
                 let mut new_meta = e.metadata.clone();
                 new_meta.tags.retain(|t| t != TAG_CURRENT);
                 let new_vec = e.vector.clone();
-                store.store(key, new_vec, new_meta);
+                // Stays pinned — it's still a goal, just no longer current.
+                let _ = store.store_with_options(key, new_vec, new_meta, pinned_no_ttl());
             }
         }
 
@@ -109,7 +122,12 @@ impl GoalManager {
             tags: vec![format!("goal:{goal_id}"), TAG_CURRENT.to_string()],
             text_summary: text.to_string(),
         };
-        store.store(format!("goal:{goal_id}"), vec![0.0f32; self.d_model], metadata);
+        let _ = store.store_with_options(
+            format!("goal:{goal_id}"),
+            vec![0.0f32; self.d_model],
+            metadata,
+            pinned_no_ttl(),
+        );
         goal_id
     }
 
@@ -148,7 +166,7 @@ impl GoalManager {
                 let mut new_meta = e.metadata.clone();
                 new_meta.tags.retain(|t| t != TAG_CURRENT);
                 let new_vec = e.vector.clone();
-                store.store(key, new_vec, new_meta);
+                let _ = store.store_with_options(key, new_vec, new_meta, pinned_no_ttl());
             }
         }
 
@@ -159,7 +177,7 @@ impl GoalManager {
                 new_meta.tags.push(TAG_CURRENT.to_string());
             }
             let new_vec = e.vector.clone();
-            store.store(goal_key, new_vec, new_meta);
+            let _ = store.store_with_options(goal_key, new_vec, new_meta, pinned_no_ttl());
             true
         } else {
             false
@@ -196,7 +214,13 @@ impl GoalManager {
             ],
             text_summary: text.to_string(),
         };
-        store.store(format!("task:{task_id}"), vec![0.0f32; self.d_model], metadata);
+        // Active tasks are pinned; they unpin only when marked Done.
+        let _ = store.store_with_options(
+            format!("task:{task_id}"),
+            vec![0.0f32; self.d_model],
+            metadata,
+            pinned_no_ttl(),
+        );
         task_id
     }
 
@@ -210,7 +234,13 @@ impl GoalManager {
                 .retain(|t| TaskStatus::from_tag(t).is_none());
             new_meta.tags.push(status.tag().to_string());
             let new_vec = e.vector.clone();
-            store.store(key, new_vec, new_meta);
+            // Done tasks unpin (historical, evictable). Active/Blocked stay
+            // pinned as live work-in-progress.
+            let opts = match status {
+                TaskStatus::Done => StoreOptions { pinned: false, ttl_seconds: None },
+                TaskStatus::Active | TaskStatus::Blocked => pinned_no_ttl(),
+            };
+            let _ = store.store_with_options(key, new_vec, new_meta, opts);
             true
         } else {
             false
@@ -260,7 +290,15 @@ impl GoalManager {
             tags: vec![format!("goal:{goal_id}")],
             text_summary: text.to_string(),
         };
-        store.store(key, vec![0.0f32; self.d_model], metadata);
+        // Status is a rolling snapshot — not pinned, with a 1-hour TTL.
+        // Eviction or expiry just means we lose the breadcrumb; the goal
+        // and tasks survive.
+        let _ = store.store_with_options(
+            key,
+            vec![0.0f32; self.d_model],
+            metadata,
+            StoreOptions { pinned: false, ttl_seconds: Some(STATUS_TTL_SECONDS) },
+        );
         true
     }
 
@@ -416,5 +454,81 @@ mod tests {
         let state = m.get_state();
         assert_eq!(state.active_tasks.len(), 1);
         assert_eq!(state.active_tasks[0].text, "task two");
+    }
+
+    // --- v0.2 pin/TTL tests ---
+
+    use crate::engine::memory_store::MemoryCategory;
+    use std::collections::HashMap;
+
+    fn pressure_manager() -> GoalManager {
+        // Tiny category budgets to provoke pressure quickly. d_model=8 → each
+        // entry is 32 bytes. Context cap is 96 bytes → 3 unpinned Context
+        // entries max.
+        let mut budgets = HashMap::new();
+        budgets.insert(MemoryCategory::Goal, 1024);
+        budgets.insert(MemoryCategory::Task, 1024);
+        budgets.insert(MemoryCategory::Status, 256);
+        budgets.insert(MemoryCategory::Context, 96);
+        budgets.insert(MemoryCategory::Finding, 256);
+        budgets.insert(MemoryCategory::Pattern, 256);
+        budgets.insert(MemoryCategory::Correction, 256);
+        budgets.insert(MemoryCategory::Knowledge, 256);
+        let store = Arc::new(RwLock::new(MemoryStore::with_budget(
+            128, 16, 8192, budgets,
+        )));
+        GoalManager::new(store).with_d_model(8)
+    }
+
+    #[test]
+    fn goal_survives_context_pressure() {
+        let m = pressure_manager();
+        let _goal_id = m.set_goal("the only goal that matters");
+        // Flood Context — goal must survive because it's pinned.
+        {
+            let mut store = m.store.write().unwrap();
+            for i in 0..50 {
+                let _ = store.store_with_options(
+                    format!("noise{i}"),
+                    vec![0.5; 8],
+                    MemoryMetadata {
+                        source_request_id: "test".into(),
+                        tenant_id: "local".into(),
+                        layer_captured: 0,
+                        category: MemoryCategory::Context,
+                        tags: vec![],
+                        text_summary: String::new(),
+                    },
+                    StoreOptions::default(),
+                );
+            }
+        }
+        let goals = m.list_goals();
+        assert_eq!(goals.len(), 1, "pinned goal must survive Context pressure");
+        assert_eq!(goals[0].text, "the only goal that matters");
+    }
+
+    #[test]
+    fn done_task_becomes_evictable() {
+        let m = pressure_manager();
+        let goal_id = m.set_goal("g");
+        let t = m.add_task(&goal_id, "the task");
+        // While active + pinned: check the entry exists and is pinned.
+        {
+            let store = m.store.read().unwrap();
+            let key = format!("task:{t}");
+            let entry = store.query_by_tag(&format!("task:{t}"));
+            assert_eq!(entry.len(), 1);
+            assert_eq!(entry[0].key, key);
+            assert!(entry[0].pinned, "active task must be pinned");
+        }
+        // Mark done → unpinned.
+        assert!(m.update_task(&t, TaskStatus::Done));
+        {
+            let store = m.store.read().unwrap();
+            let entry = store.query_by_tag(&format!("task:{t}"));
+            assert_eq!(entry.len(), 1);
+            assert!(!entry[0].pinned, "done task must be unpinned");
+        }
     }
 }

@@ -1,4 +1,5 @@
 use crate::backend::traits::Tensor;
+use std::cell::Cell;
 
 #[derive(Debug, Clone)]
 pub enum HookAction {
@@ -8,12 +9,40 @@ pub enum HookAction {
     SkipRemaining,
 }
 
+/// Per-request context handed to every hook firing.
+///
+/// **Thread-safety invariant**: a `HookContext` is constructed per request and
+/// not shared across threads concurrently. `stores_remaining` is `Cell<u32>` —
+/// safely mutable through `&HookContext` only within a single thread. Do not
+/// hand the same `HookContext` to spawned tasks; build a fresh one per task or
+/// switch to atomics if that ever becomes a need.
 #[derive(Debug, Clone)]
 pub struct HookContext {
     pub tenant_id: String,
     pub request_id: String,
     pub tokens_generated: usize,
     pub current_confidence: f32,
+    /// Number of memory writes (captures) a hook may still perform in this
+    /// request. Hook implementations should `get()` to check and `set()` to
+    /// decrement; `MemoryInjectHook` already does so.
+    pub stores_remaining: Cell<u32>,
+}
+
+impl HookContext {
+    /// Default write quota per request: 4 captures. Plenty for inject-once +
+    /// capture-once-or-twice patterns; tight enough to stop a runaway hook
+    /// from filling the store inside a single inference call.
+    pub const DEFAULT_STORES_PER_REQUEST: u32 = 4;
+
+    pub fn new(tenant_id: impl Into<String>, request_id: impl Into<String>) -> Self {
+        Self {
+            tenant_id: tenant_id.into(),
+            request_id: request_id.into(),
+            tokens_generated: 0,
+            current_confidence: 0.0,
+            stores_remaining: Cell::new(Self::DEFAULT_STORES_PER_REQUEST),
+        }
+    }
 }
 
 pub trait Hook: Send + Sync {

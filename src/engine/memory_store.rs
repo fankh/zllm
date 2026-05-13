@@ -1,5 +1,6 @@
 use crate::backend::traits::Tensor;
-use std::collections::HashMap;
+use crate::metrics;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 #[derive(Debug, Clone)]
@@ -10,6 +11,9 @@ pub struct MemoryEntry {
     pub created_at: u64,
     pub access_count: u32,
     pub relevance_score: f32,
+    pub expires_at: Option<u64>,
+    pub pinned: bool,
+    pub byte_size: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +38,41 @@ pub enum MemoryCategory {
     Status,         // Rolling progress snapshot for the current goal
 }
 
+impl MemoryCategory {
+    fn as_str(&self) -> &'static str {
+        match self {
+            MemoryCategory::Finding => "finding",
+            MemoryCategory::Context => "context",
+            MemoryCategory::Pattern => "pattern",
+            MemoryCategory::Correction => "correction",
+            MemoryCategory::Knowledge => "knowledge",
+            MemoryCategory::Goal => "goal",
+            MemoryCategory::Task => "task",
+            MemoryCategory::Status => "status",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StoreOptions {
+    /// Pinned entries are never evicted. Only the GoalManager and other
+    /// privileged code paths should set this; hook-driven captures must leave
+    /// it false.
+    pub pinned: bool,
+    /// Optional TTL — entries with `expires_at <= now` are skipped in queries
+    /// and dropped first when the store is under pressure.
+    pub ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StoreError {
+    /// The entry's byte size exceeds the per-category budget on its own.
+    /// No amount of eviction can make room — caller should not retry.
+    Oversize,
+    /// The store could not free enough space (everything else is pinned).
+    Full,
+}
+
 #[derive(Debug, Clone)]
 pub struct InspectionTrace {
     pub request_id: String,
@@ -51,83 +90,271 @@ pub struct LayerSnapshot {
     pub interpretation: String,
 }
 
+const DEFAULT_TOTAL_BUDGET_BYTES: usize = 256 * 1024 * 1024; // 256 MB
+
+fn default_category_budgets() -> HashMap<MemoryCategory, usize> {
+    use MemoryCategory::*;
+    let mb = 1024 * 1024;
+    [
+        (Goal, 16 * mb),
+        (Task, 32 * mb),
+        (Status, 8 * mb),
+        (Context, 128 * mb),
+        (Finding, 16 * mb),
+        (Pattern, 16 * mb),
+        (Correction, 16 * mb),
+        (Knowledge, 16 * mb),
+    ]
+    .into_iter()
+    .collect()
+}
+
 pub struct MemoryStore {
     entries: HashMap<String, MemoryEntry>,
     traces: Vec<InspectionTrace>,
     max_entries: usize,
     max_traces: usize,
     epoch: Instant,
+
+    // Byte accounting + budgets
+    bytes_used: usize,
+    byte_budget: usize,
+    category_budgets: HashMap<MemoryCategory, usize>,
+    category_bytes: HashMap<MemoryCategory, usize>,
+
+    // Indexes (key sets) for fast filtered queries.
+    by_category: HashMap<MemoryCategory, HashSet<String>>,
+    by_tag: HashMap<String, HashSet<String>>,
 }
 
 impl MemoryStore {
     pub fn new(max_entries: usize, max_traces: usize) -> Self {
+        Self::with_budget(
+            max_entries,
+            max_traces,
+            DEFAULT_TOTAL_BUDGET_BYTES,
+            default_category_budgets(),
+        )
+    }
+
+    pub fn with_budget(
+        max_entries: usize,
+        max_traces: usize,
+        byte_budget: usize,
+        category_budgets: HashMap<MemoryCategory, usize>,
+    ) -> Self {
         Self {
             entries: HashMap::new(),
             traces: Vec::new(),
             max_entries,
             max_traces,
             epoch: Instant::now(),
+            bytes_used: 0,
+            byte_budget,
+            category_budgets,
+            category_bytes: HashMap::new(),
+            by_category: HashMap::new(),
+            by_tag: HashMap::new(),
         }
+    }
+
+    pub fn bytes_used(&self) -> usize {
+        self.bytes_used
+    }
+
+    pub fn byte_budget(&self) -> usize {
+        self.byte_budget
+    }
+
+    fn now(&self) -> u64 {
+        self.epoch.elapsed().as_secs()
+    }
+
+    fn is_expired(entry: &MemoryEntry, now: u64) -> bool {
+        matches!(entry.expires_at, Some(t) if t <= now)
     }
 
     // --- Persist: Store memory entries ---
 
+    /// Legacy entry point. Stores with default options (not pinned, no TTL).
+    /// Returns silently on failure for back-compat — callers wanting the
+    /// error should use `store_with_options`.
     pub fn store(&mut self, key: String, vector: Tensor, metadata: MemoryMetadata) {
-        if self.entries.len() >= self.max_entries {
-            self.evict_least_relevant();
+        let _ = self.store_with_options(key, vector, metadata, StoreOptions::default());
+    }
+
+    pub fn store_with_options(
+        &mut self,
+        key: String,
+        vector: Tensor,
+        metadata: MemoryMetadata,
+        options: StoreOptions,
+    ) -> Result<(), StoreError> {
+        let byte_size = vector.len() * std::mem::size_of::<f32>();
+        let cat = metadata.category.clone();
+        let cat_budget = *self
+            .category_budgets
+            .get(&cat)
+            .unwrap_or(&self.byte_budget);
+
+        // Oversize-on-its-own — no eviction can save us.
+        if byte_size > cat_budget || byte_size > self.byte_budget {
+            metrics::memory_evictions_total()
+                .with_label_values(&["oversize"])
+                .inc();
+            return Err(StoreError::Oversize);
         }
 
+        // Replace-in-place: removing the old key first frees its bytes/indexes
+        // before we account for the new entry.
+        if self.entries.contains_key(&key) {
+            self.remove_internal(&key);
+        }
+
+        let now = self.now();
+        loop {
+            let cat_used = *self.category_bytes.get(&cat).unwrap_or(&0);
+            let fits_total = self.bytes_used + byte_size <= self.byte_budget;
+            let fits_category = cat_used + byte_size <= cat_budget;
+            let fits_count = self.entries.len() < self.max_entries;
+            if fits_total && fits_category && fits_count {
+                break;
+            }
+
+            // Lazy expiry: drop one expired entry to make room.
+            if self.drop_one_expired(now) {
+                continue;
+            }
+
+            // Score-based eviction, preferring the same category.
+            if !self.evict_one(Some(&cat)) {
+                metrics::memory_evictions_total()
+                    .with_label_values(&["unfree"])
+                    .inc();
+                return Err(StoreError::Full);
+            }
+        }
+
+        let expires_at = options.ttl_seconds.map(|t| now + t);
         let entry = MemoryEntry {
             key: key.clone(),
             vector,
             metadata,
-            created_at: self.epoch.elapsed().as_secs(),
+            created_at: now,
             access_count: 0,
             relevance_score: 1.0,
+            expires_at,
+            pinned: options.pinned,
+            byte_size,
         };
 
+        self.by_category
+            .entry(cat.clone())
+            .or_default()
+            .insert(key.clone());
+        for tag in &entry.metadata.tags {
+            self.by_tag
+                .entry(tag.clone())
+                .or_default()
+                .insert(key.clone());
+        }
+        self.bytes_used += byte_size;
+        *self.category_bytes.entry(cat).or_insert(0) += byte_size;
         self.entries.insert(key, entry);
+
+        self.publish_gauges();
+        Ok(())
     }
 
     pub fn get(&mut self, key: &str) -> Option<&MemoryEntry> {
+        let now = self.now();
         if let Some(entry) = self.entries.get_mut(key) {
+            if Self::is_expired(entry, now) {
+                return None;
+            }
             entry.access_count += 1;
             entry.relevance_score = (entry.relevance_score + 0.1).min(1.0);
         }
-        self.entries.get(key)
+        self.entries.get(key).filter(|e| !Self::is_expired(e, now))
     }
 
     pub fn remove(&mut self, key: &str) -> bool {
-        self.entries.remove(key).is_some()
+        let removed = self.remove_internal(key);
+        if removed {
+            self.publish_gauges();
+        }
+        removed
     }
 
-    // --- Query: Find relevant memories ---
+    fn remove_internal(&mut self, key: &str) -> bool {
+        if let Some(entry) = self.entries.remove(key) {
+            self.bytes_used = self.bytes_used.saturating_sub(entry.byte_size);
+            if let Some(b) = self.category_bytes.get_mut(&entry.metadata.category) {
+                *b = b.saturating_sub(entry.byte_size);
+            }
+            if let Some(set) = self.by_category.get_mut(&entry.metadata.category) {
+                set.remove(key);
+            }
+            for tag in &entry.metadata.tags {
+                if let Some(set) = self.by_tag.get_mut(tag) {
+                    set.remove(key);
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    // --- Query: Find relevant memories (expired entries are skipped) ---
 
     pub fn query_by_category(&self, category: &MemoryCategory) -> Vec<&MemoryEntry> {
-        self.entries
-            .values()
-            .filter(|e| &e.metadata.category == category)
+        let now = self.now();
+        let Some(keys) = self.by_category.get(category) else {
+            return Vec::new();
+        };
+        keys.iter()
+            .filter_map(|k| self.entries.get(k))
+            .filter(|e| !Self::is_expired(e, now))
             .collect()
     }
 
+    /// Returns entries owned by the given tenant. **Deprecated**: tenant
+    /// isolation belongs in a gateway in front of the engine, not inside it.
+    /// New code should not call this — kept for backward compatibility with
+    /// existing tests and `build_injection_vector`.
+    #[deprecated(
+        note = "tenant isolation belongs in a gateway, not in the engine; new code should not depend on this"
+    )]
     pub fn query_by_tenant(&self, tenant_id: &str) -> Vec<&MemoryEntry> {
+        let now = self.now();
         self.entries
             .values()
-            .filter(|e| e.metadata.tenant_id == tenant_id)
+            .filter(|e| e.metadata.tenant_id == tenant_id && !Self::is_expired(e, now))
             .collect()
     }
 
     pub fn query_by_tag(&self, tag: &str) -> Vec<&MemoryEntry> {
-        self.entries
-            .values()
-            .filter(|e| e.metadata.tags.contains(&tag.to_string()))
+        let now = self.now();
+        let Some(keys) = self.by_tag.get(tag) else {
+            return Vec::new();
+        };
+        keys.iter()
+            .filter_map(|k| self.entries.get(k))
+            .filter(|e| !Self::is_expired(e, now))
             .collect()
     }
 
-    pub fn query_by_similarity(&self, query_vector: &Tensor, top_k: usize) -> Vec<(&MemoryEntry, f32)> {
+    pub fn query_by_similarity(
+        &self,
+        query_vector: &Tensor,
+        top_k: usize,
+    ) -> Vec<(&MemoryEntry, f32)> {
+        let now = self.now();
         let mut scored: Vec<(&MemoryEntry, f32)> = self
             .entries
             .values()
+            .filter(|e| !Self::is_expired(e, now))
             .map(|entry| {
                 let sim = cosine_similarity(&entry.vector, query_vector);
                 (entry, sim)
@@ -148,22 +375,23 @@ impl MemoryStore {
         max_memories: usize,
         alpha: f32,
     ) -> Option<Tensor> {
+        let now = self.now();
         let tenant_memories: Vec<&MemoryEntry> = self
             .entries
             .values()
-            .filter(|e| e.metadata.tenant_id == tenant_id)
+            .filter(|e| e.metadata.tenant_id == tenant_id && !Self::is_expired(e, now))
             .collect();
 
         if tenant_memories.is_empty() {
             return None;
         }
 
-        // Score by similarity to current hidden state
         let mut scored: Vec<(&MemoryEntry, f32)> = tenant_memories
             .into_iter()
             .map(|entry| {
                 let sim = cosine_similarity(&entry.vector, query_vector);
-                let recency_boost = 1.0 / (1.0 + (self.epoch.elapsed().as_secs() - entry.created_at) as f32 / 3600.0);
+                let recency_boost =
+                    1.0 / (1.0 + (now.saturating_sub(entry.created_at)) as f32 / 3600.0);
                 let final_score = sim * 0.7 + entry.relevance_score * 0.2 + recency_boost * 0.1;
                 (entry, final_score)
             })
@@ -176,7 +404,6 @@ impl MemoryStore {
             return None;
         }
 
-        // Weighted average of top-k memory vectors
         let d = scored[0].0.vector.len();
         let mut result = vec![0.0f32; d];
         let mut total_weight = 0.0f32;
@@ -200,24 +427,26 @@ impl MemoryStore {
         }
     }
 
-    /// Category-aware injection: for each (category, alpha, max) tuple, build a
-    /// per-category injection vector and sum them into a single tensor.
-    ///
-    /// Used by goal/task/status memory injection. The existing
-    /// `build_injection_vector` is left unchanged for backward compatibility.
+    /// Category-aware injection. Walks each (category, alpha, max) entry,
+    /// builds a per-category injection vector via the per-category index
+    /// (no full-table scan), and sums them.
     pub fn build_injection_vector_by_categories(
         &self,
         query_vector: &Tensor,
         tenant_id: &str,
         weights: &[(MemoryCategory, f32, usize)],
     ) -> Option<Tensor> {
+        let now = self.now();
         let mut result: Option<Vec<f32>> = None;
 
         for (category, alpha, max_per_category) in weights {
-            let cat_memories: Vec<&MemoryEntry> = self
-                .entries
-                .values()
-                .filter(|e| e.metadata.tenant_id == tenant_id && &e.metadata.category == category)
+            let Some(keys) = self.by_category.get(category) else {
+                continue;
+            };
+            let cat_memories: Vec<&MemoryEntry> = keys
+                .iter()
+                .filter_map(|k| self.entries.get(k))
+                .filter(|e| e.metadata.tenant_id == tenant_id && !Self::is_expired(e, now))
                 .collect();
 
             if cat_memories.is_empty() {
@@ -228,9 +457,8 @@ impl MemoryStore {
                 .into_iter()
                 .map(|entry| {
                     let sim = cosine_similarity(&entry.vector, query_vector);
-                    let recency_boost = 1.0
-                        / (1.0
-                            + (self.epoch.elapsed().as_secs() - entry.created_at) as f32 / 3600.0);
+                    let recency_boost =
+                        1.0 / (1.0 + (now.saturating_sub(entry.created_at)) as f32 / 3600.0);
                     let final_score =
                         sim * 0.7 + entry.relevance_score * 0.2 + recency_boost * 0.1;
                     (entry, final_score)
@@ -310,18 +538,77 @@ impl MemoryStore {
         }
     }
 
-    fn evict_least_relevant(&mut self) {
-        if let Some(key) = self
+    /// Drop one expired entry if any exists. Returns true if one was dropped.
+    fn drop_one_expired(&mut self, now: u64) -> bool {
+        let victim = self
             .entries
             .iter()
+            .find(|(_, e)| Self::is_expired(e, now))
+            .map(|(k, _)| k.clone());
+        if let Some(key) = victim {
+            self.remove_internal(&key);
+            metrics::memory_evictions_total()
+                .with_label_values(&["expired"])
+                .inc();
+            metrics::memory_expired_drops().inc();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Evict one non-pinned entry, preferring the supplied category if any.
+    /// Returns false only if every remaining entry is pinned.
+    fn evict_one(&mut self, prefer_category: Option<&MemoryCategory>) -> bool {
+        // First pass: prefer the same category.
+        if let Some(cat) = prefer_category {
+            if let Some(key) = self.lowest_score_key(Some(cat)) {
+                self.remove_internal(&key);
+                metrics::memory_evictions_total()
+                    .with_label_values(&["budget"])
+                    .inc();
+                return true;
+            }
+        }
+        // Second pass: any non-pinned entry.
+        if let Some(key) = self.lowest_score_key(None) {
+            self.remove_internal(&key);
+            metrics::memory_evictions_total()
+                .with_label_values(&["budget"])
+                .inc();
+            return true;
+        }
+        false
+    }
+
+    fn lowest_score_key(&self, only_category: Option<&MemoryCategory>) -> Option<String> {
+        self.entries
+            .iter()
+            .filter(|(_, e)| !e.pinned)
+            .filter(|(_, e)| match only_category {
+                Some(cat) => &e.metadata.category == cat,
+                None => true,
+            })
             .min_by(|a, b| {
                 a.1.relevance_score
                     .partial_cmp(&b.1.relevance_score)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(k, _)| k.clone())
-        {
-            self.entries.remove(&key);
+    }
+
+    fn publish_gauges(&self) {
+        metrics::memory_bytes_used().set(self.bytes_used as i64);
+        // Per-category gauges
+        for (cat, set) in &self.by_category {
+            metrics::memory_entries()
+                .with_label_values(&[cat.as_str()])
+                .set(set.len() as i64);
+        }
+        for (cat, bytes) in &self.category_bytes {
+            metrics::memory_bytes_by_category()
+                .with_label_values(&[cat.as_str()])
+                .set(*bytes as i64);
         }
     }
 }
@@ -408,14 +695,12 @@ mod tests {
             .build_injection_vector(&query, "local", 8, 1.0)
             .expect("expected injection");
 
-        // Build expected: result with only the real entry.
         let mut s_real_only = MemoryStore::new(16, 4);
         s_real_only.store("real".into(), vec![1.0; 8], meta(MemoryCategory::Context));
         let expected = s_real_only
             .build_injection_vector(&query, "local", 8, 1.0)
             .expect("expected injection");
 
-        // Bit-for-bit equality after the dilution guard.
         assert_eq!(with_both, expected);
     }
 
@@ -434,9 +719,114 @@ mod tests {
             )
             .expect("expected vector");
         assert_eq!(out.len(), 4);
-        // Goal contributes 0.5*1.0 and Context 0.1*0.5 → 0.55 per element.
         for v in out {
             assert!((v - 0.55).abs() < 1e-4, "expected 0.55, got {v}");
         }
+    }
+
+    // --- v0.2 tests ---
+
+    fn tiny_budget_store() -> MemoryStore {
+        // Tiny budgets to make pressure easy in tests.
+        let mut cat = HashMap::new();
+        cat.insert(MemoryCategory::Goal, 128);
+        cat.insert(MemoryCategory::Task, 128);
+        cat.insert(MemoryCategory::Status, 128);
+        cat.insert(MemoryCategory::Context, 256);
+        cat.insert(MemoryCategory::Finding, 128);
+        cat.insert(MemoryCategory::Pattern, 128);
+        cat.insert(MemoryCategory::Correction, 128);
+        cat.insert(MemoryCategory::Knowledge, 128);
+        MemoryStore::with_budget(64, 4, 1024, cat)
+    }
+
+    #[test]
+    fn byte_budget_evicts_when_full() {
+        let mut s = tiny_budget_store();
+        // 16 floats = 64 bytes per Context entry. Context cap = 256 bytes = 4 entries.
+        for i in 0..6 {
+            s.store(format!("c{i}"), vec![0.5; 16], meta(MemoryCategory::Context));
+        }
+        let count = s.by_category.get(&MemoryCategory::Context).map(|s| s.len()).unwrap_or(0);
+        assert!(count <= 4, "category cap should keep <=4 entries, got {count}");
+        assert!(s.bytes_used <= s.byte_budget);
+    }
+
+    #[test]
+    fn oversize_entry_refused() {
+        let mut s = tiny_budget_store();
+        // Goal cap = 128 bytes. 64 floats = 256 bytes.
+        let err = s.store_with_options(
+            "big".into(),
+            vec![1.0; 64],
+            meta(MemoryCategory::Goal),
+            StoreOptions::default(),
+        );
+        assert_eq!(err, Err(StoreError::Oversize));
+        assert_eq!(s.entry_count(), 0);
+    }
+
+    #[test]
+    fn pinned_entry_survives_pressure() {
+        let mut s = tiny_budget_store();
+        s.store_with_options(
+            "goal".into(),
+            vec![0.5; 8],
+            meta(MemoryCategory::Goal),
+            StoreOptions { pinned: true, ttl_seconds: None },
+        )
+        .expect("pinned store ok");
+        // Fill goal category with unpinned entries (under cap)
+        for i in 0..10 {
+            let _ = s.store_with_options(
+                format!("g{i}"),
+                vec![0.5; 8],
+                meta(MemoryCategory::Goal),
+                StoreOptions::default(),
+            );
+        }
+        assert!(s.entries.contains_key("goal"), "pinned goal must survive");
+    }
+
+    #[test]
+    fn ttl_skipped_in_queries_after_expiry() {
+        let mut s = tiny_budget_store();
+        // ttl = 0 → already expired by next tick.
+        s.store_with_options(
+            "transient".into(),
+            vec![0.5; 4],
+            meta(MemoryCategory::Status),
+            StoreOptions { pinned: false, ttl_seconds: Some(0) },
+        )
+        .expect("store ok");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let entries = s.query_by_category(&MemoryCategory::Status);
+        assert!(entries.is_empty(), "expired entries must not appear in queries");
+    }
+
+    #[test]
+    fn category_index_isolates_queries() {
+        let mut s = tiny_budget_store();
+        s.store("g".into(), vec![0.1; 4], meta(MemoryCategory::Goal));
+        s.store("c".into(), vec![0.2; 4], meta(MemoryCategory::Context));
+        let goals = s.query_by_category(&MemoryCategory::Goal);
+        let ctx = s.query_by_category(&MemoryCategory::Context);
+        assert_eq!(goals.len(), 1);
+        assert_eq!(ctx.len(), 1);
+        assert_eq!(goals[0].metadata.category, MemoryCategory::Goal);
+        assert_eq!(ctx[0].metadata.category, MemoryCategory::Context);
+    }
+
+    #[test]
+    fn tag_index_round_trips() {
+        let mut s = tiny_budget_store();
+        let mut m = meta(MemoryCategory::Task);
+        m.tags = vec!["goal:abc".into(), "active".into()];
+        s.store("t1".into(), vec![0.1; 4], m);
+        let by_goal = s.query_by_tag("goal:abc");
+        let by_status = s.query_by_tag("active");
+        assert_eq!(by_goal.len(), 1);
+        assert_eq!(by_status.len(), 1);
+        assert_eq!(by_goal[0].key, "t1");
     }
 }
