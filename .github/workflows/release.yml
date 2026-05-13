@@ -35,10 +35,6 @@ jobs:
             target: x86_64-unknown-linux-gnu
             accel: cuda
             archive_suffix: linux-x86_64-cuda.tar.gz
-          - os: macos-13
-            target: x86_64-apple-darwin
-            accel: cpu
-            archive_suffix: macos-x86_64.tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
             accel: metal
@@ -70,6 +66,21 @@ jobs:
           cuda: '12.5.0'
           method: 'network'
           sub-packages: '["nvcc", "cudart"]'
+
+      - name: Install CUDA dev libs (Linux)
+        # Jimver's sub-packages can only express old `cuda-cublas-*` style
+        # names; CUDA 12 renamed these to `libcublas-*`/`libcurand-*`, so
+        # add them via apt directly. candle-kernels links -lcublas -lcurand
+        # -lcublasLt at build time, not just at runtime.
+        if: matrix.accel == 'cuda' && runner.os == 'Linux'
+        run: sudo apt-get install -y libcublas-dev-12-5 libcurand-dev-12-5
+
+      - name: Enable MSVC dev shell (Windows CUDA)
+        # nvcc needs cl.exe on PATH to compile .cu files into host code.
+        # Windows runners have MSVC Build Tools installed but cl.exe is
+        # behind vcvars64.bat; this action loads that environment.
+        if: matrix.accel == 'cuda' && runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Build (CPU)
         if: matrix.accel == 'cpu'
