@@ -11,7 +11,6 @@ pub struct ZllmConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServerConfig {
-    pub grpc_port: u16,
     pub rest_port: u16,
     pub max_concurrent: usize,
 }
@@ -21,6 +20,10 @@ pub struct ModelConfig {
     pub path: String,
     pub quantization: String,
     pub max_seq_len: usize,
+    /// Optional path to tokenizer.json. If empty / absent, the server
+    /// looks for `tokenizer.json` next to `path`.
+    #[serde(default)]
+    pub tokenizer_path: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -38,7 +41,6 @@ pub struct EngineConfig {
 pub struct MemoryConfig {
     pub block_size: usize,
     pub max_blocks: usize,
-    pub max_tenants: usize,
 }
 
 impl ZllmConfig {

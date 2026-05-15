@@ -74,7 +74,6 @@ fn test_hook_registry() {
 fn test_config_parsing() {
     let config = zllm::config::ZllmConfig::load(std::path::Path::new("configs/default.toml")).unwrap();
     assert_eq!(config.server.rest_port, 8080);
-    assert_eq!(config.server.grpc_port, 50051);
     assert_eq!(config.engine.max_loops, 16);
     assert_eq!(config.memory.block_size, 16);
 }

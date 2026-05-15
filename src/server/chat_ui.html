@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>zllm chat</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #161a22;
+    --border: #2a2f3a;
+    --text: #e6e8ee;
+    --muted: #8b93a3;
+    --accent: #5b8cff;
+    --user: #2a3656;
+    --assistant: #1d2230;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --bad: #f87171;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, -apple-system, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  header {
+    padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--border);
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  header h1 { margin: 0; font-size: 16px; font-weight: 600; }
+  header .status { color: var(--muted); font-size: 12px; }
+  .layout { flex: 1; display: flex; min-height: 0; }
+  .sidebar {
+    width: 320px; min-width: 320px; background: var(--panel); border-right: 1px solid var(--border);
+    overflow-y: auto; padding: 16px;
+  }
+  .sidebar h2 { font-size: 12px; text-transform: uppercase; color: var(--muted); margin: 16px 0 8px 0; letter-spacing: 0.5px; }
+  .sidebar h2:first-child { margin-top: 0; }
+  .goal-card { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px; margin-bottom: 8px; }
+  .goal-card.current { border-color: var(--accent); }
+  .goal-card .text { font-weight: 500; }
+  .goal-card .id { font-size: 10px; color: var(--muted); font-family: monospace; margin-top: 4px; }
+  .task { display: flex; align-items: flex-start; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+  .task:last-child { border-bottom: none; }
+  .task .text { flex: 1; }
+  .task button { background: none; border: 1px solid var(--border); color: var(--muted); padding: 2px 6px; border-radius: 3px; cursor: pointer; font-size: 11px; }
+  .task button:hover { color: var(--ok); border-color: var(--ok); }
+  .status-line { color: var(--warn); font-style: italic; padding: 6px 0; }
+  .input-row { display: flex; gap: 6px; margin-top: 6px; }
+  .input-row input { flex: 1; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; font: inherit; }
+  .input-row button { background: var(--accent); color: white; border: none; padding: 6px 10px; border-radius: 4px; cursor: pointer; font: inherit; }
+  .input-row button:hover { opacity: 0.85; }
+  .chat { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .messages { flex: 1; overflow-y: auto; padding: 16px; }
+  .msg { padding: 10px 14px; border-radius: 6px; margin-bottom: 12px; max-width: 80%; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user { background: var(--user); margin-left: auto; }
+  .msg.assistant { background: var(--assistant); border: 1px solid var(--border); }
+  .msg .role { font-size: 11px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; }
+  .composer { padding: 12px 16px; border-top: 1px solid var(--border); background: var(--panel); display: flex; gap: 8px; }
+  .composer textarea { flex: 1; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font: inherit; resize: none; min-height: 40px; max-height: 200px; }
+  .composer button { background: var(--accent); color: white; border: none; padding: 0 18px; border-radius: 6px; cursor: pointer; font: inherit; font-weight: 500; }
+  .composer button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .empty { color: var(--muted); padding: 16px; text-align: center; }
+  .clearbtn { background: none; border: 1px solid var(--border); color: var(--muted); padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>zllm</h1>
+  <div class="status" id="connStatus">connected</div>
+</header>
+<div class="layout">
+  <aside class="sidebar">
+    <h2>Current goal</h2>
+    <div id="currentGoal"><div class="empty">no goal set</div></div>
+    <div class="input-row">
+      <input id="newGoalText" placeholder="set a new goal..." />
+      <button id="setGoalBtn">Set</button>
+    </div>
+
+    <h2>Active tasks</h2>
+    <div id="taskList"><div class="empty">no tasks</div></div>
+    <div class="input-row">
+      <input id="newTaskText" placeholder="add a task..." />
+      <button id="addTaskBtn">Add</button>
+    </div>
+
+    <h2>Status</h2>
+    <div id="statusLine"><div class="empty">no status</div></div>
+    <div class="input-row">
+      <input id="newStatusText" placeholder="set status..." />
+      <button id="setStatusBtn">Set</button>
+    </div>
+
+    <h2>Conversation</h2>
+    <button class="clearbtn" id="clearBtn">Clear history</button>
+  </aside>
+
+  <main class="chat">
+    <div class="messages" id="messages"></div>
+    <div class="composer">
+      <textarea id="composer" placeholder="message…  (Enter to send, Shift+Enter for newline)"></textarea>
+      <button id="sendBtn">Send</button>
+    </div>
+  </main>
+</div>
+
+<script>
+const STORAGE_KEY = 'zllm-chat-history';
+let messages = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+
+const el = (id) => document.getElementById(id);
+
+function renderMessages() {
+  const wrap = el('messages');
+  wrap.innerHTML = '';
+  for (const m of messages) {
+    const div = document.createElement('div');
+    div.className = 'msg ' + (m.role === 'user' ? 'user' : 'assistant');
+    const r = document.createElement('div');
+    r.className = 'role';
+    r.textContent = m.role;
+    const c = document.createElement('div');
+    c.textContent = m.content;
+    div.appendChild(r);
+    div.appendChild(c);
+    wrap.appendChild(div);
+  }
+  wrap.scrollTop = wrap.scrollHeight;
+}
+
+function persist() {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(messages));
+}
+
+async function refreshState() {
+  try {
+    const r = await fetch('/v1/goal/state');
+    const s = await r.json();
+    // Current goal
+    const g = el('currentGoal');
+    if (s.current_goal) {
+      g.innerHTML = '';
+      const card = document.createElement('div');
+      card.className = 'goal-card current';
+      const t = document.createElement('div');
+      t.className = 'text';
+      t.textContent = s.current_goal.text;
+      const i = document.createElement('div');
+      i.className = 'id';
+      i.textContent = s.current_goal.goal_id;
+      card.appendChild(t);
+      card.appendChild(i);
+      g.appendChild(card);
+    } else {
+      g.innerHTML = '<div class="empty">no goal set</div>';
+    }
+    // Tasks
+    const tl = el('taskList');
+    tl.innerHTML = '';
+    if (s.active_tasks && s.active_tasks.length) {
+      for (const t of s.active_tasks) {
+        const row = document.createElement('div');
+        row.className = 'task';
+        const txt = document.createElement('div');
+        txt.className = 'text';
+        txt.textContent = t.text;
+        const btn = document.createElement('button');
+        btn.textContent = 'done';
+        btn.onclick = async () => {
+          await fetch('/v1/goal/task/' + encodeURIComponent(t.task_id), {
+            method: 'PATCH',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({status: 'done'})
+          });
+          refreshState();
+        };
+        row.appendChild(txt);
+        row.appendChild(btn);
+        tl.appendChild(row);
+      }
+    } else {
+      tl.innerHTML = '<div class="empty">no tasks</div>';
+    }
+    // Status
+    const sl = el('statusLine');
+    if (s.latest_status) {
+      sl.innerHTML = '';
+      const div = document.createElement('div');
+      div.className = 'status-line';
+      div.textContent = s.latest_status.text;
+      sl.appendChild(div);
+    } else {
+      sl.innerHTML = '<div class="empty">no status</div>';
+    }
+  } catch (e) {
+    el('connStatus').textContent = 'disconnected';
+  }
+}
+
+el('setGoalBtn').onclick = async () => {
+  const text = el('newGoalText').value.trim();
+  if (!text) return;
+  await fetch('/v1/goal/set', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({text})
+  });
+  el('newGoalText').value = '';
+  refreshState();
+};
+
+el('addTaskBtn').onclick = async () => {
+  const text = el('newTaskText').value.trim();
+  if (!text) return;
+  // Find current goal id from sidebar
+  const r = await fetch('/v1/goal/state');
+  const s = await r.json();
+  if (!s.current_goal) {
+    alert('Set a current goal first.');
+    return;
+  }
+  await fetch('/v1/goal/task', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({goal_id: s.current_goal.goal_id, text})
+  });
+  el('newTaskText').value = '';
+  refreshState();
+};
+
+el('setStatusBtn').onclick = async () => {
+  const text = el('newStatusText').value.trim();
+  if (!text) return;
+  await fetch('/v1/goal/status', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({text})
+  });
+  el('newStatusText').value = '';
+  refreshState();
+};
+
+el('clearBtn').onclick = () => {
+  if (!confirm('Clear chat history?')) return;
+  messages = [];
+  persist();
+  renderMessages();
+};
+
+async function send() {
+  const text = el('composer').value.trim();
+  if (!text) return;
+  const sendBtn = el('sendBtn');
+  sendBtn.disabled = true;
+  el('composer').value = '';
+
+  messages.push({role: 'user', content: text});
+  // Placeholder assistant message that we fill incrementally
+  messages.push({role: 'assistant', content: ''});
+  const assistantIdx = messages.length - 1;
+  renderMessages();
+  persist();
+
+  try {
+    const resp = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        model: 'zllm',
+        messages: messages.slice(0, -1),  // drop the empty placeholder
+        stream: true,
+        max_tokens: 512
+      })
+    });
+    if (!resp.ok || !resp.body) {
+      messages[assistantIdx].content = '[error: ' + resp.status + ']';
+      renderMessages();
+      return;
+    }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      let lineEnd;
+      while ((lineEnd = buf.indexOf('\n\n')) !== -1) {
+        const chunk = buf.slice(0, lineEnd);
+        buf = buf.slice(lineEnd + 2);
+        if (!chunk.startsWith('data:')) continue;
+        const payload = chunk.slice(5).trim();
+        if (payload === '[DONE]') continue;
+        try {
+          const j = JSON.parse(payload);
+          const delta = j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content;
+          if (delta) {
+            messages[assistantIdx].content += delta;
+            renderMessages();
+          }
+        } catch (_) {}
+      }
+    }
+    persist();
+    refreshState();
+  } catch (e) {
+    messages[assistantIdx].content = '[error: ' + e.message + ']';
+    renderMessages();
+  } finally {
+    sendBtn.disabled = false;
+  }
+}
+
+el('sendBtn').onclick = send;
+el('composer').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    send();
+  }
+});
+
+// Initial paint
+renderMessages();
+refreshState();
+setInterval(refreshState, 30000);  // periodic refresh
+</script>
+</body>
+</html>

@@ -1,5 +1,4 @@
 [server]
-grpc_port = 50051
 rest_port = 8080
 max_concurrent = 32
 
@@ -7,6 +6,8 @@ max_concurrent = 32
 path = "models/llama3.1-8b-q4.bin"
 quantization = "q4"
 max_seq_len = 8192
+# Optional: defaults to tokenizer.json next to `path`.
+tokenizer_path = ""
 
 [engine]
 encoder_layers = 8
@@ -20,4 +21,3 @@ default_top_p = 0.9
 [memory]
 block_size = 16
 max_blocks = 65536
-max_tenants = 64

@@ -58,47 +58,77 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Serve { config } => {
-            let cfg = config::ZllmConfig::load(&config)?;
-            tracing::info!("Starting ZLLM server (REST: {}, gRPC: {})", cfg.server.rest_port, cfg.server.grpc_port);
+            use backend::candle::backend::CandleCpuBackend;
+            use backend::candle::tokenizer::LlamaTokenizer;
+            use backend::traits::{Backend, QuantConfig};
+            use server::rest::AppState;
+            use std::sync::{Arc, RwLock};
 
-            // Shared memory store + goal manager (in-memory, no persistence).
-            let memory_store = std::sync::Arc::new(std::sync::RwLock::new(
+            let cfg = config::ZllmConfig::load(&config)?;
+            tracing::info!("Starting ZLLM server (REST: {})", cfg.server.rest_port);
+
+            // Tokenizer: explicit path wins; otherwise look next to the model.
+            let tokenizer = if !cfg.model.tokenizer_path.is_empty() {
+                LlamaTokenizer::from_file(&cfg.model.tokenizer_path)?
+            } else {
+                let model_path = std::path::PathBuf::from(&cfg.model.path);
+                let next_to = model_path
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join("tokenizer.json");
+                if next_to.exists() {
+                    LlamaTokenizer::from_file(next_to.to_str().unwrap())?
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "tokenizer.json not found at model.tokenizer_path or next to model.path ({})",
+                        next_to.display()
+                    ));
+                }
+            };
+
+            // Load the model. If the model file is missing, we still start
+            // the server (so the chat UI loads and goal CRUD works) — chat
+            // requests will then fail clearly per-request rather than
+            // crashing the whole process.
+            let mut backend = CandleCpuBackend::new();
+            let model_path = std::path::PathBuf::from(&cfg.model.path);
+            if model_path.exists() {
+                backend.load_model(&model_path, &QuantConfig {
+                    method: "gguf".into(),
+                    bits: 4,
+                })?;
+            } else {
+                tracing::warn!(
+                    "model file {} not found — server will start but /v1/chat/completions will fail until a model is loaded",
+                    model_path.display()
+                );
+            }
+
+            let memory_store = Arc::new(RwLock::new(
                 engine::memory_store::MemoryStore::new(1024, 256),
             ));
-            let goal_manager = std::sync::Arc::new(
+            let goal_manager = Arc::new(
                 control_plane::goal_manager::GoalManager::new(memory_store.clone()),
             );
 
-            // Start REST server
-            let rest_router = server::rest::router();
+            let state = AppState {
+                backend: Arc::new(RwLock::new(backend)),
+                tokenizer: Arc::new(tokenizer),
+                goals: goal_manager,
+                memory: memory_store,
+                model_id: "zllm".into(),
+            };
+
             let rest_addr = format!("0.0.0.0:{}", cfg.server.rest_port);
-
-            // Start gRPC server
-            let grpc_addr = format!("0.0.0.0:{}", cfg.server.grpc_port).parse()?;
-            let grpc_service = server::grpc::ZllmInferenceService;
-            let goal_service = server::grpc::ZllmGoalService::new(goal_manager.clone());
-
-            let grpc_handle = tokio::spawn(async move {
-                tonic::transport::Server::builder()
-                    .add_service(
-                        server::grpc::inference_proto::inference_service_server::InferenceServiceServer::new(grpc_service),
-                    )
-                    .add_service(
-                        server::grpc::control_proto::goal_service_server::GoalServiceServer::new(goal_service),
-                    )
-                    .serve(grpc_addr)
-                    .await
-                    .unwrap();
-            });
+            let router = server::rest::router(state);
 
             let rest_handle = tokio::spawn(async move {
                 let listener = tokio::net::TcpListener::bind(&rest_addr).await.unwrap();
                 tracing::info!("REST server listening on {rest_addr}");
-                axum::serve(listener, rest_router).await.unwrap();
+                axum::serve(listener, router).await.unwrap();
             });
 
             tokio::select! {
-                _ = grpc_handle => {},
                 _ = rest_handle => {},
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("Shutting down...");

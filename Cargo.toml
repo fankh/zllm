@@ -13,12 +13,12 @@ path = "src/main.rs"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# API server
-tonic = "0.12"
-prost = "0.13"
+# REST server (axum). gRPC was removed in v0.4 — installed-app surface
+# is REST + chat UI only.
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
+futures = "0.3"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -38,9 +38,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Metrics
 prometheus = "0.14"
-
-# Streaming
-tokio-stream = "0.1"
 
 # ML inference (candle)
 candle-core = "0.10"
@@ -67,5 +64,3 @@ metal = [
     "candle-transformers/metal",
 ]
 
-[build-dependencies]
-tonic-build = "0.12"
