@@ -1,0 +1,13 @@
+# Local builds compile for the host CPU's full instruction set (AVX2 /
+# AVX-512 / NEON depending on the dev machine). zllm is positioned as an
+# installed-app: the user typically builds for the same box they'll run
+# on, so portability isn't a concern at the source-build level.
+#
+# CI release artifacts (.github/workflows/release.yml) override this with
+# RUSTFLAGS="" so the published binaries on GitHub Releases stay
+# redistributable across x86_64 microarchitectures. If you `cargo build`
+# locally and then move the binary to a machine with weaker SIMD support
+# (e.g., a pre-AVX2 box), it won't run — rebuild on that target, or set
+# RUSTFLAGS="" yourself before building.
+[build]
+rustflags = ["-C", "target-cpu=native"]

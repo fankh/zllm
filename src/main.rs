@@ -116,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
                 tokenizer: Arc::new(tokenizer),
                 goals: goal_manager,
                 memory: memory_store,
+                engine: Arc::new(cfg.engine.clone()),
                 model_id: "zllm".into(),
             };
 

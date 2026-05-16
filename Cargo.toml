@@ -51,6 +51,18 @@ bitvec = "1"
 rand = "0.9"
 uuid = { version = "1", features = ["v4"] }
 
+[profile.release]
+# Inference performance squeeze. LTO fat ~doubles release-mode build time
+# (2-4 min on a typical dev machine) but yields a tighter inner loop in the
+# Candle quantized matmul kernels. Single codegen unit lets LLVM see the
+# whole crate at once. `strip = true` shaves a few MB from the artifact;
+# debug info already isn't part of release.
+lto = "fat"
+codegen-units = 1
+strip = true
+opt-level = 3
+panic = "unwind"
+
 [features]
 default = []
 cuda = [

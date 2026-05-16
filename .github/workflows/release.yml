@@ -90,8 +90,15 @@ jobs:
         if: matrix.accel == 'cuda' && runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
+      # NB: RUSTFLAGS="" overrides .cargo/config.toml's `target-cpu=native`
+      # so the published release binaries stay portable across x86_64
+      # microarchitectures (any AVX2-capable CPU). Local dev builds keep
+      # the host-tuned flags from .cargo/config.toml.
+
       - name: Build (CPU)
         if: matrix.accel == 'cpu'
+        env:
+          RUSTFLAGS: ""
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Build (CUDA)
@@ -102,10 +109,13 @@ jobs:
           # Lovelace; the resulting PTX is forward-compatible to newer
           # arches via JIT, but won't run on cards older than ~RTX 40.
           CUDA_COMPUTE_CAP: '89'
+          RUSTFLAGS: ""
         run: cargo build --release --locked --target ${{ matrix.target }} --features cuda
 
       - name: Build (Metal)
         if: matrix.accel == 'metal'
+        env:
+          RUSTFLAGS: ""
         run: cargo build --release --locked --target ${{ matrix.target }} --features metal
 
       - name: Stage artifact (Unix)

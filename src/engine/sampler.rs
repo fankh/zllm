@@ -17,10 +17,22 @@ impl Default for SamplerConfig {
 }
 
 pub fn sample(logits: &Tensor, config: &SamplerConfig) -> u32 {
+    // temperature == 0 ⇒ deterministic argmax. This both avoids a divide-by-
+    // zero in temperature scaling and gives callers a clean way to ask for
+    // greedy decoding through the same API.
+    if config.temperature <= 0.0 {
+        return logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0);
+    }
+
     let mut logits = logits.clone();
 
     // Temperature scaling
-    if config.temperature != 1.0 && config.temperature > 0.0 {
+    if config.temperature != 1.0 {
         for l in logits.iter_mut() {
             *l /= config.temperature;
         }
@@ -81,4 +93,43 @@ pub fn sample(logits: &Tensor, config: &SamplerConfig) -> u32 {
     }
 
     (probs.len() - 1) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temperature_zero_is_argmax() {
+        let logits = vec![0.1, 0.5, 0.9, 0.2, 0.7];
+        let cfg = SamplerConfig { temperature: 0.0, top_k: 0, top_p: 1.0 };
+        for _ in 0..16 {
+            assert_eq!(sample(&logits, &cfg), 2);
+        }
+    }
+
+    #[test]
+    fn temperature_zero_breaks_ties_deterministically() {
+        // All equal — argmax picks the first index reliably.
+        let logits = vec![1.0; 8];
+        let cfg = SamplerConfig { temperature: 0.0, top_k: 0, top_p: 1.0 };
+        let first = sample(&logits, &cfg);
+        for _ in 0..16 {
+            assert_eq!(sample(&logits, &cfg), first);
+        }
+    }
+
+    #[test]
+    fn high_temperature_explores() {
+        // Many tokens equally likely after extreme softening — distribution
+        // should spread. We just check we see at least two distinct outputs
+        // in many tries (probabilistic but very safe).
+        let logits = vec![1.0, 1.01, 1.02, 1.03, 1.04, 1.05];
+        let cfg = SamplerConfig { temperature: 100.0, top_k: 0, top_p: 1.0 };
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            seen.insert(sample(&logits, &cfg));
+        }
+        assert!(seen.len() >= 2, "expected exploration, got only {seen:?}");
+    }
 }

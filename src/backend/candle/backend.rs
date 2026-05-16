@@ -34,8 +34,16 @@ impl CandleCpuBackend {
         self.index_pos = 0;
     }
 
-    pub fn generate_token(&mut self, prompt_tokens: &[u32]) -> Result<(u32, Vec<Vec<f32>>)> {
-        let model = self.model.as_mut()
+    /// Run the forward pass and return the next-token logits as a
+    /// `Vec<f32>` of length `vocab_size`. Increments `index_pos` for
+    /// KV-cache state. Use this when you want to apply a custom sampler
+    /// (the chat path in `src/server/rest.rs` does — it calls
+    /// `engine::sampler::sample`). The greedy path stays available via
+    /// `generate_token`, which delegates here and applies argmax.
+    pub fn forward_logits(&mut self, prompt_tokens: &[u32]) -> Result<Vec<f32>> {
+        let model = self
+            .model
+            .as_mut()
             .ok_or_else(|| ZllmError::Model("model not loaded".into()))?;
 
         let input = CandleTensor::new(prompt_tokens, &self.device)
@@ -43,31 +51,38 @@ impl CandleCpuBackend {
             .unsqueeze(0)
             .map_err(|e| ZllmError::Backend(format!("unsqueeze: {e}")))?;
 
-        // Forward pass — gets logits
-        let logits = model.forward(&input, self.index_pos)
+        let logits = model
+            .forward(&input, self.index_pos)
             .map_err(|e| ZllmError::Backend(format!("forward pass: {e}")))?;
 
         self.index_pos += prompt_tokens.len();
 
-        // Extract logits as Vec<f32>
         let logits_vec: Vec<f32> = logits
             .squeeze(0)
             .map_err(|e| ZllmError::Backend(format!("squeeze: {e}")))?
             .to_vec1()
             .map_err(|e| ZllmError::Backend(format!("to_vec1: {e}")))?;
 
-        // Get the argmax token for now (greedy)
-        let token_id = logits_vec
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0);
+        Ok(logits_vec)
+    }
 
-        // Hidden states not extractable from quantized forward without modification
-        // Return empty vec for now — will implement with forked forward pass
+    pub fn generate_token(&mut self, prompt_tokens: &[u32]) -> Result<(u32, Vec<Vec<f32>>)> {
+        let logits_vec = self.forward_logits(prompt_tokens)?;
+        let token_id = argmax_token(&logits_vec);
+        // Hidden states not extractable from quantized forward without
+        // modification — second return is reserved for a future forked
+        // forward pass.
         Ok((token_id, vec![]))
     }
+}
+
+fn argmax_token(logits: &[f32]) -> u32 {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0)
 }
 
 impl Backend for CandleCpuBackend {

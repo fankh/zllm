@@ -15,8 +15,10 @@ use uuid::Uuid;
 
 use crate::backend::candle::backend::CandleCpuBackend;
 use crate::backend::candle::tokenizer::LlamaTokenizer;
+use crate::config::EngineConfig;
 use crate::control_plane::goal_manager::{GoalManager, TaskStatus};
 use crate::engine::memory_store::MemoryStore;
+use crate::engine::sampler::{SamplerConfig, sample};
 
 const CHAT_UI_HTML: &str = include_str!("chat_ui.html");
 
@@ -26,6 +28,7 @@ pub struct AppState {
     pub tokenizer: Arc<LlamaTokenizer>,
     pub goals: Arc<GoalManager>,
     pub memory: Arc<RwLock<MemoryStore>>,
+    pub engine: Arc<EngineConfig>,
     pub model_id: String,
 }
 
@@ -115,6 +118,7 @@ async fn list_models(State(s): State<AppState>) -> Json<Value> {
 #[derive(Deserialize)]
 struct ChatRequest {
     #[serde(default)]
+    #[allow(dead_code)]
     model: Option<String>,
     messages: Vec<ChatMessage>,
     #[serde(default)]
@@ -122,14 +126,24 @@ struct ChatRequest {
     #[serde(default = "default_max_tokens")]
     max_tokens: usize,
     #[serde(default)]
-    #[allow(dead_code)]
     temperature: Option<f32>,
     #[serde(default)]
-    #[allow(dead_code)]
     top_p: Option<f32>,
     #[serde(default)]
-    #[allow(dead_code)]
     top_k: Option<usize>,
+}
+
+fn sampler_from_request(
+    engine: &EngineConfig,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+) -> SamplerConfig {
+    SamplerConfig {
+        temperature: temperature.unwrap_or(engine.default_temperature),
+        top_k: top_k.unwrap_or(engine.default_top_k),
+        top_p: top_p.unwrap_or(engine.default_top_p),
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -163,13 +177,14 @@ async fn chat_completions(
     let id = format!("chatcmpl-{}", Uuid::new_v4());
     let model_id = s.model_id.clone();
     let max_tokens = req.max_tokens;
+    let sampler_cfg = sampler_from_request(&s.engine, req.temperature, req.top_p, req.top_k);
 
     if req.stream {
-        let stream = chat_stream(s.clone(), tokens, max_tokens, id, model_id);
+        let stream = chat_stream(s.clone(), tokens, max_tokens, sampler_cfg, id, model_id);
         Sse::new(stream).into_response()
     } else {
         let (text, prompt_tokens, completion_tokens) =
-            generate_blocking(&s, tokens, max_tokens);
+            generate_blocking(&s, tokens, max_tokens, &sampler_cfg);
         let now = unix_secs();
         Json(json!({
             "id": id,
@@ -199,6 +214,12 @@ struct CompletionRequest {
     prompt: String,
     #[serde(default = "default_max_tokens")]
     max_tokens: usize,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    top_k: Option<usize>,
 }
 
 async fn text_completions(
@@ -218,7 +239,8 @@ async fn text_completions(
         }
     };
     let id = format!("cmpl-{}", Uuid::new_v4());
-    let (text, p, c) = generate_blocking(&s, tokens, req.max_tokens);
+    let sampler_cfg = sampler_from_request(&s.engine, req.temperature, req.top_p, req.top_k);
+    let (text, p, c) = generate_blocking(&s, tokens, req.max_tokens, &sampler_cfg);
     let now = unix_secs();
     Json(json!({
         "id": id,
@@ -279,7 +301,12 @@ fn render_chat_prompt(goals: &GoalManager, messages: &[ChatMessage]) -> String {
 /// Synchronous bypass-path generation. Returns (decoded_text, prompt_tok_count,
 /// completion_tok_count). Holds the backend write lock for the full duration —
 /// fine for single-user installed app, documented limitation.
-fn generate_blocking(s: &AppState, prompt_tokens: Vec<u32>, max_tokens: usize) -> (String, usize, usize) {
+fn generate_blocking(
+    s: &AppState,
+    prompt_tokens: Vec<u32>,
+    max_tokens: usize,
+    sampler_cfg: &SamplerConfig,
+) -> (String, usize, usize) {
     let prompt_len = prompt_tokens.len();
     let eos = s.tokenizer.eos_token_id().unwrap_or(128001);
     let mut all_tokens = prompt_tokens;
@@ -291,13 +318,14 @@ fn generate_blocking(s: &AppState, prompt_tokens: Vec<u32>, max_tokens: usize) -
         } else {
             &all_tokens[all_tokens.len() - 1..]
         };
-        let next = match backend.generate_token(input) {
-            Ok((t, _)) => t,
+        let logits = match backend.forward_logits(input) {
+            Ok(l) => l,
             Err(e) => {
-                tracing::warn!("generate_token failed: {e}");
+                tracing::warn!("forward_logits failed: {e}");
                 break;
             }
         };
+        let next = sample(&logits, sampler_cfg);
         if next == eos || next == 128009 {
             break;
         }
@@ -315,6 +343,7 @@ fn chat_stream(
     s: AppState,
     prompt_tokens: Vec<u32>,
     max_tokens: usize,
+    sampler_cfg: SamplerConfig,
     id: String,
     model_id: String,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
@@ -352,13 +381,14 @@ fn chat_stream(
             } else {
                 &all_tokens[all_tokens.len() - 1..]
             };
-            let next = match backend.generate_token(input) {
-                Ok((t, _)) => t,
+            let logits = match backend.forward_logits(input) {
+                Ok(l) => l,
                 Err(e) => {
-                    tracing::warn!("generate_token failed: {e}");
+                    tracing::warn!("forward_logits failed: {e}");
                     break;
                 }
             };
+            let next = sample(&logits, &sampler_cfg);
             if next == eos || next == 128009 {
                 break;
             }
