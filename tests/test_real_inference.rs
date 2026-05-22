@@ -179,7 +179,7 @@ fn test_hooks_on_real_backend() {
     // Fire hooks with a dummy hidden state
     let mut context = HookContext::new("req-hook-test");
     context.tokens_generated = 10;
-    context.current_confidence = 0.5;
+    context.current_confidence.set(0.5);
 
     // Test steering hook (layer 8)
     let mut hidden = vec![1.0f32; 2048];
@@ -198,10 +198,8 @@ fn test_hooks_on_real_backend() {
     assert!(matches!(action2, HookAction::Continue), "Should not exit at confidence 0.5");
 
     // Test early exit hook (layer 12, confidence above threshold)
-    let high_conf_context = HookContext {
-        current_confidence: 0.99,
-        ..context.clone()
-    };
+    let high_conf_context = context.clone();
+    high_conf_context.current_confidence.set(0.99);
     let mut hidden3 = vec![1.0f32; 2048];
     let action3 = registry.fire(12, 0, &mut hidden3, &high_conf_context);
     assert!(matches!(action3, HookAction::EarlyExit { .. }), "Should exit at confidence 0.99");

@@ -161,6 +161,13 @@ impl InferenceRunner {
             for layer_idx in 8..8 + self.reasoning_layers {
                 hidden = self.backend.forward_layer(layer_idx, &hidden, seq_len).unwrap();
 
+                // Update HookContext confidence from the live hidden state
+                // so hooks like EarlyExitHook see a real signal. Source:
+                // engine::confidence::ConfidenceHead::estimate (IPR-based).
+                hook_context
+                    .current_confidence
+                    .set(crate::engine::confidence::ConfidenceHead::estimate(&hidden));
+
                 // Fire hooks (including MemoryInjectHook if registered)
                 let action = self.hook_registry.fire(layer_idx, loop_idx, &mut hidden, &hook_context);
                 match action {
@@ -181,7 +188,10 @@ impl InferenceRunner {
                 break;
             }
 
-            let confidence = (loop_idx as f32 + 1.0) / n_loops_needed as f32;
+            // Confidence at end of this reasoning loop, from the final
+            // hidden state. Replaces the v0.1 placeholder linear ramp
+            // `(loop_idx + 1) / n_loops_needed`.
+            let confidence = crate::engine::confidence::ConfidenceHead::estimate(&hidden);
             state.record_loop(memory_per_loop, confidence);
         }
 

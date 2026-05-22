@@ -14,10 +14,13 @@ impl Hook for EarlyExitHook {
         _hidden_state: &mut Tensor,
         context: &HookContext,
     ) -> HookAction {
-        // Stub: check confidence from context
-        if context.current_confidence > self.threshold {
+        // Read the runner-updated confidence via Cell interior mutability.
+        // Real signal source: `ConfidenceHead::estimate` in `engine::confidence`,
+        // computed per layer inside the reasoning loop.
+        let c = context.current_confidence.get();
+        if c > self.threshold {
             HookAction::EarlyExit {
-                reason: format!("confidence {:.3} > threshold {:.3}", context.current_confidence, self.threshold),
+                reason: format!("confidence {:.3} > threshold {:.3}", c, self.threshold),
             }
         } else {
             HookAction::Continue

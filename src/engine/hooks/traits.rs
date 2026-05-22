@@ -20,7 +20,13 @@ pub enum HookAction {
 pub struct HookContext {
     pub request_id: String,
     pub tokens_generated: usize,
-    pub current_confidence: f32,
+    /// Confidence signal updated by the runner before each hook firing.
+    /// Wrapped in `Cell` for the same reason as `stores_remaining` —
+    /// hooks see `&HookContext` and can read the latest value with
+    /// `.get()` without forcing the `fire()` signature to take `&mut`.
+    /// Source today: `ConfidenceHead::estimate(&hidden_state)` from
+    /// `engine::confidence`.
+    pub current_confidence: Cell<f32>,
     /// Number of memory writes (captures) a hook may still perform in this
     /// request. Hook implementations should `get()` to check and `set()` to
     /// decrement; `MemoryInjectHook` already does so.
@@ -37,7 +43,7 @@ impl HookContext {
         Self {
             request_id: request_id.into(),
             tokens_generated: 0,
-            current_confidence: 0.0,
+            current_confidence: Cell::new(0.0),
             stores_remaining: Cell::new(Self::DEFAULT_STORES_PER_REQUEST),
         }
     }
