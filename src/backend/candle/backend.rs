@@ -1,8 +1,8 @@
+use crate::backend::candle::quantized_llama_fork::ModelWeights;
 use crate::backend::traits::*;
 use crate::error::{Result, ZllmError};
-use candle_core::{DType, Device, Tensor as CandleTensor};
 use candle_core::quantized::gguf_file;
-use candle_transformers::models::quantized_llama::ModelWeights;
+use candle_core::{DType, Device, Tensor as CandleTensor};
 use std::path::Path;
 
 pub struct CandleCpuBackend {
@@ -41,6 +41,25 @@ impl CandleCpuBackend {
     /// `engine::sampler::sample`). The greedy path stays available via
     /// `generate_token`, which delegates here and applies argmax.
     pub fn forward_logits(&mut self, prompt_tokens: &[u32]) -> Result<Vec<f32>> {
+        self.forward_logits_with_observer(prompt_tokens, |_, _| {})
+    }
+
+    /// Same as `forward_logits`, but invokes `on_layer(layer_idx, &hidden)`
+    /// after every transformer block. `hidden` is the live residual
+    /// stream as a borrow on the underlying candle tensor (shape
+    /// `(1, seq_len, n_embd)`). The hook can read it cheaply (no copy)
+    /// for memory capture; mutation requires building a replacement
+    /// tensor and is out of v0.7 scope.
+    ///
+    /// This is the surface the chat handler / inference runner uses to
+    /// fire its `HookRegistry` mid-inference — see
+    /// `crate::backend::candle::quantized_llama_fork::ModelWeights::forward_with_callback`
+    /// for why the fork exists.
+    pub fn forward_logits_with_observer<F: FnMut(usize, &CandleTensor)>(
+        &mut self,
+        prompt_tokens: &[u32],
+        on_layer: F,
+    ) -> Result<Vec<f32>> {
         let model = self
             .model
             .as_mut()
@@ -52,7 +71,7 @@ impl CandleCpuBackend {
             .map_err(|e| ZllmError::Backend(format!("unsqueeze: {e}")))?;
 
         let logits = model
-            .forward(&input, self.index_pos)
+            .forward_with_callback(&input, self.index_pos, on_layer)
             .map_err(|e| ZllmError::Backend(format!("forward pass: {e}")))?;
 
         self.index_pos += prompt_tokens.len();
