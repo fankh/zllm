@@ -2,7 +2,7 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     http::{StatusCode, header},
-    response::{Html, IntoResponse, Sse, sse::Event},
+    response::{IntoResponse, Sse, sse::Event},
     routing::{get, patch, post},
 };
 use futures::stream::Stream;
@@ -56,8 +56,29 @@ pub fn router(state: AppState) -> Router {
 
 // --- UI + ops ---
 
-async fn chat_ui() -> Html<&'static str> {
-    Html(CHAT_UI_HTML)
+/// Serve the embedded chat UI HTML.
+///
+/// Built as an explicit response (rather than `axum::response::Html`) to be
+/// defensive against browsers that download the page instead of rendering it:
+/// - `Content-Disposition: inline` — explicitly tells the browser to render,
+///   not download. Fixes the bug where Chrome was saving the page as a
+///   UUID-named file with no extension.
+/// - `X-Content-Type-Options: nosniff` — prevents MIME sniffing from
+///   second-guessing the declared `text/html`.
+/// - `Cache-Control: no-cache` — ensures chat UI updates take effect on
+///   reload during development; for an installed app the binary IS the cache
+///   buster, but explicit no-cache avoids stale-UI confusion.
+async fn chat_ui() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CONTENT_DISPOSITION, "inline"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        CHAT_UI_HTML,
+    )
 }
 
 async fn health() -> Json<Value> {
