@@ -135,14 +135,22 @@ impl InferenceRunner {
         state.token_importances = importances.clone();
         let avg_importance = TokenImportanceScorer::average_importance(&importances);
 
-        // Determine loop count from importance
+        // Determine loop count.
+        // - `per_token_adaptive` mode: weight by the share of high-
+        //   importance tokens (existing logic).
+        // - Otherwise: use DifficultyEstimator::estimate over the
+        //   current hidden state, mapped through map_to_loops, capped
+        //   at the budget. v0.1 just returned budget.max_loops here.
         let n_loops_needed = if budget.per_token_adaptive {
             let high_importance_ratio = importances.iter().filter(|&&s| s >= 0.7).count() as f32
                 / importances.len().max(1) as f32;
             let adaptive = (high_importance_ratio * budget.max_loops as f32).ceil() as usize;
             adaptive.max(1).min(budget.max_loops)
         } else {
-            budget.max_loops
+            let level = crate::engine::difficulty::DifficultyEstimator::estimate(&hidden);
+            crate::engine::difficulty::DifficultyEstimator::map_to_loops(level)
+                .min(budget.max_loops)
+                .max(1)
         };
 
         // Zone 2: Reasoning loops (budgeted)
