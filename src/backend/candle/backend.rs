@@ -34,6 +34,12 @@ impl CandleCpuBackend {
         self.index_pos = 0;
     }
 
+    /// Number of transformer blocks in the loaded model. Returns 0 if no
+    /// model is loaded yet.
+    pub fn n_layers(&self) -> usize {
+        self.n_layers
+    }
+
     /// Run the forward pass and return the next-token logits as a
     /// `Vec<f32>` of length `vocab_size`. Increments `index_pos` for
     /// KV-cache state. Use this when you want to apply a custom sampler

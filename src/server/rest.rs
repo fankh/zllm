@@ -18,7 +18,7 @@ use crate::backend::candle::tokenizer::LlamaTokenizer;
 use crate::config::EngineConfig;
 use crate::control_plane::goal_manager::{GoalManager, TaskStatus};
 use crate::engine::logit_fsm::LogitFSM;
-use crate::engine::memory_store::MemoryStore;
+use crate::engine::memory_store::{MemoryCategory, MemoryMetadata, MemoryStore};
 use crate::engine::sampler::{SamplerConfig, sample};
 
 const CHAT_UI_HTML: &str = include_str!("chat_ui.html");
@@ -209,11 +209,11 @@ async fn chat_completions(
     let fsm = req.grammar.as_deref().map(LogitFSM::new);
 
     if req.stream {
-        let stream = chat_stream(s.clone(), tokens, max_tokens, sampler_cfg, fsm, id, model_id);
+        let stream = chat_stream(s.clone(), tokens, max_tokens, sampler_cfg, fsm, id.clone(), model_id);
         Sse::new(stream).into_response()
     } else {
         let (text, prompt_tokens, completion_tokens) =
-            generate_blocking(&s, tokens, max_tokens, &sampler_cfg, fsm.as_ref());
+            generate_blocking(&s, tokens, max_tokens, &sampler_cfg, fsm.as_ref(), &id);
         let now = unix_secs();
         Json(json!({
             "id": id,
@@ -272,7 +272,7 @@ async fn text_completions(
     let id = format!("cmpl-{}", Uuid::new_v4());
     let sampler_cfg = sampler_from_request(&s.engine, req.temperature, req.top_p, req.top_k);
     let fsm = req.grammar.as_deref().map(LogitFSM::new);
-    let (text, p, c) = generate_blocking(&s, tokens, req.max_tokens, &sampler_cfg, fsm.as_ref());
+    let (text, p, c) = generate_blocking(&s, tokens, req.max_tokens, &sampler_cfg, fsm.as_ref(), &id);
     let now = unix_secs();
     Json(json!({
         "id": id,
@@ -294,6 +294,40 @@ async fn text_completions(
 }
 
 // --- Generation ---
+
+/// Mean-pool a `(1, seq_len, n_embd)` candle tensor and write it into
+/// `MemoryStore` as a chat-prefill capture. Fires once per chat request
+/// from inside `forward_logits_with_observer` (v0.7 Phase 2). Lets the
+/// memory store actually populate from chat conversations — before this,
+/// the only way to write to the store was via the `GoalManager` API.
+fn capture_prefill_to_memory(
+    memory: &Arc<RwLock<MemoryStore>>,
+    request_id: &str,
+    layer_idx: usize,
+    hidden: &candle_core::Tensor,
+) {
+    let pooled = match hidden
+        .mean(1)
+        .and_then(|t| t.squeeze(0))
+        .and_then(|t| t.to_vec1::<f32>())
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("chat capture mean-pool failed at layer {layer_idx}: {e}");
+            return;
+        }
+    };
+    if let Ok(mut store) = memory.write() {
+        let metadata = MemoryMetadata {
+            source_request_id: request_id.to_string(),
+            layer_captured: layer_idx,
+            category: MemoryCategory::Context,
+            tags: vec!["chat".into(), "prefill".into()],
+            text_summary: format!("chat prefill at layer {layer_idx}"),
+        };
+        store.store(format!("{request_id}:prefill"), pooled, metadata);
+    }
+}
 
 /// Llama 3 instruct chat template with the goal prefix folded into the
 /// effective system message. Hand-built — getting the special tokens right
@@ -339,19 +373,36 @@ fn generate_blocking(
     max_tokens: usize,
     sampler_cfg: &SamplerConfig,
     fsm: Option<&LogitFSM>,
+    request_id: &str,
 ) -> (String, usize, usize) {
     let prompt_len = prompt_tokens.len();
     let eos = s.tokenizer.eos_token_id().unwrap_or(128001);
     let mut all_tokens = prompt_tokens;
     let mut generated_ids: Vec<u32> = Vec::new();
     let mut backend = s.backend.write().expect("backend poisoned");
+    let last_layer = backend.n_layers().saturating_sub(1);
     for _ in 0..max_tokens {
-        let input = if generated_ids.is_empty() {
+        let is_prefill = generated_ids.is_empty();
+        let input = if is_prefill {
             &all_tokens[..]
         } else {
             &all_tokens[all_tokens.len() - 1..]
         };
-        let mut logits = match backend.forward_logits(input) {
+        // Prefill: observe the final-layer residual stream and capture
+        // it into MemoryStore. Subsequent single-token continuations
+        // skip the observer (no capture per token).
+        let logits_result = if is_prefill {
+            let memory = s.memory.clone();
+            let req_id = request_id.to_string();
+            backend.forward_logits_with_observer(input, move |layer_idx, hidden| {
+                if layer_idx == last_layer {
+                    capture_prefill_to_memory(&memory, &req_id, layer_idx, hidden);
+                }
+            })
+        } else {
+            backend.forward_logits(input)
+        };
+        let mut logits = match logits_result {
             Ok(l) => l,
             Err(e) => {
                 tracing::warn!("forward_logits failed: {e}");
@@ -411,16 +462,33 @@ fn chat_stream(
         let mut all_tokens = prompt_tokens;
         let mut backend = s.backend.write().expect("backend poisoned");
         let mut generated = 0usize;
+        let last_layer = backend.n_layers().saturating_sub(1);
+        let memory = s.memory.clone();
+        let req_id = id.clone();
         loop {
             if generated >= max_tokens {
                 break;
             }
-            let input = if generated == 0 {
+            let is_prefill = generated == 0;
+            let input = if is_prefill {
                 &all_tokens[..]
             } else {
                 &all_tokens[all_tokens.len() - 1..]
             };
-            let mut logits = match backend.forward_logits(input) {
+            let logits_result = if is_prefill {
+                // Same pattern as generate_blocking: observe + capture
+                // once at prefill, plain forward thereafter.
+                let memory = memory.clone();
+                let req_id = req_id.clone();
+                backend.forward_logits_with_observer(input, move |layer_idx, hidden| {
+                    if layer_idx == last_layer {
+                        capture_prefill_to_memory(&memory, &req_id, layer_idx, hidden);
+                    }
+                })
+            } else {
+                backend.forward_logits(input)
+            };
+            let mut logits = match logits_result {
                 Ok(l) => l,
                 Err(e) => {
                     tracing::warn!("forward_logits failed: {e}");
