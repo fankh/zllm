@@ -1,5 +1,70 @@
 # Changelog
 
+## v0.7.0 — 2026-05-22
+
+First release since v0.1.3. Six unreleased milestones fold in here.
+Brief recap; see commit history for full detail.
+
+### Major features
+
+- **v0.2 — memory management overhaul**: `MemoryStore` gains byte budgets per category, TTL + pin flags, write quotas, per-category and per-tag indexes. `GoalManager` pins Goals and active Tasks so they survive `Context` write storms. Six new prometheus metrics on the `/metrics` endpoint (`zllm_memory_bytes_used`, `zllm_memory_entries{category}`, etc.). Lazy eviction, no background tasks.
+
+- **v0.3 — installed-app stance cleanup**: drop SaaS vestiges. `tenant_id` removed from `MemoryMetadata` / `HookContext` / `InferenceRunner::generate` / `build_injection_vector*` / `query_by_tenant`. Delete `proto/admin.proto`, `src/control_plane/router.rs`, `src/control_plane/gateway.rs`, `src/memory/isolation.rs` (TenantMemoryPool). Drop unused CLI subcommands (`Tenants`, `Hooks`, `Bench`, `Metrics`). Net: 342 lines deleted.
+
+- **v0.4 — REST-first**: drop gRPC entirely (no more `tonic` / `prost` / `tonic-build` / `protoc` / `build.rs` / `proto/`). New OpenAI-compatible REST surface on the existing axum server: `/v1/models`, `/v1/chat/completions` (with SSE streaming), `/v1/completions`. Goal CRUD over REST: `/v1/goal/{state,set,list,current,task,status}`. Embedded chat UI served at `/` (vanilla HTML/CSS/JS, sidebar shows current goal/tasks/status, localStorage history).
+
+- **v0.5 — inference performance + mock-data audit**: 
+  - Wire the project sampler into the chat path (was greedy-only — `temperature`/`top_p`/`top_k` were parsed and ignored).
+  - `[profile.release]` tuning: `lto = "fat"`, `codegen-units = 1`, `strip = true`.
+  - `.cargo/config.toml` with `target-cpu=native` for local builds; CI release artifacts override `RUSTFLAGS=""` to stay portable.
+  - `LogitFSM` ban-mode wired into chat (`grammar = "ban:128001,128009"` etc.) — was completely unwired before.
+  - `ConfidenceHead` real IPR-based implementation (was `false` always); `HookContext.current_confidence` updated per layer; `EarlyExitHook` now actually fires.
+  - `DifficultyEstimator` real implementation; wired into runner's non-adaptive branch.
+  - Fix download bug where Chrome saved the chat UI HTML instead of rendering it (`Content-Disposition: inline` + `X-Content-Type-Options: nosniff`).
+
+- **v0.7 — Option E partial-fork**:
+  - Vendor `candle_transformers::models::quantized_llama` into `src/backend/candle/quantized_llama_fork.rs` (MIT/Apache-2.0) to expose per-layer access that upstream keeps private.
+  - New `ModelWeights::forward_with_callback` fires `(layer_idx, &Tensor)` after each transformer block.
+  - New `CandleCpuBackend::forward_logits_with_observer` lets the chat path observe the residual stream mid-forward.
+  - Chat-prefill capture wired: every chat completion now writes a mean-pooled final-layer hidden state into `MemoryStore` as a `Context` entry. `MemoryStore` is no longer goal-manager-write-only.
+
+### Mock-data scorecard (vs v0.1.3)
+
+| Was mocked | v0.7.0 status |
+|---|---|
+| `LogitFSM::apply_mask` / `advance` no-ops | **Fixed** (ban-mode real) |
+| `ConfidenceHead::should_exit → false` | **Fixed** (IPR signal) |
+| `runner.rs` fake confidence ramp | **Fixed** (real per-loop estimate) |
+| `HookContext.current_confidence` static 0.0 | **Fixed** (Cell, updated per layer) |
+| `DifficultyEstimator::estimate → 1` | **Fixed** (inverse-confidence buckets) |
+| `tenant_id`-scoped APIs | **Deleted** (installed-app stance) |
+| Per-layer hooks fire on chat | **Half-fixed** (capture wired; inject still mutation-only via forward; replacement is Phase 3) |
+| `CandleCpuBackend::forward_layer → identity` | Still mocked — needs runner integration |
+| `CandleCpuBackend::compute_logits → zeros` | Still mocked — same |
+| `runner.rs vec![0.1f32; …]` placeholder | Still mocked — needs `Backend::embed_tokens` |
+| `GoalManager` zero-vector storage | Still mocked — needs an encoder pass |
+
+### Surface today
+
+Single CLI: `zllm serve` (REST + chat UI) and `zllm generate` (one-shot CPU inference).
+
+REST endpoints on `:8080`:
+- `GET /`, `/health`, `/v1/info`, `/metrics`
+- `GET /v1/models`
+- `POST /v1/chat/completions` (stream + non-stream)
+- `POST /v1/completions`
+- Goal CRUD: `GET /v1/goal/state`, `GET /v1/goal/list`, `POST /v1/goal/{set,current,task,status}`, `PATCH /v1/goal/task/{id}`
+
+### Tests
+
+60 passing: 39 lib + 21 integration smoke. Three new test modules added since v0.1.3 (`LogitFSM`, `ConfidenceHead`, `DifficultyEstimator`); existing memory_store / goal_manager / sampler / inspection tests preserved.
+
+### Build
+
+- `cargo build --release` ≈ 2-4 min (LTO fat is expensive but worth it).
+- No more `protoc` build dependency.
+- `.cargo/config.toml` opts local builds into `target-cpu=native`; CI releases override.
+
 ## v0.1.3 — 2026-05-13
 
 Workflow-only release. No code changes from v0.1.0.
