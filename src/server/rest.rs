@@ -17,6 +17,7 @@ use crate::backend::candle::backend::CandleCpuBackend;
 use crate::backend::candle::tokenizer::LlamaTokenizer;
 use crate::config::EngineConfig;
 use crate::control_plane::goal_manager::{GoalManager, TaskStatus};
+use crate::engine::logit_fsm::LogitFSM;
 use crate::engine::memory_store::MemoryStore;
 use crate::engine::sampler::{SamplerConfig, sample};
 
@@ -152,6 +153,12 @@ struct ChatRequest {
     top_p: Option<f32>,
     #[serde(default)]
     top_k: Option<usize>,
+    /// Optional logit-constraint string. v0.5 supports `"ban:<id>,<id>,…"`;
+    /// see `engine::logit_fsm::LogitFSM` for the full list of modes.
+    /// Non-OpenAI-standard but cheap to add and useful for the
+    /// installed-app case.
+    #[serde(default)]
+    grammar: Option<String>,
 }
 
 fn sampler_from_request(
@@ -199,13 +206,14 @@ async fn chat_completions(
     let model_id = s.model_id.clone();
     let max_tokens = req.max_tokens;
     let sampler_cfg = sampler_from_request(&s.engine, req.temperature, req.top_p, req.top_k);
+    let fsm = req.grammar.as_deref().map(LogitFSM::new);
 
     if req.stream {
-        let stream = chat_stream(s.clone(), tokens, max_tokens, sampler_cfg, id, model_id);
+        let stream = chat_stream(s.clone(), tokens, max_tokens, sampler_cfg, fsm, id, model_id);
         Sse::new(stream).into_response()
     } else {
         let (text, prompt_tokens, completion_tokens) =
-            generate_blocking(&s, tokens, max_tokens, &sampler_cfg);
+            generate_blocking(&s, tokens, max_tokens, &sampler_cfg, fsm.as_ref());
         let now = unix_secs();
         Json(json!({
             "id": id,
@@ -241,6 +249,8 @@ struct CompletionRequest {
     top_p: Option<f32>,
     #[serde(default)]
     top_k: Option<usize>,
+    #[serde(default)]
+    grammar: Option<String>,
 }
 
 async fn text_completions(
@@ -261,7 +271,8 @@ async fn text_completions(
     };
     let id = format!("cmpl-{}", Uuid::new_v4());
     let sampler_cfg = sampler_from_request(&s.engine, req.temperature, req.top_p, req.top_k);
-    let (text, p, c) = generate_blocking(&s, tokens, req.max_tokens, &sampler_cfg);
+    let fsm = req.grammar.as_deref().map(LogitFSM::new);
+    let (text, p, c) = generate_blocking(&s, tokens, req.max_tokens, &sampler_cfg, fsm.as_ref());
     let now = unix_secs();
     Json(json!({
         "id": id,
@@ -327,6 +338,7 @@ fn generate_blocking(
     prompt_tokens: Vec<u32>,
     max_tokens: usize,
     sampler_cfg: &SamplerConfig,
+    fsm: Option<&LogitFSM>,
 ) -> (String, usize, usize) {
     let prompt_len = prompt_tokens.len();
     let eos = s.tokenizer.eos_token_id().unwrap_or(128001);
@@ -339,13 +351,18 @@ fn generate_blocking(
         } else {
             &all_tokens[all_tokens.len() - 1..]
         };
-        let logits = match backend.forward_logits(input) {
+        let mut logits = match backend.forward_logits(input) {
             Ok(l) => l,
             Err(e) => {
                 tracing::warn!("forward_logits failed: {e}");
                 break;
             }
         };
+        if let Some(fsm) = fsm {
+            if fsm.is_active() {
+                fsm.apply_mask(&mut logits);
+            }
+        }
         let next = sample(&logits, sampler_cfg);
         if next == eos || next == 128009 {
             break;
@@ -365,6 +382,7 @@ fn chat_stream(
     prompt_tokens: Vec<u32>,
     max_tokens: usize,
     sampler_cfg: SamplerConfig,
+    fsm: Option<LogitFSM>,
     id: String,
     model_id: String,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
@@ -402,13 +420,18 @@ fn chat_stream(
             } else {
                 &all_tokens[all_tokens.len() - 1..]
             };
-            let logits = match backend.forward_logits(input) {
+            let mut logits = match backend.forward_logits(input) {
                 Ok(l) => l,
                 Err(e) => {
                     tracing::warn!("forward_logits failed: {e}");
                     break;
                 }
             };
+            if let Some(fsm) = &fsm {
+                if fsm.is_active() {
+                    fsm.apply_mask(&mut logits);
+                }
+            }
             let next = sample(&logits, &sampler_cfg);
             if next == eos || next == 128009 {
                 break;
