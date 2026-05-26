@@ -16,11 +16,44 @@ pub struct CandleCpuBackend {
     index_pos: usize,
 }
 
+/// Pick the best Candle device available at runtime given the compiled
+/// feature set. Metal takes precedence on macOS, CUDA on Linux/Windows,
+/// CPU as a safe fallback if either init fails (e.g., compiled with
+/// `--features cuda` but no NVIDIA driver present).
+///
+/// The struct name `CandleCpuBackend` is historical from before v0.6 —
+/// it now backs all three devices. Renaming is held back to avoid a
+/// large mechanical diff across callers.
+fn select_best_device() -> Device {
+    #[cfg(feature = "metal")]
+    {
+        match Device::new_metal(0) {
+            Ok(d) => {
+                tracing::info!("Candle backend: selected Metal device 0");
+                return d;
+            }
+            Err(e) => tracing::debug!("Metal init failed, falling back: {e}"),
+        }
+    }
+    #[cfg(feature = "cuda")]
+    {
+        match Device::new_cuda(0) {
+            Ok(d) => {
+                tracing::info!("Candle backend: selected CUDA device 0");
+                return d;
+            }
+            Err(e) => tracing::debug!("CUDA init failed, falling back: {e}"),
+        }
+    }
+    tracing::info!("Candle backend: selected CPU");
+    Device::Cpu
+}
+
 impl CandleCpuBackend {
     pub fn new() -> Self {
         Self {
             model: None,
-            device: Device::Cpu,
+            device: select_best_device(),
             n_layers: 0,
             hidden_size: 0,
             vocab_size: 0,
@@ -28,6 +61,26 @@ impl CandleCpuBackend {
             next_block_id: 0,
             index_pos: 0,
         }
+    }
+
+    /// Build a backend with an explicit device. Useful for tests, for
+    /// pinning to a specific GPU ordinal, or for forcing CPU on a box
+    /// that has a flaky GPU.
+    pub fn with_device(device: Device) -> Self {
+        Self {
+            model: None,
+            device,
+            n_layers: 0,
+            hidden_size: 0,
+            vocab_size: 0,
+            hidden_states: Vec::new(),
+            next_block_id: 0,
+            index_pos: 0,
+        }
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
     }
 
     pub fn reset_position(&mut self) {
@@ -214,10 +267,17 @@ impl Backend for CandleCpuBackend {
     }
 
     fn device_info(&self) -> DeviceInfo {
+        let (name, backend) = if self.device.is_cuda() {
+            ("CUDA (candle)".to_string(), "candle-cuda".to_string())
+        } else if self.device.is_metal() {
+            ("Metal (candle)".to_string(), "candle-metal".to_string())
+        } else {
+            ("CPU (candle)".to_string(), "candle-cpu".to_string())
+        };
         DeviceInfo {
-            name: "CPU (candle)".to_string(),
-            backend: "candle-cpu".to_string(),
-            memory_total_mb: 0, // TODO: detect system RAM
+            name,
+            backend,
+            memory_total_mb: 0, // TODO: detect via candle once exposed
             memory_used_mb: 0,
             supports_fp8: false,
             supports_fp4: false,
