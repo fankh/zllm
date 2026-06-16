@@ -1,0 +1,78 @@
+{
+  "goals": [
+    {
+      "goal_id": "184d9118-7285-4c88-929a-5e29af9bdca8",
+      "text": "test",
+      "is_current": false
+    },
+    {
+      "goal_id": "cc9ab395-a9af-4685-b3c2-5c22004d6b2e",
+      "text": "ewgw",
+      "is_current": true
+    },
+    {
+      "goal_id": "64598cdc-69c9-431b-86da-d7fdd418ba2f",
+      "text": "d",
+      "is_current": false
+    },
+    {
+      "goal_id": "5fc5d595-23a6-4bab-8cb7-f862ce8b7059",
+      "text": "few",
+      "is_current": false
+    },
+    {
+      "goal_id": "1475c368-1e58-49b8-b78b-f585a4dcd646",
+      "text": "survive a server restart",
+      "is_current": false
+    },
+    {
+      "goal_id": "dd7f7001-6f3c-4fd3-a58d-a22a285e28c6",
+      "text": "e",
+      "is_current": false
+    },
+    {
+      "goal_id": "9a94adad-6260-4272-9dc0-534fe42267a9",
+      "text": "tset",
+      "is_current": false
+    }
+  ],
+  "tasks": [
+    {
+      "task_id": "8c552d74-8b46-4725-abdb-c3690e2970a5",
+      "goal_id": "64598cdc-69c9-431b-86da-d7fdd418ba2f",
+      "text": "test",
+      "status": "Done"
+    },
+    {
+      "task_id": "70c6b189-08f8-43e9-8891-d2e2e796c356",
+      "goal_id": "1475c368-1e58-49b8-b78b-f585a4dcd646",
+      "text": "task A",
+      "status": "Done"
+    },
+    {
+      "task_id": "f6986eb7-2a9d-432b-9bf6-264da32dc6e2",
+      "goal_id": "64598cdc-69c9-431b-86da-d7fdd418ba2f",
+      "text": "asfaf",
+      "status": "Done"
+    },
+    {
+      "task_id": "5a12e478-1bc7-4add-b448-56bdddd8360c",
+      "goal_id": "64598cdc-69c9-431b-86da-d7fdd418ba2f",
+      "text": "ff",
+      "status": "Done"
+    },
+    {
+      "task_id": "8020d159-fdcf-46ab-86e1-b889a237d6d5",
+      "goal_id": "cc9ab395-a9af-4685-b3c2-5c22004d6b2e",
+      "text": "ttt",
+      "status": "Done"
+    },
+    {
+      "task_id": "b4c1b6ab-d0ad-41d9-b495-f67c9b7e9551",
+      "goal_id": "1475c368-1e58-49b8-b78b-f585a4dcd646",
+      "text": "tttt",
+      "status": "Active"
+    }
+  ],
+  "status": null
+}

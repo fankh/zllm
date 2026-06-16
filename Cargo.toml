@@ -1,6 +1,6 @@
 [package]
 name = "zllm"
-version = "0.1.0"
+version = "0.7.0"
 edition = "2024"
 description = "ZLLM — White-box LLM inference engine with zero-copy latent intercept"
 license = "MIT"
@@ -43,6 +43,8 @@ prometheus = "0.14"
 candle-core = "0.10"
 candle-nn = "0.10"
 candle-transformers = "0.10"
+rayon = "1.10"
+core_affinity = "0.8"
 tokenizers = "0.21"
 hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "ureq"] }
 
@@ -50,6 +52,17 @@ hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", 
 bitvec = "1"
 rand = "0.9"
 uuid = { version = "1", features = ["v4"] }
+
+# iGPU compute (wgpu → Vulkan on AMD). Pure-Rust shader compilation via
+# naga (WGSL), so no Vulkan SDK / cmake / glslang needed. Gated behind
+# the `gpu` feature; off by default so CPU builds stay lean.
+wgpu = { version = "22", optional = true }
+pollster = { version = "0.3", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+
+# (No external profiler dep — Windows ADK / pprof-rs both fail in this
+# environment. Profiling done via in-process timing instrumentation
+# behind the `profile` feature; see src/backend/candle/quantized_llama_fork.rs.)
 
 [profile.release]
 # Inference performance squeeze. LTO fat ~doubles release-mode build time
@@ -63,8 +76,23 @@ strip = true
 opt-level = 3
 panic = "unwind"
 
+# Same as release but keeps debug symbols so profilers (samply,
+# perf, vtune) can attribute samples to function names. About the
+# same perf — debug info doesn't change generated code.
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
+
 [features]
 default = []
+# AMD iGPU compute path via wgpu/Vulkan. Build with `--features gpu`.
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+# Enable in-process per-layer timing inside the Candle forward path.
+# Off by default (timing calls have non-zero cost). Build with
+# `cargo build --profile profiling --features profile`. The chat
+# handler emits a summary line per request when this is on.
+profile = []
 cuda = [
     "candle-core/cuda",
     "candle-nn/cuda",

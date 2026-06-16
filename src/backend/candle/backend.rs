@@ -83,8 +83,37 @@ impl CandleCpuBackend {
         &self.device
     }
 
+    /// Number of token positions currently in the KV cache. Equals
+    /// `index_pos`. Used by speculative decoding to know how far to
+    /// truncate after a rejected draft.
+    pub fn position(&self) -> usize {
+        self.index_pos
+    }
+
+    /// Reset both the position counter and the underlying KV cache so
+    /// the next forward pass starts from a clean slate. Call between
+    /// independent chat requests — without this, position + cache
+    /// accumulate across requests until the model's effective range is
+    /// exceeded and generation collapses to immediate EOS.
     pub fn reset_position(&mut self) {
         self.index_pos = 0;
+        if let Some(model) = self.model.as_mut() {
+            model.clear_kv_cache();
+        }
+    }
+
+    /// Keep the first `n` token positions in the KV cache and set
+    /// `index_pos = n`. Used by prompt-prefix caching to reuse a
+    /// previous request's prefill K/V instead of recomputing it.
+    /// Returns `Err` if the KV-truncation tensor op fails.
+    pub fn truncate_to(&mut self, n: usize) -> Result<()> {
+        self.index_pos = n;
+        if let Some(model) = self.model.as_mut() {
+            model
+                .truncate_kv_cache(n)
+                .map_err(|e| ZllmError::Backend(format!("truncate_kv_cache: {e}")))?;
+        }
+        Ok(())
     }
 
     /// Number of transformer blocks in the loaded model. Returns 0 if no
@@ -142,6 +171,94 @@ impl CandleCpuBackend {
             .map_err(|e| ZllmError::Backend(format!("to_vec1: {e}")))?;
 
         Ok(logits_vec)
+    }
+
+    /// Diagnostic: project every layer's hidden state through the
+    /// final norm + LM head, returning the top-1 token per layer.
+    /// Used to investigate "is early exit viable on this model?" by
+    /// measuring layer-vs-final agreement. Expensive — runs n_layers
+    /// extra LM head matmuls — so for analysis only.
+    pub fn forward_per_layer_argmax(
+        &mut self,
+        tokens: &[u32],
+    ) -> Result<(Vec<f32>, Vec<u32>)> {
+        let model = self
+            .model
+            .as_mut()
+            .ok_or_else(|| ZllmError::Model("model not loaded".into()))?;
+        let input = CandleTensor::new(tokens, &self.device)
+            .map_err(|e| ZllmError::Backend(format!("tensor creation: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| ZllmError::Backend(format!("unsqueeze: {e}")))?;
+        let (logits, top1_per_layer) = model
+            .forward_per_layer_argmax(&input, self.index_pos)
+            .map_err(|e| ZllmError::Backend(format!("forward pass: {e}")))?;
+        self.index_pos += tokens.len();
+        let logits_vec: Vec<f32> = logits
+            .squeeze(0)
+            .map_err(|e| ZllmError::Backend(format!("squeeze: {e}")))?
+            .to_vec1()
+            .map_err(|e| ZllmError::Backend(format!("to_vec1: {e}")))?;
+        Ok((logits_vec, top1_per_layer))
+    }
+
+    /// Forward with a per-layer "should we exit now?" callback. Wraps
+    /// `ModelWeights::forward_with_early_exit`. Returns
+    /// `(logits, exit_layer_idx)` — `exit_layer_idx == n_layers - 1`
+    /// means no early exit fired.
+    pub fn forward_logits_early_exit<F>(
+        &mut self,
+        prompt_tokens: &[u32],
+        should_exit: F,
+    ) -> Result<(Vec<f32>, usize)>
+    where
+        F: FnMut(usize, &CandleTensor) -> bool,
+    {
+        let model = self
+            .model
+            .as_mut()
+            .ok_or_else(|| ZllmError::Model("model not loaded".into()))?;
+        let input = CandleTensor::new(prompt_tokens, &self.device)
+            .map_err(|e| ZllmError::Backend(format!("tensor creation: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| ZllmError::Backend(format!("unsqueeze: {e}")))?;
+        let (logits, exit_at) = model
+            .forward_with_early_exit(&input, self.index_pos, should_exit)
+            .map_err(|e| ZllmError::Backend(format!("forward pass: {e}")))?;
+        self.index_pos += prompt_tokens.len();
+        let logits_vec: Vec<f32> = logits
+            .squeeze(0)
+            .map_err(|e| ZllmError::Backend(format!("squeeze: {e}")))?
+            .to_vec1()
+            .map_err(|e| ZllmError::Backend(format!("to_vec1: {e}")))?;
+        Ok((logits_vec, exit_at))
+    }
+
+    /// Multi-position forward used by speculative decoding. Returns
+    /// `(seq_len, vocab)` — one logit vector per input token. Caller
+    /// is responsible for truncating the KV cache afterwards if any
+    /// of the input positions are rejected.
+    pub fn forward_all_logits(&mut self, tokens: &[u32]) -> Result<Vec<Vec<f32>>> {
+        let model = self
+            .model
+            .as_mut()
+            .ok_or_else(|| ZllmError::Model("model not loaded".into()))?;
+        let input = CandleTensor::new(tokens, &self.device)
+            .map_err(|e| ZllmError::Backend(format!("tensor creation: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| ZllmError::Backend(format!("unsqueeze: {e}")))?;
+        let logits = model
+            .forward_all_positions(&input, self.index_pos)
+            .map_err(|e| ZllmError::Backend(format!("forward pass: {e}")))?;
+        self.index_pos += tokens.len();
+        // logits shape: (1, seq_len, vocab). Squeeze batch, return vec-of-vec.
+        let squeezed = logits
+            .squeeze(0)
+            .map_err(|e| ZllmError::Backend(format!("squeeze: {e}")))?;
+        let rows: Vec<Vec<f32>> = squeezed
+            .to_vec2()
+            .map_err(|e| ZllmError::Backend(format!("to_vec2: {e}")))?;
+        Ok(rows)
     }
 
     pub fn generate_token(&mut self, prompt_tokens: &[u32]) -> Result<(u32, Vec<Vec<f32>>)> {

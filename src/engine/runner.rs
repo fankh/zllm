@@ -233,6 +233,7 @@ impl InferenceRunner {
             let trace = InspectionTrace {
                 request_id: request_id.to_string(),
                 layers: layer_snapshots,
+                tokens: Vec::new(),
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()

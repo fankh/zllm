@@ -1,0 +1,33 @@
+[server]
+rest_port = 8090
+max_concurrent = 32
+
+[model]
+path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+quantization = "q4"
+max_seq_len = 8192
+tokenizer_path = "C:/models/llama-3.2-1b/tokenizer.json"
+# Scan this directory (recursively) for additional .gguf files that the
+# chat UI's picker will offer. Each .gguf must have a sibling tokenizer.json.
+dir = "C:/models"
+
+[engine]
+encoder_layers = 8
+reasoning_layers = 8
+max_loops = 16
+confidence_threshold = 0.9
+default_temperature = 1.0
+default_top_k = 50
+default_top_p = 0.9
+# Optional: draft model for speculative decoding. Leave blank to
+# disable. Spec-decode is off by default even when set (toggle via UI
+# settings or POST /v1/spec_decode/enabled). Needs the same tokenizer
+# family as the main model. Note: at the 1B/3B ratio on CPU it's
+# typically *slower* than plain decode — useful as a structural
+# demonstration but not a perf win unless main is 8B+.
+draft_model_path = ""
+backend_pool_size = 2
+
+[memory]
+block_size = 16
+max_blocks = 65536

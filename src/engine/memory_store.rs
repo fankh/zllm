@@ -76,6 +76,7 @@ pub enum StoreError {
 pub struct InspectionTrace {
     pub request_id: String,
     pub layers: Vec<LayerSnapshot>,
+    pub tokens: Vec<TokenSnapshot>,
     pub timestamp: u64,
 }
 
@@ -87,6 +88,19 @@ pub struct LayerSnapshot {
     pub hidden_state_hash: u64,
     pub top_activations: Vec<(usize, f32)>,
     pub interpretation: String,
+}
+
+/// One sampled token in the autoregressive decode. Captures what the
+/// model picked, how confident it was (softmax prob of the chosen
+/// token), and the runners-up — enough to reconstruct "where was the
+/// model unsure" without storing the full vocab distribution.
+#[derive(Debug, Clone)]
+pub struct TokenSnapshot {
+    pub step: usize,
+    pub token_id: u32,
+    pub token_text: String,
+    pub confidence: f32,
+    pub top_alternatives: Vec<(u32, f32)>,
 }
 
 const DEFAULT_TOTAL_BUDGET_BYTES: usize = 256 * 1024 * 1024; // 256 MB

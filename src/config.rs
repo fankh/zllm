@@ -24,6 +24,12 @@ pub struct ModelConfig {
     /// looks for `tokenizer.json` next to `path`.
     #[serde(default)]
     pub tokenizer_path: String,
+    /// Optional directory the server scans for additional `.gguf` files
+    /// that the chat UI's model-picker dropdown will offer. Each file
+    /// must have a sibling `tokenizer.json`. Empty / absent disables
+    /// the picker.
+    #[serde(default)]
+    pub dir: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -35,6 +41,19 @@ pub struct EngineConfig {
     pub default_temperature: f32,
     pub default_top_k: usize,
     pub default_top_p: f32,
+    /// How many backend slots to spin up. Each slot loads its own copy
+    /// of the model weights (~N × model_size RAM) but lets that many
+    /// chat requests run in parallel without contending on a single
+    /// write lock. Default 2 — set to 1 for memory-constrained boxes,
+    /// 4+ if you have RAM to spare and want more concurrency headroom.
+    #[serde(default)]
+    pub backend_pool_size: Option<usize>,
+    /// Path to a smaller "draft" GGUF used by speculative decoding.
+    /// Must share the main model's tokenizer (e.g. main = Llama 3.2
+    /// 3B, draft = Llama 3.2 1B). Loaded once per pool slot
+    /// alongside the main backend. Empty/absent disables spec-decode.
+    #[serde(default)]
+    pub draft_model_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

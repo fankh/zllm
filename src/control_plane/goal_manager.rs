@@ -1,6 +1,8 @@
 use crate::engine::memory_store::{
     MemoryCategory, MemoryMetadata, MemoryStore, StoreOptions,
 };
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
@@ -17,7 +19,7 @@ fn pinned_no_ttl() -> StoreOptions {
     StoreOptions { pinned: true, ttl_seconds: None }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskStatus {
     Active,
     Done,
@@ -43,14 +45,14 @@ impl TaskStatus {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Goal {
     pub goal_id: String,
     pub text: String,
     pub is_current: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub task_id: String,
     pub goal_id: String,
@@ -58,7 +60,7 @@ pub struct Task {
     pub status: TaskStatus,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusEntry {
     pub text: String,
     pub goal_id: String,
@@ -71,9 +73,25 @@ pub struct GoalState {
     pub latest_status: Option<StatusEntry>,
 }
 
+/// On-disk snapshot of the goal state. Lists ALL goals (not just current)
+/// and ALL tasks (active + done + blocked), so a restart reproduces the
+/// full picture, not just what's currently "live".
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PersistedState {
+    goals: Vec<Goal>,
+    tasks: Vec<Task>,
+    #[serde(default)]
+    status: Option<StatusEntry>,
+}
+
 pub struct GoalManager {
     store: Arc<RwLock<MemoryStore>>,
     d_model: usize,
+    /// If set, the manager writes its state to this path after every
+    /// mutation and rebuilds it from this path on startup. Atomic-write
+    /// (write to .tmp + rename) so a crash mid-save can't corrupt the
+    /// file. `None` disables persistence — useful for tests.
+    save_path: Option<PathBuf>,
 }
 
 impl GoalManager {
@@ -81,7 +99,156 @@ impl GoalManager {
         Self {
             store,
             d_model: D_MODEL_PLACEHOLDER,
+            save_path: None,
         }
+    }
+
+    pub fn with_save_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.save_path = Some(path.into());
+        self
+    }
+
+    /// Restore goal/task/status entries from disk. Idempotent — safe to
+    /// call on a manager that has never been saved (no-op if file missing).
+    /// Logs and continues on parse errors (returns the same instance) so
+    /// a corrupt file doesn't take down the server.
+    pub fn load_from_disk(&self) {
+        let Some(path) = &self.save_path else { return; };
+        if !path.exists() { return; }
+        let Ok(s) = std::fs::read_to_string(path) else {
+            tracing::warn!("goal persistence: failed to read {}", path.display());
+            return;
+        };
+        let Ok(state): Result<PersistedState, _> = serde_json::from_str(&s) else {
+            tracing::warn!("goal persistence: failed to parse {} — starting fresh", path.display());
+            return;
+        };
+        for g in state.goals { self.restore_goal(&g); }
+        for t in state.tasks { self.restore_task(&t); }
+        if let Some(st) = state.status { self.restore_status(&st); }
+        tracing::info!("goal persistence: restored from {}", path.display());
+    }
+
+    fn save(&self) {
+        let Some(path) = &self.save_path else { return; };
+        let state = self.snapshot_for_save();
+        let json = match serde_json::to_string_pretty(&state) {
+            Ok(s) => s,
+            Err(e) => { tracing::warn!("goal persistence: serialize failed: {e}"); return; }
+        };
+        // Atomic write: tmp file + rename. Cheap insurance against a
+        // partial-write corruption if the process dies mid-write.
+        let tmp = path.with_extension("json.tmp");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(&tmp, json) {
+            tracing::warn!("goal persistence: tmp write failed: {e}");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            tracing::warn!("goal persistence: rename failed: {e}");
+        }
+    }
+
+    fn snapshot_for_save(&self) -> PersistedState {
+        let store = self.store.read().expect("memory store poisoned");
+        let goals: Vec<Goal> = store
+            .query_by_category(&MemoryCategory::Goal)
+            .into_iter()
+            .map(|e| Goal {
+                goal_id: extract_id(&e.metadata.tags, "goal:").unwrap_or_default(),
+                text: e.metadata.text_summary.clone(),
+                is_current: e.metadata.tags.iter().any(|t| t == TAG_CURRENT),
+            })
+            .collect();
+        let tasks: Vec<Task> = store
+            .query_by_category(&MemoryCategory::Task)
+            .into_iter()
+            .map(|e| Task {
+                task_id: extract_id(&e.metadata.tags, "task:").unwrap_or_default(),
+                goal_id: extract_id(&e.metadata.tags, "goal:").unwrap_or_default(),
+                text: e.metadata.text_summary.clone(),
+                status: e
+                    .metadata
+                    .tags
+                    .iter()
+                    .find_map(|t| TaskStatus::from_tag(t))
+                    .unwrap_or(TaskStatus::Active),
+            })
+            .collect();
+        let status = store
+            .query_by_category(&MemoryCategory::Status)
+            .into_iter()
+            .max_by_key(|e| e.created_at)
+            .map(|e| StatusEntry {
+                text: e.metadata.text_summary.clone(),
+                goal_id: extract_id(&e.metadata.tags, "goal:").unwrap_or_default(),
+            });
+        PersistedState { goals, tasks, status }
+    }
+
+    fn restore_goal(&self, g: &Goal) {
+        let mut store = self.store.write().expect("memory store poisoned");
+        let mut tags = vec![format!("goal:{}", g.goal_id)];
+        if g.is_current { tags.push(TAG_CURRENT.to_string()); }
+        let metadata = MemoryMetadata {
+            source_request_id: format!("goal:{}", g.goal_id),
+            layer_captured: 0,
+            category: MemoryCategory::Goal,
+            tags,
+            text_summary: g.text.clone(),
+        };
+        let _ = store.store_with_options(
+            format!("goal:{}", g.goal_id),
+            vec![0.0f32; self.d_model],
+            metadata,
+            pinned_no_ttl(),
+        );
+    }
+
+    fn restore_task(&self, t: &Task) {
+        let mut store = self.store.write().expect("memory store poisoned");
+        let tags = vec![
+            format!("goal:{}", t.goal_id),
+            format!("task:{}", t.task_id),
+            t.status.tag().to_string(),
+        ];
+        let metadata = MemoryMetadata {
+            source_request_id: format!("task:{}", t.task_id),
+            layer_captured: 0,
+            category: MemoryCategory::Task,
+            tags,
+            text_summary: t.text.clone(),
+        };
+        let opts = match t.status {
+            TaskStatus::Done => StoreOptions { pinned: false, ttl_seconds: None },
+            _ => pinned_no_ttl(),
+        };
+        let _ = store.store_with_options(
+            format!("task:{}", t.task_id),
+            vec![0.0f32; self.d_model],
+            metadata,
+            opts,
+        );
+    }
+
+    fn restore_status(&self, s: &StatusEntry) {
+        let mut store = self.store.write().expect("memory store poisoned");
+        let key = "status:current".to_string();
+        let metadata = MemoryMetadata {
+            source_request_id: key.clone(),
+            layer_captured: 0,
+            category: MemoryCategory::Status,
+            tags: vec![format!("goal:{}", s.goal_id)],
+            text_summary: s.text.clone(),
+        };
+        let _ = store.store_with_options(
+            key,
+            vec![0.0f32; self.d_model],
+            metadata,
+            StoreOptions { pinned: false, ttl_seconds: Some(STATUS_TTL_SECONDS) },
+        );
     }
 
     pub fn with_d_model(mut self, d_model: usize) -> Self {
@@ -126,6 +293,8 @@ impl GoalManager {
             metadata,
             pinned_no_ttl(),
         );
+        drop(store);
+        self.save();
         goal_id
     }
 
@@ -169,7 +338,7 @@ impl GoalManager {
         }
 
         // Tag the target as current.
-        if let Some(e) = store.get(&goal_key) {
+        let ok = if let Some(e) = store.get(&goal_key) {
             let mut new_meta = e.metadata.clone();
             if !new_meta.tags.iter().any(|t| t == TAG_CURRENT) {
                 new_meta.tags.push(TAG_CURRENT.to_string());
@@ -179,7 +348,10 @@ impl GoalManager {
             true
         } else {
             false
-        }
+        };
+        drop(store);
+        if ok { self.save(); }
+        ok
     }
 
     pub fn current_goal(&self) -> Option<Goal> {
@@ -218,13 +390,15 @@ impl GoalManager {
             metadata,
             pinned_no_ttl(),
         );
+        drop(store);
+        self.save();
         task_id
     }
 
     pub fn update_task(&self, task_id: &str, status: TaskStatus) -> bool {
         let mut store = self.store.write().expect("memory store poisoned");
         let key = format!("task:{task_id}");
-        if let Some(e) = store.get(&key) {
+        let ok = if let Some(e) = store.get(&key) {
             let mut new_meta = e.metadata.clone();
             new_meta
                 .tags
@@ -241,7 +415,10 @@ impl GoalManager {
             true
         } else {
             false
-        }
+        };
+        drop(store);
+        if ok { self.save(); }
+        ok
     }
 
     pub fn list_tasks(&self, goal_id: &str) -> Vec<Task> {
@@ -295,6 +472,8 @@ impl GoalManager {
             metadata,
             StoreOptions { pinned: false, ttl_seconds: Some(STATUS_TTL_SECONDS) },
         );
+        drop(store);
+        self.save();
         true
     }
 

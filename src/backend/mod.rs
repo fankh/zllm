@@ -1,5 +1,7 @@
 pub mod candle;
 pub mod dummy;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod traits;
 
 use traits::Backend;

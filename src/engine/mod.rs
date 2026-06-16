@@ -6,4 +6,6 @@ pub mod logit_fsm;
 pub mod memory_store;
 pub mod reasoning_budget;
 pub mod runner;
+pub mod runner_observer;
+pub mod spec_decode;
 pub mod sampler;
