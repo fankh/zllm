@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.8.0 — 2026-06-16
+
+Inference performance: CPU brought to parity with llama.cpp, and a new
+from-scratch iGPU engine that beats the CPU path. Target box: AMD Ryzen
+AI MAX+ 395 (Strix Halo), Radeon 8060S iGPU, Llama-3.2-1B-Instruct Q4_K_M.
+
+### CPU decode — 50 → 63 tok/s (parity with llama.cpp CPU)
+
+- Pin one rayon worker per **physical** core at startup (`main.rs`
+  `configure_thread_pool`, new `core_affinity` dep). SMT-sibling
+  oversubscription was a ~33% tax on this bandwidth-bound decode; pinning
+  recovers it. Disable with `ZLLM_NO_PIN=1`.
+- Measured baselines on this box: zllm CPU 50 → **63**; llama.cpp CPU 64;
+  llama.cpp iGPU 208. Decode is memory-bandwidth bound (~55 GB/s CPU
+  ceiling), so AVX-512 VNNI / wider SIMD / more threads do **not** help —
+  confirmed by measurement and dropped.
+
+### iGPU inference engine (new — `--features gpu`, off by default)
+
+zllm's own GPU inference path via `wgpu` → Vulkan (pure-Rust WGSL through
+naga; no Vulkan SDK / cmake needed). Lives in `src/backend/gpu`.
+
+- Kernels, all validated **bit-exact** vs CPU/candle: coalesced Q4_K, Q6_K,
+  and f32 matvecs (workgroup-per-row + shared-memory reduction); interleaved
+  RoPE (`rope_i`); GQA decode SDPA (online/flash softmax); RMSNorm; residual
+  add; fused FFN down-projection (SiLU·mul folded into `w2`); GPU argmax.
+- `GpuModel` loads a real GGUF (mixed Q4_K/Q6_K) onto the GPU once, keeps the
+  KV cache resident, and runs each decode token in a single command buffer.
+- **Faithful greedy decode is bit-for-bit identical to the candle CPU forward
+  (24/24 tokens) at ~80 tok/s — 27% over CPU.** 10 GPU tests, all bit-exact.
+- Findings worth keeping: one-thread-per-row matvec is uncoalesced (the root
+  cause of early slowness) — coalescing was decisive (Q4_K 192 GB/s, Q6_K
+  120 GB/s in isolation, both beating llama.cpp's ~133 effective); residual
+  fusion helped but further dispatch fusion plateaued; the per-token readback
+  sync pattern (drain-then-read + a persistent `MAP_READ` buffer) was a
+  bigger lever than fusion. Approaching llama.cpp's 208 would need raw
+  `ash`+SPIR-V with mega-fused kernels and hand-managed barriers.
+
+### Also folded in (in-progress backend work)
+
+AVX-512 Q4_K `vec_dot` + 8×8 repack kernels (CPU, gated off by default),
+custom CPU SDPA, prompt-lookup / speculative-decode scaffolding, and
+REST / chat-UI / goal-manager / metrics updates.
+
 ## v0.7.0 — 2026-05-22
 
 First release since v0.1.3. Six unreleased milestones fold in here.
