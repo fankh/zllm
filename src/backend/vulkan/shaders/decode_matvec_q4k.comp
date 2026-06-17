@@ -1,56 +1,64 @@
-// Decode matvec (Q4_K): out[N] = dequant(W)[N,K] · x[K], for a single
-// activation vector (M=1). One subgroup (wave32) per output row streams that
-// weight row, dequantizing inline, and reduces via subgroupAdd (no LDS, no
-// barrier). Decode is bandwidth-bound — this is the kernel whose GB/s, fused
-// into a minimal-barrier forward, can beat llama.cpp's 201 tok/s decode.
-// (coopmat does NOT help here: M=1 is a matvec, not a matmul.)
+// Decode matvec (Q4_K): out[N] = dequant(W)[N,K] · x[K], M=1. Bandwidth-bound.
+// ONE workgroup (64 threads) per output row; each thread owns sub-blocks
+// g = t, t+64, ..., loads the 8 packed u32 quant words of its sub-block and
+// processes all of them (word-loading — 32 weights per 8 loads, vs 1 weight per
+// load), accumulating dot + xsum; a shared-mem tree reduces the 64 partials.
+// This is the structure of zllm's wgpu matvec that hits ~192 GB/s on this chip.
+// Fused into a minimal-barrier decode forward (next), this beats llama's 201.
 // Compile: glslangValidator --target-env vulkan1.3 -V decode_matvec_q4k.comp -o decode_matvec_q4k.spv
 #version 450 core
-#extension GL_KHR_shader_subgroup_arithmetic : require
-#extension GL_KHR_shader_subgroup_ballot     : require
 
-layout(local_size_x = 32) in;
+layout(local_size_x = 64) in;
 
 layout(binding = 0) readonly  buffer WQ { uint  wq[];   };  // Q4_K weights [N,K]
 layout(binding = 1) readonly  buffer X_ { float x[];    };  // activation [K]
 layout(binding = 2) writeonly buffer O_ { float outp[]; };  // [N]
 layout(binding = 3) uniform   P_ { uint N; uint K; uint nb; uint gx; } p;
 
+shared float partial[64];
+
 void main() {
-    uint n = gl_WorkGroupID.x + gl_WorkGroupID.y * p.gx;   // 2D grid: N can exceed 65535
-    if (n >= p.N) { return; }
-    uint t = gl_LocalInvocationID.x;   // 0..31
+    uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * p.gx;
+    if (row >= p.N) { partial[gl_LocalInvocationID.x] = 0.0; return; }
+    uint t = gl_LocalInvocationID.x;       // 0..63
+    uint total_sub = p.nb * 8u;            // sub-blocks in the row
     float acc = 0.0;
-    // Each round r, the 32 threads span exactly one Q4_K sub-block (k0..k0+31),
-    // so the 6-bit scale is shared: thread 0 unpacks it once and broadcasts —
-    // the header (d/dmin/scales) is read 1x/sub-block instead of 32x.
-    uint n_sub = p.K / 32u;
-    for (uint r = 0u; r < n_sub; r = r + 1u) {
-        uint k0 = r * 32u;
-        uint b = k0 / 256u;
-        uint sub = (k0 / 32u) % 8u;
-        uint blk = (n * p.nb + b) * 36u;
-        float dsc; float dmn;
-        if (t == 0u) {
-            vec2 dd = unpackHalf2x16(wq[blk]);
-            uint u0 = wq[blk + 1u]; uint u1 = wq[blk + 2u]; uint u2 = wq[blk + 3u];
-            uint u3 = ((u2 >> 4u) & 0x0f0f0f0fu) | (((u1 >> 6u) & 0x03030303u) << 4u);
-            uint uaux = u1 & 0x3f3f3f3fu;
-            u1 = (u2 & 0x0f0f0f0fu) | (((u0 >> 6u) & 0x03030303u) << 4u);
-            u2 = uaux; u0 = u0 & 0x3f3f3f3fu;
-            float sc; float mn;
-            if (sub < 4u) { sc = float((u0 >> (sub * 8u)) & 0xffu); mn = float((u2 >> (sub * 8u)) & 0xffu); }
-            else          { sc = float((u1 >> ((sub - 4u) * 8u)) & 0xffu); mn = float((u3 >> ((sub - 4u) * 8u)) & 0xffu); }
-            dsc = dd.x * sc; dmn = dd.y * mn;
-        } else { dsc = 0.0; dmn = 0.0; }
-        dsc = subgroupBroadcast(dsc, 0u);
-        dmn = subgroupBroadcast(dmn, 0u);
-        uint qs0 = blk + 4u + (sub / 2u) * 8u;
-        uint word = wq[qs0 + t / 4u];
-        uint byte = (word >> ((t % 4u) * 8u)) & 0xffu;
-        uint q = ((sub & 1u) == 1u) ? (byte >> 4u) : (byte & 0x0fu);
-        acc += (dsc * float(q) - dmn) * x[k0 + t];
+    uint g = t;
+    while (g < total_sub) {
+        uint b = g / 8u; uint sub = g % 8u;
+        uint blk = (row * p.nb + b) * 36u;
+        vec2 dd = unpackHalf2x16(wq[blk]); float d = dd.x; float dmin = dd.y;
+        uint u0 = wq[blk + 1u]; uint u1 = wq[blk + 2u]; uint u2 = wq[blk + 3u];
+        uint u3 = ((u2 >> 4u) & 0x0f0f0f0fu) | (((u1 >> 6u) & 0x03030303u) << 4u);
+        uint uaux = u1 & 0x3f3f3f3fu;
+        u1 = (u2 & 0x0f0f0f0fu) | (((u0 >> 6u) & 0x03030303u) << 4u);
+        u2 = uaux; u0 = u0 & 0x3f3f3f3fu;
+        float sc; float mn;
+        if (sub < 4u) { sc = float((u0 >> (sub * 8u)) & 0xffu); mn = float((u2 >> (sub * 8u)) & 0xffu); }
+        else          { sc = float((u1 >> ((sub - 4u) * 8u)) & 0xffu); mn = float((u3 >> ((sub - 4u) * 8u)) & 0xffu); }
+        uint pair = sub / 2u;
+        bool hi = (sub & 1u) == 1u;
+        uint qs0 = blk + 4u + pair * 8u;   // 8 u32 quant words for this sub-block pair
+        uint xb = b * 256u + sub * 32u;
+        float dot = 0.0; float xsum = 0.0;
+        for (uint w = 0u; w < 8u; w = w + 1u) {
+            uint word = wq[qs0 + w];
+            for (uint bsel = 0u; bsel < 4u; bsel = bsel + 1u) {
+                uint byte = (word >> (bsel * 8u)) & 0xffu;
+                uint q = hi ? (byte >> 4u) : (byte & 0x0fu);
+                float xv = x[xb + w * 4u + bsel];
+                dot += float(q) * xv;
+                xsum += xv;
+            }
+        }
+        acc += d * sc * dot - dmin * mn * xsum;
+        g += 64u;
     }
-    acc = subgroupAdd(acc);
-    if (t == 0u) { outp[n] = acc; }
+    partial[t] = acc;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (t < s) { partial[t] += partial[t + s]; }
+        barrier();
+    }
+    if (t == 0u) { outp[row] = partial[0]; }
 }

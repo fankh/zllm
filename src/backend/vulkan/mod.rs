@@ -871,4 +871,45 @@ mod tests {
         }
         eprintln!("  llama.cpp decode ~153 GB/s effective (201 tok/s); achievable bus ~215 GB/s (~280 tok/s wall)");
     }
+
+    /// DECODE projection: sum the matvec time for a full Llama-3.2-1B forward's
+    /// worth of weights (the bandwidth-bound decode cost) and project tok/s —
+    /// the number that would beat llama's 201. Matvec-only (norm/rope/sdpa are
+    /// tiny at M=1); a fused minimal-barrier forward approaches it.
+    /// `cargo test --release --features vulkan --lib vk_decode_projection -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_decode_projection() {
+        use candle_core::{Device, Tensor};
+        use candle_core::quantized::{QTensor, GgmlDType};
+        let ctx = match VkContext::new() {
+            Ok(c) => c,
+            Err(e) => { eprintln!("no Vulkan coopmat device ({e}); skipping"); return; }
+        };
+        let mk = |n: usize, k: usize| -> Vec<u8> {
+            let mut w = vec![0f32; n * k];
+            for i in 0..w.len() { w[i] = (((i as i64).wrapping_mul(2654435761) & 0xFFFF) as f32 / 32768.0 - 1.0) * 0.5; }
+            QTensor::quantize(&Tensor::from_vec(w, (n, k), &Device::Cpu).unwrap(), GgmlDType::Q4K).unwrap().data().unwrap().to_vec()
+        };
+        let time = |bytes: &[u8], n: usize, nb: usize| -> f64 {
+            let x: Vec<f32> = (0..nb * 256).map(|i| ((i % 23) as f32 - 11.0) * 0.02).collect();
+            let _ = ctx.decode_matvec_q4k(bytes, n, nb, &x, 8).expect("warm");
+            let iters = 60u32;
+            let (_, ms) = ctx.decode_matvec_q4k(bytes, n, nb, &x, iters).expect("bench");
+            ms / iters as f64
+        };
+        // Per-layer matvec shapes (N_out, K_in, count) + LM head.
+        let shapes: [(usize, usize, usize); 4] = [
+            (2048, 2048, 2), (512, 2048, 2), (8192, 2048, 2), (2048, 8192, 1),
+        ];
+        let mut forward_ms = 0f64;
+        for &(n, k, count) in &shapes {
+            forward_ms += time(&mk(n, k), n, k / 256) * count as f64;
+        }
+        forward_ms *= 16.0; // layers
+        forward_ms += time(&mk(128256, 2048), 128256, 8); // LM head
+        let tok_s = 1000.0 / forward_ms;
+        eprintln!("decode matvec projection: {forward_ms:.3} ms/token (matvecs only) => {tok_s:.0} tok/s");
+        eprintln!("  vs current wgpu decode ~80 tok/s; llama.cpp iGPU 201; bandwidth wall ~280");
+    }
 }
