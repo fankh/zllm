@@ -54,6 +54,10 @@ pub struct GpuContext {
     bnorm_pipeline: wgpu::ComputePipeline,
     brope_pipeline: wgpu::ComputePipeline,
     bsdpa_pipeline: wgpu::ComputePipeline,
+    /// Batched decode: per-stream SDPA (each of M concurrent streams attends
+    /// its OWN KV cache at its OWN position) and per-stream argmax.
+    bdsdpa_pipeline: wgpu::ComputePipeline,
+    bargmax_pipeline: wgpu::ComputePipeline,
 }
 
 /// A dense f32 weight matrix resident on the GPU (row-major).
@@ -139,6 +143,8 @@ impl GpuContext {
         let bnorm_pipeline = Self::make_pipeline(&device, "bnorm", BNORM_WGSL);
         let brope_pipeline = Self::make_pipeline(&device, "brope", BROPE_WGSL);
         let bsdpa_pipeline = Self::make_pipeline(&device, "bsdpa", BSDPA_WGSL);
+        let bdsdpa_pipeline = Self::make_pipeline(&device, "bdsdpa", BDSDPA_WGSL);
+        let bargmax_pipeline = Self::make_pipeline(&device, "bargmax", BARGMAX_WGSL);
 
         Ok(Self {
             device,
@@ -161,6 +167,8 @@ impl GpuContext {
             bnorm_pipeline,
             brope_pipeline,
             bsdpa_pipeline,
+            bdsdpa_pipeline,
+            bargmax_pipeline,
         })
     }
 
@@ -225,6 +233,31 @@ impl GpuContext {
         let mut p = enc.begin_compute_pass(&Default::default());
         p.set_pipeline(&self.bsdpa_pipeline); p.set_bind_group(0, &bg, &[]);
         p.dispatch_workgroups(((m_rows * n_head) as u32).div_ceil(64), 1, 1);
+    }
+    /// Batched DECODE SDPA: each of `m` streams attends its own KV cache.
+    #[allow(clippy::too_many_arguments)]
+    fn record_bdsdpa(&self, enc: &mut wgpu::CommandEncoder, q: &wgpu::Buffer, kc: &wgpu::Buffer, vc: &wgpu::Buffer, out: &wgpu::Buffer, posb: &wgpu::Buffer, n_head: usize, n_kv_head: usize, head_dim: usize, m: usize, max_seq: usize) {
+        use wgpu::util::DeviceExt;
+        let pbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::cast_slice(&[n_head as u32, n_kv_head as u32, head_dim as u32, m as u32, max_seq as u32, 0u32, 0u32, 0u32]), usage: wgpu::BufferUsages::UNIFORM });
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.bdsdpa_pipeline.get_bind_group_layout(0),
+            entries: &[bge(0, q), bge(1, kc), bge(2, vc), bge(3, out), bge(4, posb), bge(5, &pbuf)] });
+        let mut p = enc.begin_compute_pass(&Default::default());
+        p.set_pipeline(&self.bdsdpa_pipeline); p.set_bind_group(0, &bg, &[]);
+        p.dispatch_workgroups(((m * n_head) as u32).div_ceil(64), 1, 1);
+    }
+    /// Batched argmax: one workgroup per stream → `out_idx[s]` (m u32 readback).
+    fn record_bargmax(&self, enc: &mut wgpu::CommandEncoder, logits: &wgpu::Buffer, out_idx: &wgpu::Buffer, vocab: usize, m: usize) {
+        use wgpu::util::DeviceExt;
+        let pbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::cast_slice(&[vocab as u32, m as u32]), usage: wgpu::BufferUsages::UNIFORM });
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.bargmax_pipeline.get_bind_group_layout(0),
+            entries: &[bge(0, logits), bge(1, out_idx), bge(2, &pbuf)] });
+        let mut p = enc.begin_compute_pass(&Default::default());
+        p.set_pipeline(&self.bargmax_pipeline); p.set_bind_group(0, &bg, &[]);
+        p.dispatch_workgroups(m as u32, 1, 1);
     }
 
     /// Standalone batched Q4_K GEMM (upload + dispatch + readback), for
@@ -1074,6 +1107,82 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let inv = 1.0 / l;
     for (var d: u32 = 0u; d < hd; d = d + 1u) { outp[q_base + d] = av[d] * inv; }
+}
+"#;
+
+/// Batched DECODE SDPA: M independent concurrent streams, each a single query
+/// attending its OWN KV cache at its OWN position. Thread per (stream s, head
+/// h); stream s's cache occupies [s*max_seq*kv_dim ..], `posb[s]` is its last
+/// filled position (attends 0..=posb[s]). This is the coalesced-serving kernel:
+/// the matmuls around it run once for all M streams (weights amortized), only
+/// the attention is per-stream.
+const BDSDPA_WGSL: &str = r#"
+struct BP { n_head: u32, n_kv_head: u32, head_dim: u32, m_streams: u32, max_seq: u32, p0: u32, p1: u32, p2: u32 };
+@group(0) @binding(0) var<storage, read>       q:    array<f32>;
+@group(0) @binding(1) var<storage, read>       kc:   array<f32>;
+@group(0) @binding(2) var<storage, read>       vc:   array<f32>;
+@group(0) @binding(3) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(4) var<storage, read>       posb: array<u32>;
+@group(0) @binding(5) var<uniform>             p:    BP;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= p.m_streams * p.n_head) { return; }
+    let s = idx / p.n_head; let h = idx % p.n_head;
+    let hd = p.head_dim;
+    let kvh = h / (p.n_head / p.n_kv_head);
+    let scale = 1.0 / sqrt(f32(hd));
+    let seq_len = posb[s] + 1u;
+    let q_base = s * (p.n_head * hd) + h * hd;
+    let stream_kv = s * p.max_seq * p.n_kv_head * hd;   // base of stream s's cache
+    var av: array<f32, 128>;
+    for (var d: u32 = 0u; d < hd; d = d + 1u) { av[d] = 0.0; }
+    var mx: f32 = -1e30; var l: f32 = 0.0;
+    for (var t: u32 = 0u; t < seq_len; t = t + 1u) {
+        let kv_base = stream_kv + (t * p.n_kv_head + kvh) * hd;
+        var sdot: f32 = 0.0;
+        for (var d: u32 = 0u; d < hd; d = d + 1u) { sdot = sdot + q[q_base + d] * kc[kv_base + d]; }
+        sdot = sdot * scale;
+        let m_new = max(mx, sdot); let corr = exp(mx - m_new); let pe = exp(sdot - m_new);
+        l = l * corr + pe;
+        for (var d: u32 = 0u; d < hd; d = d + 1u) { av[d] = av[d] * corr + pe * vc[kv_base + d]; }
+        mx = m_new;
+    }
+    let inv = 1.0 / l;
+    for (var d: u32 = 0u; d < hd; d = d + 1u) { outp[q_base + d] = av[d] * inv; }
+}
+"#;
+
+/// Batched argmax: one workgroup per stream reduces that stream's `vocab`-wide
+/// logit row of `logits[M, vocab]` to its argmax → `out_idx[s]`. Lets batched
+/// decode read back M u32s instead of M*128k logits.
+const BARGMAX_WGSL: &str = r#"
+struct BA { vocab: u32, m_streams: u32 };
+@group(0) @binding(0) var<storage, read>       logits:  array<f32>;
+@group(0) @binding(1) var<storage, read_write> out_idx: array<u32>;
+@group(0) @binding(2) var<uniform>             p:       BA;
+var<workgroup> vmax: array<f32, 256>;
+var<workgroup> imax: array<u32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let s = wid.x; let t = lid.x;
+    if (s >= p.m_streams) { return; }
+    let base = s * p.vocab;
+    var bv: f32 = -1e30; var bi: u32 = 0u;
+    var k = t;
+    loop { if (k >= p.vocab) { break; } let v = logits[base + k]; if (v > bv) { bv = v; bi = k; } k = k + 256u; }
+    vmax[t] = bv; imax[t] = bi;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (t < stride) {
+            if (vmax[t + stride] > vmax[t]) { vmax[t] = vmax[t + stride]; imax[t] = imax[t + stride]; }
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if (t == 0u) { out_idx[s] = imax[0]; }
 }
 "#;
 
@@ -2384,6 +2493,125 @@ impl GpuModel {
         ctx.queue.submit([enc.finish()]);
         ctx.read_buffer(&self.logits, self.vocab)
     }
+
+    /// Build a batched decoder: `m_max` concurrent decode streams coalesced
+    /// into one forward (weights loaded once for all M = compute-bound, the
+    /// regime where aggregate serving throughput can far exceed M× serialized
+    /// single-stream decode). Each stream gets its own KV cache up to `max_seq`.
+    pub fn batched_decoder(&self, m_max: usize, max_seq: usize) -> BatchedDecoder<'_> {
+        BatchedDecoder::new(self, m_max, max_seq)
+    }
+}
+
+/// M concurrent decode streams in one forward. The matmuls (which dominate)
+/// run once for all M streams — their weight bandwidth is amortized across the
+/// batch, so this enters the compute-bound regime. Only the attention is
+/// per-stream (each stream attends its own KV cache). PoC for serving-
+/// throughput exploration.
+pub struct BatchedDecoder<'a> {
+    model: &'a GpuModel,
+    m_max: usize,
+    max_seq: usize,
+    x_b: wgpu::Buffer, normed_b: wgpu::Buffer, q_b: wgpu::Buffer,
+    k_b: wgpu::Buffer, v_b: wgpu::Buffer, attn_b: wgpu::Buffer,
+    gate_b: wgpu::Buffer, up_b: wgpu::Buffer, h_b: wgpu::Buffer,
+    cos_b: wgpu::Buffer, sin_b: wgpu::Buffer, logits_b: wgpu::Buffer,
+    pos_buf: wgpu::Buffer, argmax_out: wgpu::Buffer, argmax_read: wgpu::Buffer,
+    k_caches: Vec<wgpu::Buffer>, v_caches: Vec<wgpu::Buffer>,
+}
+
+impl<'a> BatchedDecoder<'a> {
+    fn new(model: &'a GpuModel, m_max: usize, max_seq: usize) -> Self {
+        let ctx = &model.ctx;
+        let (n_embd, n_head, n_kv_head, head_dim, n_inter, vocab) =
+            (model.n_embd, model.n_head, model.n_kv_head, model.head_dim, model.n_inter, model.vocab);
+        let kv_dim = n_kv_head * head_dim;
+        let attn_dim = n_head * head_dim;
+        let half = head_dim / 2;
+        let a = |len: usize| ctx.alloc_activation(len, false);
+        let asrc = |len: usize| ctx.alloc_activation(len, true); // COPY_SRC: cache scatter / readback
+        let k_caches = (0..model.layers.len()).map(|_| a(m_max * max_seq * kv_dim)).collect();
+        let v_caches = (0..model.layers.len()).map(|_| a(m_max * max_seq * kv_dim)).collect();
+        Self {
+            model, m_max, max_seq,
+            x_b: a(m_max * n_embd), normed_b: a(m_max * n_embd), q_b: asrc(m_max * attn_dim),
+            k_b: asrc(m_max * kv_dim), v_b: asrc(m_max * kv_dim), attn_b: a(m_max * attn_dim),
+            gate_b: a(m_max * n_inter), up_b: a(m_max * n_inter), h_b: a(m_max * n_inter),
+            cos_b: a(m_max * half), sin_b: a(m_max * half), logits_b: a(m_max * vocab),
+            pos_buf: a(m_max), argmax_out: asrc(m_max),
+            argmax_read: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("bd-argmax-read"), size: (m_max * 4) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
+            k_caches, v_caches,
+        }
+    }
+
+    /// One batched step: stream s decodes `tokens[s]` at `positions[s]` —
+    /// writes its K/V to its cache there, attends 0..=positions[s] — and
+    /// returns the greedy next token per stream. Caller advances positions.
+    pub fn step(&self, tokens: &[u32], positions: &[u32]) -> Vec<u32> {
+        let ctx = &self.model.ctx;
+        let m = tokens.len();
+        assert!(m <= self.m_max && m == positions.len() && m >= 1);
+        let (n_embd, n_head, n_kv_head, head_dim, n_inter, vocab, eps) = (
+            self.model.n_embd, self.model.n_head, self.model.n_kv_head,
+            self.model.head_dim, self.model.n_inter, self.model.vocab, self.model.eps);
+        let kv_dim = n_kv_head * head_dim;
+        let attn_dim = n_head * head_dim;
+        let half = head_dim / 2;
+
+        let mut x_host = vec![0f32; m * n_embd];
+        let mut cos_host = vec![0f32; m * half];
+        let mut sin_host = vec![0f32; m * half];
+        for s in 0..m {
+            let tk = tokens[s] as usize;
+            x_host[s * n_embd..(s + 1) * n_embd].copy_from_slice(&self.model.embed[tk * n_embd..(tk + 1) * n_embd]);
+            let p = positions[s] as usize;
+            assert!(p < self.max_seq, "position {p} exceeds batched max_seq {}", self.max_seq);
+            cos_host[s * half..(s + 1) * half].copy_from_slice(&self.model.cos[p * half..p * half + half]);
+            sin_host[s * half..(s + 1) * half].copy_from_slice(&self.model.sin[p * half..p * half + half]);
+        }
+        ctx.queue.write_buffer(&self.x_b, 0, bytemuck::cast_slice(&x_host));
+        ctx.queue.write_buffer(&self.cos_b, 0, bytemuck::cast_slice(&cos_host));
+        ctx.queue.write_buffer(&self.sin_b, 0, bytemuck::cast_slice(&sin_host));
+        ctx.queue.write_buffer(&self.pos_buf, 0, bytemuck::cast_slice(positions));
+
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        for (li, layer) in self.model.layers.iter().enumerate() {
+            ctx.record_bnorm(&mut enc, &self.x_b, &layer.attn_norm_w, &self.normed_b, n_embd, eps, m);
+            ctx.record_gemm(&mut enc, &layer.wq, &self.normed_b, &self.q_b, n_embd, m, 0);
+            ctx.record_gemm(&mut enc, &layer.wk, &self.normed_b, &self.k_b, n_embd, m, 0);
+            ctx.record_gemm(&mut enc, &layer.wv, &self.normed_b, &self.v_b, n_embd, m, 0);
+            ctx.record_brope(&mut enc, &self.q_b, &self.cos_b, &self.sin_b, n_head, head_dim, m);
+            ctx.record_brope(&mut enc, &self.k_b, &self.cos_b, &self.sin_b, n_kv_head, head_dim, m);
+            // scatter each stream's new K/V into its own cache at its position
+            for s in 0..m {
+                let dst = ((s * self.max_seq + positions[s] as usize) * kv_dim * 4) as u64;
+                let src = (s * kv_dim * 4) as u64;
+                enc.copy_buffer_to_buffer(&self.k_b, src, &self.k_caches[li], dst, (kv_dim * 4) as u64);
+                enc.copy_buffer_to_buffer(&self.v_b, src, &self.v_caches[li], dst, (kv_dim * 4) as u64);
+            }
+            ctx.record_bdsdpa(&mut enc, &self.q_b, &self.k_caches[li], &self.v_caches[li], &self.attn_b, &self.pos_buf, n_head, n_kv_head, head_dim, m, self.max_seq);
+            ctx.record_gemm(&mut enc, &layer.wo, &self.attn_b, &self.x_b, attn_dim, m, 1);
+            ctx.record_bnorm(&mut enc, &self.x_b, &layer.ffn_norm_w, &self.normed_b, n_embd, eps, m);
+            ctx.record_gemm(&mut enc, &layer.w1, &self.normed_b, &self.gate_b, n_embd, m, 0);
+            ctx.record_gemm(&mut enc, &layer.w3, &self.normed_b, &self.up_b, n_embd, m, 0);
+            ctx.record_silu_mul(&mut enc, &self.gate_b, &self.up_b, &self.h_b, m * n_inter);
+            ctx.record_gemm(&mut enc, &layer.w2, &self.h_b, &self.x_b, n_inter, m, 1);
+        }
+        ctx.record_bnorm(&mut enc, &self.x_b, &self.model.final_norm_w, &self.normed_b, n_embd, eps, m);
+        ctx.record_gemm(&mut enc, &self.model.lm_head, &self.normed_b, &self.logits_b, n_embd, m, 0);
+        ctx.record_bargmax(&mut enc, &self.logits_b, &self.argmax_out, vocab, m);
+        enc.copy_buffer_to_buffer(&self.argmax_out, 0, &self.argmax_read, 0, (m * 4) as u64);
+        ctx.queue.submit([enc.finish()]);
+        ctx.device.poll(wgpu::Maintain::Wait);
+        let slice = self.argmax_read.slice(..(m * 4) as u64);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        ctx.device.poll(wgpu::Maintain::Wait);
+        let out = bytemuck::cast_slice::<u8, u32>(&slice.get_mapped_range()).to_vec();
+        self.argmax_read.unmap();
+        out
+    }
 }
 
 #[cfg(test)]
@@ -3367,5 +3595,68 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             "GPU Q4_K resident matvec ({} MB weights): {:.1} GB/s, {:.3} ms/matvec  [CPU ref ~55 GB/s]",
             bytes.len() / (1024 * 1024), gbps, ms,
         );
+    }
+
+    /// AGGREGATE SERVING THROUGHPUT: M concurrent decode streams coalesced into
+    /// one forward. Validates batched output is bit-identical to single-stream,
+    /// then measures aggregate tok/s vs concurrency — the compute-bound
+    /// amortization that single-stream (bandwidth-bound) decode can't reach.
+    /// `cargo test --release --features gpu --lib gpu_batched_decode -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gpu_batched_decode_throughput() {
+        use std::time::Instant;
+        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU: {e}"); return; } };
+        let model = GpuModel::load(path, ctx).expect("load");
+
+        // Single-stream greedy reference (the model's own resident KV cache).
+        let k_val = 8usize;
+        let mut single = Vec::new();
+        let mut tok = 128000u32;
+        for p in 0..k_val { let n = model.forward_argmax(tok, p as usize); single.push(n); tok = n; }
+
+        // Correctness: M identical streams must reproduce the single-stream
+        // tokens exactly (catches cross-stream contamination + a wrong BDSDPA).
+        let m_val = 8usize;
+        {
+            let dec = model.batched_decoder(m_val, 256);
+            let mut bt = vec![128000u32; m_val];
+            let mut bp = vec![0u32; m_val];
+            for k in 0..k_val {
+                let nxt = dec.step(&bt, &bp);
+                for s in 0..m_val {
+                    assert_eq!(nxt[s], single[k], "stream {s} step {k} diverged from single-stream");
+                }
+                bt = nxt;
+                for p in bp.iter_mut() { *p += 1; }
+            }
+        }
+        eprintln!("batched decode validated: {m_val} streams bit-identical to single-stream over {k_val} steps");
+
+        // Single-stream decode tok/s baseline (warm, realistic cache depth).
+        let mut t = 128000u32;
+        for p in 0..32 { t = model.forward_argmax(t, p); }
+        let t0 = Instant::now();
+        let mut pp = 32usize;
+        for _ in 0..32 { t = model.forward_argmax(t, pp); pp += 1; }
+        let single_tps = 32.0 / t0.elapsed().as_secs_f64();
+        eprintln!("single-stream decode baseline: {single_tps:.0} tok/s");
+
+        // Aggregate throughput vs concurrency (all streams at the same depth).
+        eprintln!("--- aggregate decode throughput vs concurrency ---");
+        for &m in &[1usize, 2, 4, 8, 16, 32] {
+            let dec = model.batched_decoder(m, 256);
+            let mut tk = vec![128000u32; m];
+            let mut ps = vec![0u32; m];
+            for _ in 0..32 { let n = dec.step(&tk, &ps); tk = n; for p in ps.iter_mut() { *p += 1; } } // warm + fill cache
+            let steps = 24usize;
+            let t0 = Instant::now();
+            for _ in 0..steps { let n = dec.step(&tk, &ps); tk = n; for p in ps.iter_mut() { *p += 1; } }
+            let dt = t0.elapsed().as_secs_f64();
+            let agg = (m * steps) as f64 / dt;
+            eprintln!("  M={m:>2}: {:5.1} ms/step, aggregate {:>5.0} tok/s ({:>4.0}/stream)  [{:.2}x single-stream]",
+                dt * 1e3 / steps as f64, agg, agg / m as f64, agg / single_tps);
+        }
     }
 }
