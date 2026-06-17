@@ -454,7 +454,7 @@ impl VkContext {
         let k = nb * 256;
         assert_eq!(weight_bytes.len(), n * nb * 144);
         assert_eq!(x.len(), m * k);
-        assert!(m % 64 == 0 && n % 64 == 0);
+        assert!(m % 128 == 0 && n % 128 == 0, "register-blocked GEMM tile is 128x128");
         unsafe { self.coopmat_q4k_gemm_inner(weight_bytes, n, nb, x, m, iters) }
     }
 
@@ -508,7 +508,7 @@ impl VkContext {
 
         let cmd_pool = dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(self.queue_family), None).map_err(|e| format!("cmdpool: {e}"))?;
         let cmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).map_err(|e| format!("cmdbuf: {e}"))?[0];
-        let gx = (n / 64) as u32; let gy = (m / 64) as u32;
+        let gx = (n / 128) as u32; let gy = (m / 128) as u32;
         dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).map_err(|e| format!("begin: {e}"))?;
         dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
         dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, pipeline_layout, 0, &[set], &[]);
