@@ -62,6 +62,12 @@ All kernels **bit-exact / cosine-1.0 vs candle**. Where it landed vs the targets
   accumulator that **spilled to scratch** — ~6.6 ms/token. Rewritten as **one workgroup per head**
   (parallel over head-dim, single `av`/thread), it dropped to ~0.5 ms and the forward beat llama.
   Validated bit-exact vs a CPU reference (err 2.4e-7).
+- **Decode holds at long context: subgroup reduction + flash attention.** Workgroup-per-head was
+  still barrier-bound (6-barrier reduction/KV-position) and occupancy-bound at long context (32
+  workgroups looping KV serially): `VK_SEQ=512`→98, `VK_SEQ=2048`→31. Added a barrier-free subgroup
+  `q·k` reduction and **flash attention** for ctx>32 (grid n_head×n_blocks → per-block online-softmax
+  partials → log-sum-exp combine; KV-stream latency hidden). Decode-forward tok/s by context:
+  32→322, 128→305, 512→258, 2048→162 (was 323/198/98/31). Both paths bit-exact (flash err 8.9e-7).
 - **Toolchain:** no SDK needed — prebuilt glslang compiles coopmat GLSL → committed `.spv`.
 
 **Fusions that backfired (kept for the record):** folding rmsnorm *or* silu·mul into a matvec

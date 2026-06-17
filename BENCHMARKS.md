@@ -80,7 +80,7 @@ gives llama.cpp its lead. **Validated bit-exact / cosine-1.0 vs candle throughou
 | **Q4_K coopmat GEMM** (register-blocked) | **6405–9880 GFLOP/s** | **~6–8× the wgpu f32 GEMM** (~1000) |
 | **prefill projection** (full forward's GEMMs) | **M=256 4250 / M=512 4802 tok/s** | **~74–84% of llama's 5747** |
 | **decode matvec** (word-loading) | **180–208 GB/s** | **above llama's ~153 effective**, near the ~215 wall |
-| **decode fused forward** (16 layers, 1 cmd buffer) | **~290 tok/s** (279–307) | **beats llama's 201 by ~1.4×** |
+| **decode fused forward** (16 layers, 1 cmd buffer) | **~322 tok/s** @ctx≤64, ~258 @512, ~162 @2048 | **beats llama's 201** at the bench context |
 
 Key Phase-2 levers (all bit-exact):
 
@@ -99,6 +99,16 @@ Key Phase-2 levers (all bit-exact):
   ~6.6 ms. Rewritten as **one workgroup per head** (threads parallel over head-dim, single `av` per
   thread, shared-mem dot reduction), SDPA dropped to ~0.5 ms total and the forward hit ~290 tok/s.
   Validated bit-exact vs a CPU softmax-attention reference (`vk_sdpa_correctness`, err 2.4e-7).
+- **Decode holds up at long context: subgroup reduction + flash attention.** The workgroup-per-head
+  SDPA was still barrier-bound (a 6-barrier shared-mem reduction per KV position) and occupancy-bound
+  at long context (only 32 workgroups looping the KV cache serially) — `VK_SEQ=512` collapsed to 98
+  tok/s, `VK_SEQ=2048` to 31. Fix: (1) a barrier-free **subgroup** `q·k` reduction (one wave32
+  subgroup per head, lane owns hd/32 dims), and (2) **flash attention** for ctx > 32 — a grid of
+  (n_head × n_blocks) workgroups each computes a per-block online-softmax partial, then a combine
+  pass merges them by log-sum-exp, so KV-stream latency is hidden. Decode-forward tok/s by context:
+  **32→322, 128→305, 512→258, 2048→162** (was 323/198/98/31). Both paths bit-exact (flash err 8.9e-7).
+  Note: llama-bench `tg128` runs at avg context ~64, where zllm wins (~320 vs 201); sustained
+  long-context decode degrades gracefully rather than collapsing.
 - **Fusions that backfired (kept for the record):** folding rmsnorm *or* silu·mul into a matvec
   recomputes a per-element transform once **per output row** — e.g. silu-into-down (`VK_FUSE=1`) was
   88 vs 104 tok/s (16.7 M redundant `exp`/layer). Rule: never fold a per-input-element op into a
@@ -156,7 +166,8 @@ cargo test --release --features vulkan --lib vk_coopmat_prefill_projection  -- -
 cargo test --release --features vulkan --lib vk_decode_matvec_bandwidth     -- --ignored --nocapture  # decode GB/s
 cargo test --release --features vulkan --lib vk_decode_projection           -- --ignored --nocapture  # decode matvec tok/s
 cargo test --release --features vulkan --lib vk_fused_decode_throughput     -- --ignored --nocapture  # fused decode forward (~290 tok/s, beats llama)
-cargo test --release --features vulkan --lib vk_sdpa_correctness            -- --ignored --nocapture  # SDPA bit-exact vs CPU ref
+cargo test --release --features vulkan --lib vk_sdpa_correctness            -- --ignored --nocapture  # SDPA (single + flash) bit-exact vs CPU ref
+VK_SEQ=512 cargo test --release --features vulkan --lib vk_fused_decode_throughput -- --ignored --nocapture  # decode at a given context depth
 cargo test --release --features vulkan --lib vk_barrier_coherence_probe     -- --ignored --nocapture  # barrier cost/coherence (VK_EXECBAR/VK_NOBAR show staleness)
 # Diagnostics: VK_SKIP=sdpa,norm,rope,silu attributes per-op cost; VK_FUSE=1 shows the silu-fusion backfire
 ```
