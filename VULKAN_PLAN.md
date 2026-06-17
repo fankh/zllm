@@ -34,6 +34,44 @@ metric for interactive use. That's the headline this plan targets.
 
 ---
 
+## RESULTS — what was actually built (2026-06-17)
+
+Phase 2 was implemented (`--features vulkan`, `src/backend/vulkan/`): `ash` device with the
+coopmat feature chain, UMA zero-copy buffers, GLSL kernels compiled offline to committed SPIR-V.
+All kernels **bit-exact / cosine-1.0 vs candle**. Where it landed vs the targets above:
+
+| metric | start | **achieved** | target | status |
+|---|---:|---:|---:|---|
+| coopmat works on 8060S | — | err 5e-5 | — | ✅ proven (disproves "unreachable") |
+| Q4_K GEMM throughput | ~1000 (wgpu) | **6400–9900 GFLOP/s** | — | ✅ 6–8× wgpu |
+| **prefill** (projection) | 490 | **~4250–4800 tok/s** | ~3000–4500 | ✅ **hit (~74–84% of llama)** |
+| **decode matvec** | 50 GB/s | **208 GB/s** | >153 | ✅ beats llama's effective bus |
+| **decode** (fused forward) | 80 (wgpu) | **97 tok/s** | 240–250 | ❌ blocked by barrier wall |
+
+**What worked:**
+- **Prefill: register blocking was the lever, not the exotic stuff.** A 128×128 tile / 16-subgroup
+  / 2×2-fragment kernel took prefill 44% → ~80% of llama. Double-buffering + bigger grids plateaued
+  ~17% of peak (occupancy-bound on this part).
+- **Decode matvec: word-loading** (process all 8 nibbles of a loaded u32) took it 50 → 208 GB/s,
+  above llama's ~153 effective.
+- **Toolchain:** no SDK needed — prebuilt glslang compiles coopmat GLSL → committed `.spv`.
+
+**What's blocked — the decode fused forward (97 tok/s, < llama's 201):**
+- `VK_NOBAR=1` shows the ~145 per-token barriers cost ~8 ms (~55 µs each, full GPU drains on the
+  AMD proprietary driver). The decode wall is the **barrier count** (9 sync points/layer vs llama's
+  ~3), not the kernels (matvecs overlap to 2.7 ms).
+- The obvious fix — fold rmsnorm into the matvecs — **backfired** (the 128k-row LM head's redundant
+  per-workgroup reduction cost more than it saved). rmsnorm must fold into the *preceding* op, and
+  reaching ~3 sync points/layer needs the full mega-fusion (flash-attn, QKV+RoPE fused,
+  norm+residual folded) — hard, multi-session kernel work.
+
+**Honest bottom line:** the "no hardware ceiling — it's kernel software" framing was right; prefill
+went from 8.5% → ~80% of llama with validated coopmat kernels. But **no iGPU metric beats llama
+yet** — prefill is close (parity is the realistic best; +50% isn't), and decode's path is
+understood (cut barriers via fusion) but not cracked. Remaining work below is the *hard* part.
+
+---
+
 ## Key technical findings (the basis for everything below)
 
 1. **Prefill matmul (llama `mul_mm.comp`, KHR-coopmat path):** 16×16×16 fp16 fragments
