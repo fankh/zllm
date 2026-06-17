@@ -19,6 +19,9 @@ const DECODE_MATVEC_DOWN_Q4K_SPV: &[u8] = include_bytes!("shaders/decode_matvec_
 const RMSNORM_SPV: &[u8] = include_bytes!("shaders/rmsnorm.spv");
 const ROPE_SPV: &[u8] = include_bytes!("shaders/rope.spv");
 const SDPA_DECODE_SPV: &[u8] = include_bytes!("shaders/sdpa_decode.spv");
+const SDPA_FLASH_PARTIAL_SPV: &[u8] = include_bytes!("shaders/sdpa_flash_partial.spv");
+const SDPA_FLASH_COMBINE_SPV: &[u8] = include_bytes!("shaders/sdpa_flash_combine.spv");
+const SDPA_FLASH_BLOCK: usize = 32; // must match BLOCK in the flash shaders
 const SILU_MUL_SPV: &[u8] = include_bytes!("shaders/silu_mul.spv");
 const INC_SPV: &[u8] = include_bytes!("shaders/inc.spv");
 const INC_COH_SPV: &[u8] = include_bytes!("shaders/inc_coh.spv");
@@ -992,9 +995,17 @@ mod tests {
 
 #[cfg(test)]
 unsafe fn sdpa_correctness_inner(ctx: &VkContext) {
+    // Exercise both paths: single-pass (short ctx) and flash 2-pass (long ctx,
+    // multiple KV blocks), each vs a CPU softmax-attention reference.
+    sdpa_case(ctx, 32, false);
+    sdpa_case(ctx, 520, true); // > SDPA_FLASH_BLOCK and not a block multiple
+}
+
+#[cfg(test)]
+unsafe fn sdpa_case(ctx: &VkContext, seq_len: usize, flash: bool) {
     use ash::vk;
     let dev = &ctx.device;
-    let (n_head, n_kv, hd, seq_len) = (32usize, 8usize, 64usize, 32usize);
+    let (n_head, n_kv, hd) = (32usize, 8usize, 64usize);
     let qn = n_head * hd; let kvn = seq_len * n_kv * hd;
     let rnd = |i: usize, s: usize| (((i.wrapping_mul(2654435761).wrapping_add(s.wrapping_mul(40503))) & 0xFFFF) as f32 / 32768.0 - 1.0);
     let qd: Vec<f32> = (0..qn).map(|i| rnd(i, 1)).collect();
@@ -1007,26 +1018,47 @@ unsafe fn sdpa_correctness_inner(ctx: &VkContext) {
     let (ub, _mu, up) = ctx.uma_buffer(16).unwrap();
     let pv = [n_head as u32, n_kv as u32, hd as u32, seq_len as u32];
     std::ptr::copy_nonoverlapping(pv.as_ptr() as *const u8, up, 16);
-
-    let (sd_p, sd_l, sd_sl, _m) = ctx.make_pipeline_raw(SDPA_DECODE_SPV, 4);
-    let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&[
-        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(4),
-        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(1),
-    ]), None).unwrap();
-    let set = dev.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(std::slice::from_ref(&sd_sl))).unwrap()[0];
-    let infos: Vec<[vk::DescriptorBufferInfo; 1]> = [q, kc, vc, out].iter().map(|&b| [vk::DescriptorBufferInfo::default().buffer(b).range(vk::WHOLE_SIZE)]).collect();
     let ui = [vk::DescriptorBufferInfo::default().buffer(ub).range(vk::WHOLE_SIZE)];
-    let mut writes: Vec<vk::WriteDescriptorSet> = infos.iter().enumerate().map(|(i, info)|
-        vk::WriteDescriptorSet::default().dst_set(set).dst_binding(i as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(info)).collect();
-    writes.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(4).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&ui));
-    dev.update_descriptor_sets(&writes, &[]);
 
     let cmd_pool = dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family), None).unwrap();
     let cmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).unwrap()[0];
+    let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(2).pool_sizes(&[
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(6),
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(2),
+    ]), None).unwrap();
+    let mkset = |sl: vk::DescriptorSetLayout, bufs: &[vk::Buffer]| -> vk::DescriptorSet {
+        let set = dev.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(std::slice::from_ref(&sl))).unwrap()[0];
+        let infos: Vec<[vk::DescriptorBufferInfo; 1]> = bufs.iter().map(|&b| [vk::DescriptorBufferInfo::default().buffer(b).range(vk::WHOLE_SIZE)]).collect();
+        let mut writes: Vec<vk::WriteDescriptorSet> = infos.iter().enumerate().map(|(i, info)|
+            vk::WriteDescriptorSet::default().dst_set(set).dst_binding(i as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(info)).collect();
+        writes.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(bufs.len() as u32).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&ui));
+        dev.update_descriptor_sets(&writes, &[]);
+        set
+    };
     dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
-    dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, sd_p);
-    dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, sd_l, 0, &[set], &[]);
-    dev.cmd_dispatch(cmd, n_head as u32, 1, 1);
+    let barr = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
+    let cs = vk::PipelineStageFlags::COMPUTE_SHADER;
+    if flash {
+        let nblk = seq_len.div_ceil(SDPA_FLASH_BLOCK);
+        let part = { let (b, _m, _p) = ctx.uma_buffer((n_head * nblk * (hd + 2) * 4) as u64).unwrap(); b };
+        let (fp_p, fp_l, fp_sl, _a) = ctx.make_pipeline_raw(SDPA_FLASH_PARTIAL_SPV, 4);
+        let (fc_p, fc_l, fc_sl, _b) = ctx.make_pipeline_raw(SDPA_FLASH_COMBINE_SPV, 2);
+        let s_fp = mkset(fp_sl, &[q, kc, vc, part]);
+        let s_fc = mkset(fc_sl, &[part, out]);
+        dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, fp_p);
+        dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, fp_l, 0, &[s_fp], &[]);
+        dev.cmd_dispatch(cmd, n_head as u32, nblk as u32, 1);
+        dev.cmd_pipeline_barrier(cmd, cs, cs, vk::DependencyFlags::empty(), &[barr], &[], &[]);
+        dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, fc_p);
+        dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, fc_l, 0, &[s_fc], &[]);
+        dev.cmd_dispatch(cmd, n_head as u32, 1, 1);
+    } else {
+        let (sd_p, sd_l, sd_sl, _a) = ctx.make_pipeline_raw(SDPA_DECODE_SPV, 4);
+        let set = mkset(sd_sl, &[q, kc, vc, out]);
+        dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, sd_p);
+        dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, sd_l, 0, &[set], &[]);
+        dev.cmd_dispatch(cmd, n_head as u32, 1, 1);
+    }
     dev.end_command_buffer(cmd).unwrap();
     let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
     let cmds = [cmd]; let submit = vk::SubmitInfo::default().command_buffers(&cmds);
@@ -1056,9 +1088,10 @@ unsafe fn sdpa_correctness_inner(ctx: &VkContext) {
     let op = out_ptr as *const f32;
     let (mut max_err, mut argmax) = (0f32, 0usize);
     for i in 0..qn { let e = (*op.add(i) - refo[i]).abs(); if e > max_err { max_err = e; argmax = i; } }
-    eprintln!("SDPA correctness: max_abs_err={max_err:.3e} at {argmax} (gpu={} cpu={}) => {}",
-        *op.add(argmax), refo[argmax], if max_err < 1e-3 { "PASS" } else { "FAIL" });
-    assert!(max_err < 1e-3, "SDPA mismatch: {max_err}");
+    let kind = if flash { "flash" } else { "single" };
+    eprintln!("SDPA correctness [{kind}, seq={seq_len}]: max_abs_err={max_err:.3e} at {argmax} => {}",
+        if max_err < 1e-3 { "PASS" } else { "FAIL" });
+    assert!(max_err < 1e-3, "SDPA {kind} mismatch: {max_err}");
 }
 
 #[cfg(test)]
@@ -1139,7 +1172,9 @@ unsafe fn fused_decode_inner(ctx: &VkContext) {
     let (n_embd, n_head, n_kv, hd, n_inter, vocab, n_layers, max_seq) =
         (2048usize, 32usize, 8usize, 64usize, 8192usize, 128256usize, 16usize, 64usize);
     let kv_dim = n_kv * hd;
-    let seq_len = 32u32; // realistic short-context decode depth
+    // VK_SEQ sets the KV-cache depth (context length) to stress SDPA scaling.
+    let seq_len: u32 = std::env::var("VK_SEQ").ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+    let max_seq = (seq_len as usize).max(max_seq);
     let eps = 1e-5f32;
 
     let q4k = |n: usize, k: usize| -> Vec<u8> {
@@ -1160,12 +1195,16 @@ unsafe fn fused_decode_inner(ctx: &VkContext) {
     let attn = buf_f32(n_embd); let gate = buf_f32(n_inter); let up = buf_f32(n_inter); let h = buf_f32(n_inter);
     let (logits, _lmm, logits_ptr) = ctx.uma_buffer((vocab * 4) as u64).unwrap(); // keep ptr for correctness check
     let kc = buf_f32(max_seq * kv_dim); let vc = buf_f32(max_seq * kv_dim);
+    let n_blocks_max = max_seq.div_ceil(SDPA_FLASH_BLOCK);
+    let part = buf_f32(n_head * n_blocks_max * (hd + 2)); // flash-attn per-block partials
 
     // Pipelines (storage-buffer count per kernel).
     let (mv_p, mv_l, mv_sl, _m0) = ctx.make_pipeline_raw(DECODE_MATVEC_Q4K_SPV, 3);
     let (rn_p, rn_l, rn_sl, _m1) = ctx.make_pipeline_raw(RMSNORM_SPV, 3);
     let (ro_p, ro_l, ro_sl, _m2) = ctx.make_pipeline_raw(ROPE_SPV, 3);
     let (sd_p, sd_l, sd_sl, _m3) = ctx.make_pipeline_raw(SDPA_DECODE_SPV, 4);
+    let (fp_p, fp_l, fp_sl, _mf0) = ctx.make_pipeline_raw(SDPA_FLASH_PARTIAL_SPV, 4); // flash pass 1
+    let (fc_p, fc_l, fc_sl, _mf1) = ctx.make_pipeline_raw(SDPA_FLASH_COMBINE_SPV, 2); // flash pass 2
     let (si_p, si_l, si_sl, _m4) = ctx.make_pipeline_raw(SILU_MUL_SPV, 3);
     let (dn_p, dn_l, dn_sl, _m5) = ctx.make_pipeline_raw(DECODE_MATVEC_DOWN_Q4K_SPV, 4); // fused silu·mul + down
 
@@ -1194,6 +1233,8 @@ unsafe fn fused_decode_inner(ctx: &VkContext) {
     let s_rq = mkset(ro_sl, &[q, cosb, sinb], uni([n_head as u32, hd as u32, 0, 0]));
     let s_rk = mkset(ro_sl, &[k, cosb, sinb], uni([n_kv as u32, hd as u32, 0, 0]));
     let s_sd = mkset(sd_sl, &[q, kc, vc, attn], uni([n_head as u32, n_kv as u32, hd as u32, seq_len]));
+    let s_fp = mkset(fp_sl, &[q, kc, vc, part], uni([n_head as u32, n_kv as u32, hd as u32, seq_len]));
+    let s_fc = mkset(fc_sl, &[part, attn], uni([n_head as u32, n_kv as u32, hd as u32, seq_len]));
     let s_wo = mkset(mv_sl, &[wo, attn, x], mvuni(n_embd, n_embd));
     let s_w1 = mkset(mv_sl, &[w1, normed, gate], mvuni(n_inter, n_embd));
     let s_w3 = mkset(mv_sl, &[w3, normed, up], mvuni(n_inter, n_embd));
@@ -1244,7 +1285,16 @@ unsafe fn fused_decode_inner(ctx: &VkContext) {
             disp(ro_p, ro_l, s_rq, ((n_head * hd / 2) as u32).div_ceil(64), 1);
             disp(ro_p, ro_l, s_rk, ((n_kv * hd / 2) as u32).div_ceil(64), 1); bar();   // RoPE q,k
         }
-        if !skip_sdpa { disp(sd_p, sd_l, s_sd, n_head as u32, 1); bar(); }             // SDPA (1 workgroup/head)
+        if !skip_sdpa {
+            if (seq_len as usize) > SDPA_FLASH_BLOCK {
+                // Flash: partial blocks (grid n_head × n_blocks) then combine.
+                let nblk = (seq_len as usize).div_ceil(SDPA_FLASH_BLOCK) as u32;
+                disp(fp_p, fp_l, s_fp, n_head as u32, nblk); bar();
+                disp(fc_p, fc_l, s_fc, n_head as u32, 1); bar();
+            } else {
+                disp(sd_p, sd_l, s_sd, n_head as u32, 1); bar();                       // single-pass (short ctx)
+            }
+        }
         mv(s_wo, n_embd); bar();                                                       // O proj
         if !skip_norm { disp(rn_p, rn_l, s_rn, 1, 1); bar(); }                         // ffn norm
         mv(s_w1, n_inter); mv(s_w3, n_inter); bar();                                   // gate, up

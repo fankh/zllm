@@ -1,0 +1,40 @@
+// Flash-decode SDPA, pass 1 (partials): grid (n_head, n_blocks). Each workgroup
+// (one wave32 subgroup per head) runs the online softmax over ONE BLOCK of KV
+// positions and writes its partial (unnormalized acc, running max m, denom l) to
+// scratch. Many blocks => many workgroups => the KV streaming latency is hidden
+// (the single-pass kernel under-filled the GPU at long context). Combine in pass 2.
+#version 450 core
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 32) in;
+layout(binding = 0) readonly  buffer Q_   { float q[];    };
+layout(binding = 1) readonly  buffer KC_  { float kc[];   };
+layout(binding = 2) readonly  buffer VC_  { float vc[];   };
+layout(binding = 3) writeonly buffer PRT_ { float part[]; };  // [n_head*n_blocks*(hd+2)]
+layout(binding = 4) uniform   P_ { uint n_head; uint n_kv; uint hd; uint seq_len; } p;
+const uint BLOCK = 32u;
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint blk = gl_WorkGroupID.y;
+    uint n_blocks = (p.seq_len + BLOCK - 1u) / BLOCK;
+    uint lane = gl_LocalInvocationID.x;
+    uint kvh = h / (p.n_head / p.n_kv);
+    float scale = 1.0 / sqrt(float(p.hd));
+    uint dpl = (p.hd + 31u) / 32u;
+    float qd[8]; float av[8];
+    for (uint i = 0u; i < dpl; i++) { uint d = lane + i * 32u; qd[i] = (d < p.hd) ? q[h * p.hd + d] : 0.0; av[i] = 0.0; }
+    float mx = -1e30; float l = 0.0;
+    uint start = blk * BLOCK; uint end = min(start + BLOCK, p.seq_len);
+    for (uint t = start; t < end; t++) {
+        uint kb = (t * p.n_kv + kvh) * p.hd;
+        float partial = 0.0;
+        for (uint i = 0u; i < dpl; i++) { uint d = lane + i * 32u; if (d < p.hd) { partial += qd[i] * kc[kb + d]; } }
+        float s = subgroupAdd(partial) * scale;
+        float mn = max(mx, s); float corr = exp(mx - mn); float pe = exp(s - mn);
+        l = l * corr + pe;
+        for (uint i = 0u; i < dpl; i++) { uint d = lane + i * 32u; if (d < p.hd) { av[i] = av[i] * corr + pe * vc[kb + d]; } }
+        mx = mn;
+    }
+    uint base = (h * n_blocks + blk) * (p.hd + 2u);
+    for (uint i = 0u; i < dpl; i++) { uint d = lane + i * 32u; if (d < p.hd) { part[base + d] = av[i]; } }
+    if (lane == 0u) { part[base + p.hd] = mx; part[base + p.hd + 1u] = l; }
+}

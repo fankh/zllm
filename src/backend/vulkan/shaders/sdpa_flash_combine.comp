@@ -1,0 +1,28 @@
+// Flash-decode SDPA, pass 2 (combine): grid (n_head). Reads the per-block
+// partials for a head and merges them into the final attention output via the
+// log-sum-exp combine: gm = max_b m_b; out = (sum_b acc_b * exp(m_b-gm)) /
+// (sum_b l_b * exp(m_b-gm)). One wave32 subgroup per head, lane owns hd/32 dims.
+#version 450 core
+layout(local_size_x = 32) in;
+layout(binding = 0) readonly  buffer PRT_ { float part[]; };
+layout(binding = 1) writeonly buffer O_   { float outp[]; };
+layout(binding = 2) uniform   P_ { uint n_head; uint n_kv; uint hd; uint seq_len; } p;
+const uint BLOCK = 32u;
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint n_blocks = (p.seq_len + BLOCK - 1u) / BLOCK;
+    uint dpl = (p.hd + 31u) / 32u;
+    float gm = -1e30;
+    for (uint b = 0u; b < n_blocks; b++) { gm = max(gm, part[(h * n_blocks + b) * (p.hd + 2u) + p.hd]); }
+    float gdenom = 0.0;
+    float acc[8]; for (uint i = 0u; i < dpl; i++) { acc[i] = 0.0; }
+    for (uint b = 0u; b < n_blocks; b++) {
+        uint base = (h * n_blocks + b) * (p.hd + 2u);
+        float w = exp(part[base + p.hd] - gm);
+        gdenom += part[base + p.hd + 1u] * w;
+        for (uint i = 0u; i < dpl; i++) { uint d = lane + i * 32u; if (d < p.hd) { acc[i] += part[base + d] * w; } }
+    }
+    float inv = 1.0 / gdenom;
+    for (uint i = 0u; i < dpl; i++) { uint d = lane + i * 32u; if (d < p.hd) { outp[h * p.hd + d] = acc[i] * inv; } }
+}
