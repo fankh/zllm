@@ -27,6 +27,11 @@ const DECODE_MATVEC_Q6K_SPV: &[u8] = include_bytes!("shaders/decode_matvec_q6k.s
 const KV_WRITE_SPV: &[u8] = include_bytes!("shaders/kv_write.spv");
 const RESIDUAL_ADD_SPV: &[u8] = include_bytes!("shaders/residual_add.spv");
 const ARGMAX_SPV: &[u8] = include_bytes!("shaders/argmax.spv");
+
+/// Max prompt length for the raw-Vulkan server fast-lane. Prefill is sequential
+/// (one forward per prompt token) so this is kept modest; batched prefill via
+/// the coopmat GEMM is the follow-up that would raise it.
+pub const MAX_PREFILL_M: usize = 128;
 const INC_SPV: &[u8] = include_bytes!("shaders/inc.spv");
 const INC_COH_SPV: &[u8] = include_bytes!("shaders/inc_coh.spv");
 
@@ -1003,16 +1008,22 @@ impl VkModel {
     /// Decode one token at position `pos` (0-based). Writes K/V into the resident
     /// cache at `pos` and attends over 0..=pos. Returns the full logits.
     pub fn forward(&self, token: u32, pos: usize) -> Vec<f32> {
-        unsafe { self.forward_inner(token, pos, false).0 }
+        unsafe { self.forward_inner(token, pos, true, false).0 }
     }
 
     /// Greedy decode: argmax on the GPU, reads back 4 bytes (avoids the slow
     /// 513 KB logit readback from write-combined host-visible memory).
     pub fn forward_argmax(&self, token: u32, pos: usize) -> u32 {
-        unsafe { self.forward_inner(token, pos, true).1 }
+        unsafe { self.forward_inner(token, pos, true, true).1 }
     }
 
-    unsafe fn forward_inner(&self, token: u32, pos: usize, argmax: bool) -> (Vec<f32>, u32) {
+    /// Prefill step: run the layers to fill the KV cache at `pos`, skipping the
+    /// final norm + LM head (logits not needed for non-final prompt tokens).
+    pub fn prefill_step(&self, token: u32, pos: usize) {
+        unsafe { self.forward_inner(token, pos, false, false); }
+    }
+
+    unsafe fn forward_inner(&self, token: u32, pos: usize, lm: bool, argmax: bool) -> (Vec<f32>, u32) {
         use ash::vk;
         let dv = &self.ctx.device;
         let (n_embd, n_head, n_kv, hd, n_inter, kv_dim, half) = (self.n_embd, self.n_head, self.n_kv, self.hd, self.n_inter, self.kv_dim, self.half);
@@ -1060,22 +1071,26 @@ impl VkModel {
             mv(l.w2, n_embd); bar();                                                   // down proj
             disp(self.p_add, l.radd_f, (n_embd as u32).div_ceil(64), 1); bar();        // x += ffn out
         }
-        disp(self.p_rms, self.s_final_norm, 1, 1); bar();                              // final norm
-        disp(self.p_q6k, self.s_lm, gxof(self.vocab), (self.vocab as u32).div_ceil(gxof(self.vocab))); // LM head
-        if argmax { bar(); disp(self.p_argmax, self.s_argmax, 1, 1); }                  // GPU argmax (4-byte readback)
+        if lm {
+            disp(self.p_rms, self.s_final_norm, 1, 1); bar();                          // final norm
+            disp(self.p_q6k, self.s_lm, gxof(self.vocab), (self.vocab as u32).div_ceil(gxof(self.vocab))); // LM head
+            if argmax { bar(); disp(self.p_argmax, self.s_argmax, 1, 1); }              // GPU argmax (4-byte readback)
+        }
         let _ = attn_dim;
         dv.end_command_buffer(cmd).unwrap();
         dv.reset_fences(&[self.fence]).unwrap();
         let cmds = [cmd];
         dv.queue_submit(self.ctx.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], self.fence).unwrap();
         dv.wait_for_fences(&[self.fence], true, u64::MAX).unwrap();
-        if argmax {
-            (Vec::new(), *(self.argmax_ptr as *const u32))
-        } else {
-            (std::slice::from_raw_parts(self.logits_ptr as *const f32, self.vocab).to_vec(), 0)
-        }
+        if !lm { (Vec::new(), 0) }
+        else if argmax { (Vec::new(), *(self.argmax_ptr as *const u32)) }
+        else { (std::slice::from_raw_parts(self.logits_ptr as *const f32, self.vocab).to_vec(), 0) }
     }
 }
+
+// Safe: the model is only ever accessed behind a Mutex (one thread at a time);
+// the raw mapped pointers are valid for the model's lifetime.
+unsafe impl Send for VkModel {}
 
 impl Drop for VkModel {
     fn drop(&mut self) {

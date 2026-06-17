@@ -117,6 +117,12 @@ pub struct AppState {
     /// GpuModel has a single resident KV cache. Reloaded on model swap.
     #[cfg(feature = "gpu")]
     pub gpu: Arc<Mutex<Option<crate::backend::gpu::GpuModel>>>,
+    /// Optional resident raw-Vulkan (ash) decode engine (cargo feature
+    /// `vulkan`, enabled via `ZLLM_VK=1`). Same fast-lane contract as `gpu`
+    /// but uses the VkModel (validated bit-exact vs candle). Prompts ≤ 128
+    /// (sequential prefill). Serialized through the Mutex (single KV cache).
+    #[cfg(feature = "vulkan")]
+    pub vk: Arc<Mutex<Option<crate::backend::vulkan::VkModel>>>,
 }
 
 /// Round-robin tie-breaker when every pool slot is busy. Atomic so
@@ -612,6 +618,16 @@ async fn select_model(
             }
         }
     }
+    #[cfg(feature = "vulkan")]
+    if std::env::var("ZLLM_VK").is_ok() {
+        let path_str = gguf_path.to_str().unwrap_or("").to_string();
+        let loaded = crate::backend::vulkan::VkContext::new()
+            .and_then(|ctx| crate::backend::vulkan::VkModel::load(&path_str, ctx));
+        match loaded {
+            Ok(m) => { *s.vk.lock().expect("vk poisoned") = Some(m); tracing::info!("Vulkan engine reloaded for swapped model"); }
+            Err(e) => { *s.vk.lock().expect("vk poisoned") = None; tracing::warn!("Vulkan reload failed ({e}); fast-lane disabled for this model"); }
+        }
+    }
 
     *s.tokenizer.write().expect("tokenizer poisoned") = new_tok;
     *s.current_model.write().expect("current_model poisoned") = req.id.clone();
@@ -1042,6 +1058,46 @@ fn generate_gpu(
     (text, prompt_len, generated.len(), finish_reason)
 }
 
+/// Raw-Vulkan (ash) decode fast-lane. Mirrors `generate_gpu` but uses the
+/// `VkModel` engine (validated bit-exact vs candle). Prefill is sequential
+/// (one forward per prompt token filling the KV cache); decode uses the GPU
+/// argmax path for greedy (4-byte readback) or full logits for sampling.
+#[cfg(feature = "vulkan")]
+fn generate_vk(
+    s: &AppState,
+    model: &crate::backend::vulkan::VkModel,
+    prompt_tokens: &[u32],
+    max_tokens: usize,
+    sampler_cfg: &SamplerConfig,
+) -> (String, usize, usize, &'static str) {
+    let prompt_len = prompt_tokens.len();
+    let eos = s.tokenizer.read().unwrap().eos_token_id().unwrap_or(128001);
+    let greedy = sampler_cfg.temperature == 0.0;
+    let t_prefill = std::time::Instant::now();
+    for (i, &tk) in prompt_tokens[..prompt_len - 1].iter().enumerate() { model.prefill_step(tk, i); }
+    let last = prompt_tokens[prompt_len - 1];
+    let mut next = if greedy { model.forward_argmax(last, prompt_len - 1) } else { sample(&model.forward(last, prompt_len - 1), sampler_cfg) };
+    let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1e3;
+    let mut generated: Vec<u32> = Vec::new();
+    let mut finish_reason: &'static str = "length";
+    let mut pos = prompt_len;
+    let t_decode = std::time::Instant::now();
+    loop {
+        if next == eos || next == 128009 { finish_reason = "stop"; break; }
+        generated.push(next);
+        if generated.len() >= max_tokens { break; }
+        next = if greedy { model.forward_argmax(next, pos) } else { sample(&model.forward(next, pos), sampler_cfg) };
+        pos += 1;
+    }
+    let dec_s = t_decode.elapsed().as_secs_f64();
+    tracing::info!(
+        "Vulkan fast-lane: prefill {prompt_len} tok in {prefill_ms:.0} ms, decoded {} tok at {:.0} tok/s",
+        generated.len(), generated.len() as f64 / dec_s.max(1e-6),
+    );
+    let text = s.tokenizer.read().unwrap().decode(&generated).unwrap_or_default();
+    (text, prompt_len, generated.len(), finish_reason)
+}
+
 fn generate_blocking(
     s: &AppState,
     prompt_tokens: Vec<u32>,
@@ -1082,6 +1138,22 @@ fn generate_blocking(
             if let Ok(guard) = s.gpu.lock() {
                 if let Some(model) = guard.as_ref() {
                     return generate_gpu(s, model, &prompt_tokens, max_tokens, sampler_cfg);
+                }
+            }
+        }
+    }
+    // Raw-Vulkan decode fast-lane (same gate, prompt cap is the VkModel's).
+    #[cfg(feature = "vulkan")]
+    {
+        let vk_eligible = !inspect_on
+            && !s.pld_enabled.load(Ordering::Relaxed)
+            && !s.early_exit_enabled.load(Ordering::Relaxed)
+            && fsm.is_none()
+            && (1..=crate::backend::vulkan::MAX_PREFILL_M).contains(&prompt_tokens.len());
+        if vk_eligible {
+            if let Ok(guard) = s.vk.lock() {
+                if let Some(model) = guard.as_ref() {
+                    return generate_vk(s, model, &prompt_tokens, max_tokens, sampler_cfg);
                 }
             }
         }
@@ -1380,6 +1452,57 @@ fn chat_stream(
                             prompt_len as f64 / (prefill_ms / 1e3),
                             generated as f64 / dec_s.max(1e-6),
                         );
+                        let final_chunk = json!({
+                            "id": id, "object": "chat.completion.chunk",
+                            "created": now, "model": model_id,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+                        });
+                        let _ = tx.unbounded_send(Ok(Event::default().data(final_chunk.to_string())));
+                        let _ = tx.unbounded_send(Ok(Event::default().data("[DONE]")));
+                        tx.disconnect();
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Raw-Vulkan fast-lane (streaming) — same gate, sequential prefill.
+        #[cfg(feature = "vulkan")]
+        {
+            let inspect_on = s.inspection_enabled.load(Ordering::Relaxed);
+            let vk_eligible = !inspect_on
+                && !s.pld_enabled.load(Ordering::Relaxed)
+                && !s.early_exit_enabled.load(Ordering::Relaxed)
+                && fsm.is_none()
+                && (1..=crate::backend::vulkan::MAX_PREFILL_M).contains(&prompt_tokens.len());
+            if vk_eligible {
+                if let Ok(guard) = s.vk.lock() {
+                    if let Some(model) = guard.as_ref() {
+                        let greedy = sampler_cfg.temperature == 0.0;
+                        let prompt_len = prompt_tokens.len();
+                        let t_decode = std::time::Instant::now();
+                        for (i, &tk) in prompt_tokens[..prompt_len - 1].iter().enumerate() { model.prefill_step(tk, i); }
+                        let last = prompt_tokens[prompt_len - 1];
+                        let mut next = if greedy { model.forward_argmax(last, prompt_len - 1) } else { sample(&model.forward(last, prompt_len - 1), &sampler_cfg) };
+                        let mut finish_reason: &'static str = "length";
+                        let mut pos = prompt_len;
+                        let mut generated = 0usize;
+                        loop {
+                            if next == eos || next == 128009 { finish_reason = "stop"; break; }
+                            let text = s.tokenizer.read().unwrap().decode(&[next]).unwrap_or_default();
+                            let chunk = json!({
+                                "id": id, "object": "chat.completion.chunk",
+                                "created": now, "model": model_id,
+                                "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
+                            });
+                            if tx.unbounded_send(Ok(Event::default().data(chunk.to_string()))).is_err() { break; }
+                            generated += 1;
+                            if generated >= max_tokens { break; }
+                            next = if greedy { model.forward_argmax(next, pos) } else { sample(&model.forward(next, pos), &sampler_cfg) };
+                            pos += 1;
+                        }
+                        let dec_s = t_decode.elapsed().as_secs_f64();
+                        tracing::info!("Vulkan fast-lane (stream): streamed {generated} tok at {:.0} tok/s", generated as f64 / dec_s.max(1e-6));
                         let final_chunk = json!({
                             "id": id, "object": "chat.completion.chunk",
                             "created": now, "model": model_id,

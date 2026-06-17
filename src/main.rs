@@ -297,6 +297,27 @@ async fn main() -> anyhow::Result<()> {
                 Arc::new(Mutex::new(loaded))
             };
 
+            // Raw-Vulkan (ash) decode engine — enabled via ZLLM_VK=1. Validated
+            // bit-exact vs candle; beats CPU/wgpu on decode. Reloaded on swap.
+            #[cfg(feature = "vulkan")]
+            let vk_engine: Arc<Mutex<Option<backend::vulkan::VkModel>>> = {
+                let loaded = if model_exists && std::env::var("ZLLM_VK").is_ok() {
+                    let t = std::time::Instant::now();
+                    match backend::vulkan::VkContext::new().and_then(|ctx| {
+                        backend::vulkan::VkModel::load(model_path.to_str().unwrap_or(""), ctx)
+                    }) {
+                        Ok(m) => {
+                            tracing::info!("Vulkan engine loaded in {} ms — chat fast-lane enabled (ZLLM_VK=1)", t.elapsed().as_millis());
+                            Some(m)
+                        }
+                        Err(e) => { tracing::warn!("Vulkan engine load failed ({e}); not using it"); None }
+                    }
+                } else {
+                    None
+                };
+                Arc::new(Mutex::new(loaded))
+            };
+
             let state = AppState {
                 pool: Arc::new(pool_slots),
                 tokenizer: Arc::new(RwLock::new(tokenizer)),
@@ -320,6 +341,8 @@ async fn main() -> anyhow::Result<()> {
                 early_exit_threshold_bits: Arc::new(std::sync::atomic::AtomicU32::new(0.30_f32.to_bits())),
                 #[cfg(feature = "gpu")]
                 gpu: gpu_engine,
+                #[cfg(feature = "vulkan")]
+                vk: vk_engine,
             };
 
             let rest_addr = format!("0.0.0.0:{}", cfg.server.rest_port);
