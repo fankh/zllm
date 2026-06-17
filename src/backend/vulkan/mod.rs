@@ -26,6 +26,7 @@ const SILU_MUL_SPV: &[u8] = include_bytes!("shaders/silu_mul.spv");
 const DECODE_MATVEC_Q6K_SPV: &[u8] = include_bytes!("shaders/decode_matvec_q6k.spv");
 const KV_WRITE_SPV: &[u8] = include_bytes!("shaders/kv_write.spv");
 const RESIDUAL_ADD_SPV: &[u8] = include_bytes!("shaders/residual_add.spv");
+const ARGMAX_SPV: &[u8] = include_bytes!("shaders/argmax.spv");
 const INC_SPV: &[u8] = include_bytes!("shaders/inc.spv");
 const INC_COH_SPV: &[u8] = include_bytes!("shaders/inc_coh.spv");
 
@@ -777,13 +778,15 @@ pub struct VkModel {
     // descriptor sets
     layers: Vec<VkLayerOps>,
     s_rope_q: ash::vk::DescriptorSet, s_rope_k: ash::vk::DescriptorSet,
-    s_final_norm: ash::vk::DescriptorSet, s_lm: ash::vk::DescriptorSet,
+    s_final_norm: ash::vk::DescriptorSet, s_lm: ash::vk::DescriptorSet, s_argmax: ash::vk::DescriptorSet,
+    argmax_ptr: *mut u8,
     // pipelines (pipeline, layout)
     p_rms: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_mv: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     p_rope: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_kvw: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     p_sdpa: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_fp: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     p_fc: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_silu: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     p_add: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_q6k: (ash::vk::Pipeline, ash::vk::PipelineLayout),
+    p_argmax: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     // owned resources for cleanup
     bufs: Vec<(ash::vk::Buffer, ash::vk::DeviceMemory)>,
     pipes: Vec<(ash::vk::Pipeline, ash::vk::PipelineLayout, ash::vk::DescriptorSetLayout, ash::vk::ShaderModule)>,
@@ -930,6 +933,7 @@ impl VkModel {
         let (silu_p, silu_l, silu_sl) = mkpipe(SILU_MUL_SPV, 3);
         let (add_p, add_l, add_sl) = mkpipe(RESIDUAL_ADD_SPV, 2);
         let (q6k_p, q6k_l, q6k_sl) = mkpipe(DECODE_MATVEC_Q6K_SPV, 6);
+        let (argmax_p, argmax_l, argmax_sl) = mkpipe(ARGMAX_SPV, 2);
 
         // Descriptor pool + sets.
         let desc_pool = dv.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets((n_layers * 20 + 16) as u32).pool_sizes(&[
@@ -950,6 +954,9 @@ impl VkModel {
         let s_rope_k = mkset(rope_sl, &[k_buf, cos_buf, sin_buf], u_rope_k);
         let s_final_norm = mkset(rms_sl, &[x_buf, final_norm, normed], u_norm);
         let s_lm = mkset(q6k_sl, &[lm_ql, lm_qh, lm_scl, lm_dd, normed, logits], u_lm);
+        let (argmax_out, argmax_ptr) = vk_zeros(&ctx, &mut bufs, 1);
+        let (u_argmax, _) = vk_uni(&ctx, &mut bufs, [vocab as u32, 0, 0, 0]);
+        let s_argmax = mkset(argmax_sl, &[logits, argmax_out], u_argmax);
 
         let mut layers = Vec::with_capacity(n_layers);
         for r in &raw {
@@ -985,10 +992,10 @@ impl VkModel {
         Ok(Self {
             n_embd, n_head, n_kv, hd, n_inter, vocab, n_layers, kv_dim, half, max_seq, embed, cos, sin, lm_nb,
             x_ptr, cos_ptr, sin_ptr, base_ptr, seq_ptr, logits_ptr,
-            layers, s_rope_q, s_rope_k, s_final_norm, s_lm,
+            layers, s_rope_q, s_rope_k, s_final_norm, s_lm, s_argmax, argmax_ptr,
             p_rms: (rms_p, rms_l), p_mv: (mv_p, mv_l), p_rope: (rope_p, rope_l), p_kvw: (kvw_p, kvw_l),
             p_sdpa: (sdpa_p, sdpa_l), p_fp: (fp_p, fp_l), p_fc: (fc_p, fc_l), p_silu: (silu_p, silu_l),
-            p_add: (add_p, add_l), p_q6k: (q6k_p, q6k_l),
+            p_add: (add_p, add_l), p_q6k: (q6k_p, q6k_l), p_argmax: (argmax_p, argmax_l),
             bufs, pipes, desc_pool, cmd_pool, cmd, fence, ctx,
         })
     }
@@ -996,10 +1003,16 @@ impl VkModel {
     /// Decode one token at position `pos` (0-based). Writes K/V into the resident
     /// cache at `pos` and attends over 0..=pos. Returns the full logits.
     pub fn forward(&self, token: u32, pos: usize) -> Vec<f32> {
-        unsafe { self.forward_inner(token, pos) }
+        unsafe { self.forward_inner(token, pos, false).0 }
     }
 
-    unsafe fn forward_inner(&self, token: u32, pos: usize) -> Vec<f32> {
+    /// Greedy decode: argmax on the GPU, reads back 4 bytes (avoids the slow
+    /// 513 KB logit readback from write-combined host-visible memory).
+    pub fn forward_argmax(&self, token: u32, pos: usize) -> u32 {
+        unsafe { self.forward_inner(token, pos, true).1 }
+    }
+
+    unsafe fn forward_inner(&self, token: u32, pos: usize, argmax: bool) -> (Vec<f32>, u32) {
         use ash::vk;
         let dv = &self.ctx.device;
         let (n_embd, n_head, n_kv, hd, n_inter, kv_dim, half) = (self.n_embd, self.n_head, self.n_kv, self.hd, self.n_inter, self.kv_dim, self.half);
@@ -1049,13 +1062,18 @@ impl VkModel {
         }
         disp(self.p_rms, self.s_final_norm, 1, 1); bar();                              // final norm
         disp(self.p_q6k, self.s_lm, gxof(self.vocab), (self.vocab as u32).div_ceil(gxof(self.vocab))); // LM head
+        if argmax { bar(); disp(self.p_argmax, self.s_argmax, 1, 1); }                  // GPU argmax (4-byte readback)
         let _ = attn_dim;
         dv.end_command_buffer(cmd).unwrap();
         dv.reset_fences(&[self.fence]).unwrap();
         let cmds = [cmd];
         dv.queue_submit(self.ctx.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], self.fence).unwrap();
         dv.wait_for_fences(&[self.fence], true, u64::MAX).unwrap();
-        std::slice::from_raw_parts(self.logits_ptr as *const f32, self.vocab).to_vec()
+        if argmax {
+            (Vec::new(), *(self.argmax_ptr as *const u32))
+        } else {
+            (std::slice::from_raw_parts(self.logits_ptr as *const f32, self.vocab).to_vec(), 0)
+        }
     }
 }
 
@@ -1383,12 +1401,13 @@ mod tests {
         let argmax = |v: &[f32]| -> u32 { let mut bi = 0u32; let mut bv = f32::MIN; for (i, &x) in v.iter().enumerate() { if x > bv { bv = x; bi = i as u32; } } bi };
         let prompt: Vec<u32> = vec![128000]; // BOS
         let n_gen = 24usize;
+        let _ = &argmax;
         let mut next = 0u32;
-        for (i, &tk) in prompt.iter().enumerate() { next = argmax(&model.forward(tk, i)); }
+        for (i, &tk) in prompt.iter().enumerate() { next = model.forward_argmax(tk, i); }
         let mut vk_gen = vec![next];
         let mut pos = prompt.len();
         let t0 = Instant::now();
-        for _ in 1..n_gen { next = argmax(&model.forward(next, pos)); vk_gen.push(next); pos += 1; }
+        for _ in 1..n_gen { next = model.forward_argmax(next, pos); vk_gen.push(next); pos += 1; }
         let dt = t0.elapsed();
         eprintln!("VkModel decode: {:.1} tok/s ({} tokens)", (n_gen - 1) as f64 / dt.as_secs_f64(), n_gen - 1);
         eprintln!("VkModel gen: {vk_gen:?}");

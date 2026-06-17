@@ -1,0 +1,22 @@
+// One-workgroup argmax over the logits: each thread scans a strided slice for
+// its local (max,idx), then a shared-mem reduction yields the global argmax.
+// Greedy decode reads back 4 bytes instead of the full 513 KB logit vector
+// (host-visible device memory is write-combined — slow to read on the CPU).
+#version 450 core
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly  buffer L_ { float logits[]; };
+layout(binding = 1) writeonly buffer O_ { uint  outp[];   };
+layout(binding = 2) uniform   P_ { uint n; uint p0; uint p1; uint p2; } p;
+shared float sval[256];
+shared uint  sidx[256];
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    float bv = -3.4e38; uint bi = 0u;
+    for (uint i = t; i < p.n; i += 256u) { float v = logits[i]; if (v > bv) { bv = v; bi = i; } }
+    sval[t] = bv; sidx[t] = bi; barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s && sval[t + s] > sval[t]) { sval[t] = sval[t + s]; sidx[t] = sidx[t + s]; }
+        barrier();
+    }
+    if (t == 0u) { outp[0] = sidx[0]; }
+}
