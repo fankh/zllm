@@ -12,6 +12,7 @@ use ash::vk;
 use std::ffi::CStr;
 
 const COOPMAT_MATMUL_SPV: &[u8] = include_bytes!("shaders/coopmat_matmul.spv");
+const COOPMAT_GEMM_SPV: &[u8] = include_bytes!("shaders/coopmat_gemm.spv");
 
 /// A minimal raw-Vulkan compute context with cooperative matrix enabled.
 pub struct VkContext {
@@ -346,6 +347,101 @@ impl VkContext {
         }
         Ok(out)
     }
+
+    /// LDS-blocked dense fp16 coopmat GEMM: C[M,N] = A[M,K] * B[K,N], run
+    /// `iters` times back-to-back (one submit). Returns the C of the last run
+    /// plus the total GPU time in ms. M,N multiples of 64, K of 16. This is the
+    /// coopmat compute core (Phase 2.1 minus Q4_K dequant) — used to measure
+    /// raw coopmat throughput vs the current wgpu path.
+    pub fn coopmat_gemm_f16(&self, m: usize, n: usize, k: usize, a: &[f32], b: &[f32], iters: u32) -> Result<(Vec<f32>, f64), String> {
+        assert_eq!(a.len(), m * k);
+        assert_eq!(b.len(), k * n);
+        assert!(m % 64 == 0 && n % 64 == 0 && k % 16 == 0);
+        unsafe { self.coopmat_gemm_f16_inner(m, n, k, a, b, iters) }
+    }
+
+    unsafe fn coopmat_gemm_f16_inner(&self, m: usize, n: usize, k: usize, a: &[f32], b: &[f32], iters: u32) -> Result<(Vec<f32>, f64), String> {
+        use std::time::Instant;
+        let dev = &self.device;
+        let (a_buf, a_mem, a_ptr) = self.uma_buffer((m * k * 2) as u64)?;
+        let (b_buf, b_mem, b_ptr) = self.uma_buffer((k * n * 2) as u64)?;
+        let (c_buf, c_mem, c_ptr) = self.uma_buffer((m * n * 4) as u64)?;
+        let (p_buf, p_mem, p_ptr) = self.uma_buffer(16)?;
+        let a16: Vec<u16> = a.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect();
+        let b16: Vec<u16> = b.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect();
+        std::ptr::copy_nonoverlapping(a16.as_ptr() as *const u8, a_ptr, m * k * 2);
+        std::ptr::copy_nonoverlapping(b16.as_ptr() as *const u8, b_ptr, k * n * 2);
+        let dims = [m as u32, n as u32, k as u32, 0u32];
+        std::ptr::copy_nonoverlapping(dims.as_ptr() as *const u8, p_ptr, 16);
+
+        let spv = ash::util::read_spv(&mut std::io::Cursor::new(COOPMAT_GEMM_SPV)).map_err(|e| format!("read_spv: {e}"))?;
+        let module = dev.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spv), None).map_err(|e| format!("module: {e}"))?;
+
+        let mut bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..3)
+            .map(|b| vk::DescriptorSetLayoutBinding::default().binding(b).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE))
+            .collect();
+        bindings.push(vk::DescriptorSetLayoutBinding::default().binding(3).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE));
+        let set_layout = dev.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).map_err(|e| format!("setlayout: {e}"))?;
+        let pipeline_layout = dev.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(std::slice::from_ref(&set_layout)), None).map_err(|e| format!("playout: {e}"))?;
+
+        let entry = std::ffi::CString::new("main").unwrap();
+        let mut req_sg = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(32);
+        let stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE).module(module).name(&entry)
+            .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS).push_next(&mut req_sg);
+        let pipeline = dev.create_compute_pipelines(vk::PipelineCache::null(),
+            &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(pipeline_layout)], None)
+            .map_err(|(_, e)| format!("pipeline: {e}"))?[0];
+
+        let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&[
+            vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(3),
+            vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(1),
+        ]), None).map_err(|e| format!("pool: {e}"))?;
+        let set = dev.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(std::slice::from_ref(&set_layout))).map_err(|e| format!("allocset: {e}"))?[0];
+        let info = |buf| [vk::DescriptorBufferInfo::default().buffer(buf).range(vk::WHOLE_SIZE)];
+        let (ai, bi, ci, pi) = (info(a_buf), info(b_buf), info(c_buf), info(p_buf));
+        let writes = [
+            vk::WriteDescriptorSet::default().dst_set(set).dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&ai),
+            vk::WriteDescriptorSet::default().dst_set(set).dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&bi),
+            vk::WriteDescriptorSet::default().dst_set(set).dst_binding(2).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&ci),
+            vk::WriteDescriptorSet::default().dst_set(set).dst_binding(3).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&pi),
+        ];
+        dev.update_descriptor_sets(&writes, &[]);
+
+        let cmd_pool = dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(self.queue_family), None).map_err(|e| format!("cmdpool: {e}"))?;
+        let cmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).map_err(|e| format!("cmdbuf: {e}"))?[0];
+        let gx = (n / 64) as u32; let gy = (m / 64) as u32;
+        dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).map_err(|e| format!("begin: {e}"))?;
+        dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+        dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, pipeline_layout, 0, &[set], &[]);
+        let barrier = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
+        for _ in 0..iters {
+            dev.cmd_dispatch(cmd, gx, gy, 1);
+            dev.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[barrier], &[], &[]);
+        }
+        dev.end_command_buffer(cmd).map_err(|e| format!("end: {e}"))?;
+        let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| format!("fence: {e}"))?;
+        let cmds = [cmd];
+        let t0 = Instant::now();
+        dev.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence).map_err(|e| format!("submit: {e}"))?;
+        dev.wait_for_fences(&[fence], true, u64::MAX).map_err(|e| format!("wait: {e}"))?;
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        let mut out = vec![0f32; m * n];
+        std::ptr::copy_nonoverlapping(c_ptr as *const f32, out.as_mut_ptr(), m * n);
+
+        dev.destroy_fence(fence, None);
+        dev.destroy_command_pool(cmd_pool, None);
+        dev.destroy_descriptor_pool(pool, None);
+        dev.destroy_pipeline(pipeline, None);
+        dev.destroy_pipeline_layout(pipeline_layout, None);
+        dev.destroy_descriptor_set_layout(set_layout, None);
+        dev.destroy_shader_module(module, None);
+        for (buf, mem) in [(a_buf, a_mem), (b_buf, b_mem), (c_buf, c_mem), (p_buf, p_mem)] {
+            dev.unmap_memory(mem); dev.destroy_buffer(buf, None); dev.free_memory(mem, None);
+        }
+        Ok((out, ms))
+    }
 }
 
 impl Drop for VkContext {
@@ -397,5 +493,43 @@ mod tests {
         eprintln!("coopmat 16x16x16 vs CPU: max_abs_err = {max_abs:.5}");
         // fp16 inputs → some rounding; fp32 accumulate keeps it small.
         assert!(max_abs < 0.05, "coopmat matmul error too high: {max_abs}");
+    }
+
+    /// PERFORMANCE COMPARISON: the LDS-blocked coopmat GEMM (the Phase 2.1
+    /// compute core) — validate vs CPU, then measure throughput (GFLOP/s) at a
+    /// prefill-scale shape, against the current wgpu f32 path and the iGPU peak.
+    /// `cargo test --release --features vulkan --lib vk_coopmat_gemm -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_coopmat_gemm_throughput() {
+        let ctx = match VkContext::new() {
+            Ok(c) => c,
+            Err(e) => { eprintln!("no Vulkan coopmat device ({e}); skipping"); return; }
+        };
+        // Correctness at a small shape (fp16 in, fp32 accumulate).
+        let (m, n, k) = (128usize, 128usize, 128usize);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i % 11) as f32 - 5.0) * 0.05).collect();
+        let (c, _) = ctx.coopmat_gemm_f16(m, n, k, &a, &b, 1).expect("gemm");
+        let mut max_abs = 0f32;
+        for r in 0..8 { for cc in 0..8 {
+            let mut acc = 0f32; for kk in 0..k { acc += a[r * k + kk] * b[kk * n + cc]; }
+            max_abs = max_abs.max((c[r * n + cc] - acc).abs());
+        } }
+        eprintln!("coopmat GEMM {m}x{n}x{k} vs CPU: max_abs_err = {max_abs:.4}");
+        assert!(max_abs < 0.5, "coopmat GEMM wrong: {max_abs}");
+
+        // Throughput at a prefill-scale shape (M prompt rows, N=K=2048).
+        for &(m, n, k) in &[(512usize, 2048usize, 2048usize), (256, 2048, 2048), (2048, 2048, 2048)] {
+            let a: Vec<f32> = (0..m * k).map(|i| ((i % 31) as f32 - 15.0) * 0.01).collect();
+            let b: Vec<f32> = (0..k * n).map(|i| ((i % 29) as f32 - 14.0) * 0.01).collect();
+            let _ = ctx.coopmat_gemm_f16(m, n, k, &a, &b, 2).expect("warm"); // warm
+            let iters = 30u32;
+            let (_, ms) = ctx.coopmat_gemm_f16(m, n, k, &a, &b, iters).expect("bench");
+            let per = ms / iters as f64;
+            let gflops = 2.0 * (m * n * k) as f64 / (per / 1e3) / 1e9;
+            eprintln!("coopmat GEMM M={m:>4} N={n} K={k}: {per:6.3} ms/iter, {gflops:6.0} GFLOP/s", );
+        }
+        eprintln!("  reference: wgpu f32 Q4_K GEMM ~1000 GFLOP/s (M=256, 2.09ms); 8060S fp16 coopmat peak ~59000 GFLOP/s");
     }
 }
