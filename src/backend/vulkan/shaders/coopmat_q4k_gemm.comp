@@ -1,12 +1,12 @@
-// Q4_K coopmat prefill GEMM (Phase 2.1, register-blocked rebuild):
+// Q4_K coopmat prefill GEMM (Phase 2.1, register-blocked):
 // C[M,N] = A[M,K] * dequant(W)[K,N], A=activations(fp16), W=Q4_K [N,K].
-// A 128x128 output tile per workgroup (8 wave32 subgroups in a 2x4 grid; each
-// register-caches a 4x2 grid of 16x16 accumulator fragments across the whole
-// K-loop). Per K-chunk: stage 128x16 of A and a dequantized 16x128 weight tile
-// into LDS (scale unpacked once per weight row), then each subgroup loads its 4
-// A-frags + 2 B-frags and does 8 coopMatMulAdds. The bigger tile + register
-// blocking raise arithmetic intensity toward the fp16 peak. M,N mult of 128;
-// K mult of 256 (Q4_K). fp32 accumulate.
+// 128x128 output tile per workgroup. 16 wave32 subgroups in a 4x4 grid, each
+// register-caching a 2x2 grid of 16x16 accumulator fragments (32 VGPR/lane for
+// acc — lower register pressure than 8-frag, so more wavefronts resident to hide
+// latency on this occupancy-bound iGPU). Per K-chunk: stage 128x16 of A and a
+// dequantized 16x128 weight tile (scale unpacked once per weight row) into LDS,
+// then each subgroup loads 2 A-frags + 2 B-frags and does 4 coopMatMulAdds.
+// M,N mult of 128; K mult of 256. fp32 accumulate.
 // Compile: glslangValidator --target-env vulkan1.3 -V coopmat_q4k_gemm.comp -o coopmat_q4k_gemm.spv
 #version 450 core
 #extension GL_KHR_cooperative_matrix          : require
@@ -15,7 +15,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #pragma use_vulkan_memory_model
 
-layout(local_size_x = 256) in;   // 8 subgroups of 32 (wave32)
+layout(local_size_x = 512) in;   // 16 subgroups of 32 (wave32)
 
 layout(binding = 0) readonly  buffer A_  { float16_t A[];  };  // activations [M,K]
 layout(binding = 1) readonly  buffer WQ_ { uint      wq[]; };  // raw Q4_K weights [N,K]
@@ -25,7 +25,7 @@ layout(binding = 3) uniform   P_ { uint M; uint N; uint K; uint nb; } p;
 const uint BM = 128u;
 const uint BN = 128u;
 const uint BK = 16u;
-const uint MM = 4u;   // M-fragments per subgroup
+const uint MM = 2u;   // M-fragments per subgroup
 const uint MN = 2u;   // N-fragments per subgroup
 shared float16_t As[BM * BK];   // 128x16
 shared float16_t Bs[BK * BN];   // 16x128
@@ -35,12 +35,12 @@ shared float dmnLDS[BN];
 void main() {
     uint tileM = gl_WorkGroupID.y * BM;
     uint tileN = gl_WorkGroupID.x * BN;
-    uint sg = gl_SubgroupID;       // 0..7
-    uint sr = sg / 4u;             // subgroup row 0..1 → M-rows [sr*64 ..]
+    uint sg = gl_SubgroupID;       // 0..15
+    uint sr = sg / 4u;             // subgroup row 0..3 → M-rows [sr*32 ..]
     uint scg = sg % 4u;            // subgroup col 0..3 → N-cols [scg*32 ..]
     uint tid = gl_LocalInvocationID.x;
 
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[4][2];
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[2][2];
     for (uint i = 0u; i < MM; i = i + 1u)
         for (uint j = 0u; j < MN; j = j + 1u)
             acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
@@ -49,11 +49,11 @@ void main() {
         uint b = k0 / 256u;
         uint sub = (k0 / 32u) % 8u;
         uint lo = k0 % 32u;
-        for (uint i = tid; i < BM * BK; i += 256u) {
+        for (uint i = tid; i < BM * BK; i += 512u) {
             uint r = i / BK; uint c = i % BK;
             As[i] = A[(tileM + r) * p.K + k0 + c];
         }
-        for (uint i = tid; i < BN; i += 256u) {
+        for (uint i = tid; i < BN; i += 512u) {
             uint n = tileN + i;
             uint blk = (n * p.nb + b) * 36u;
             vec2 dd = unpackHalf2x16(wq[blk]);
@@ -69,7 +69,7 @@ void main() {
             dmnLDS[i] = dd.y * mnf;
         }
         barrier();
-        for (uint i = tid; i < BK * BN; i += 256u) {
+        for (uint i = tid; i < BK * BN; i += 512u) {
             uint kk = i / BN; uint nn = i % BN;
             uint blk = ((tileN + nn) * p.nb + b) * 36u;
             uint local = lo + kk;
@@ -81,9 +81,9 @@ void main() {
         }
         barrier();
 
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> af[4];
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> af[2];
         for (uint i = 0u; i < MM; i = i + 1u)
-            coopMatLoad(af[i], As, (sr * 64u + i * 16u) * BK, BK, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(af[i], As, (sr * 32u + i * 16u) * BK, BK, gl_CooperativeMatrixLayoutRowMajor);
         coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bf[2];
         for (uint j = 0u; j < MN; j = j + 1u)
             coopMatLoad(bf[j], Bs, scg * 32u + j * 16u, BN, gl_CooperativeMatrixLayoutRowMajor);
@@ -95,7 +95,7 @@ void main() {
 
     for (uint i = 0u; i < MM; i = i + 1u) {
         for (uint j = 0u; j < MN; j = j + 1u) {
-            uint r0 = tileM + sr * 64u + i * 16u;
+            uint r0 = tileM + sr * 32u + i * 16u;
             uint c0 = tileN + scg * 32u + j * 16u;
             coopMatStore(acc[i][j], C, r0 * p.N + c0, p.N, gl_CooperativeMatrixLayoutRowMajor);
         }
