@@ -38,6 +38,73 @@ naga; no Vulkan SDK / cmake needed). Lives in `src/backend/gpu`.
   bigger lever than fusion. Approaching llama.cpp's 208 would need raw
   `ash`+SPIR-V with mega-fused kernels and hand-managed barriers.
 
+### iGPU prefill offload — TTFT (new)
+
+The decode path is matvec (M=1, bandwidth-bound). Prefill is a batched GEMM
+(M prompt rows reuse each weight load → compute-bound — the iGPU's strength).
+`GpuModel::prefill_forward(prompt)` runs the whole prompt in one batched pass
+(K-tiled Q4_K/Q6_K GEMMs, batched RMSNorm/RoPE/causal-GQA-SDPA), fills the
+resident KV cache for positions 0..M, and returns the last-token logits;
+decode then continues from position M.
+
+- **Bit-faithful:** greedy output is identical to candle's batched CPU forward
+  (12/12 tokens; last-token argmax matches, logit cosine 0.999). Supports
+  1..=512 tokens (the GEMM's per-thread `acc[8]` caps M at 512).
+- **Fast (averaged sweep, vs ~15 ms/token sequential decode):**
+
+  | prompt M | prefill | tok/s | speedup vs M× decode |
+  |---|---|---|---|
+  | 12  | 48 ms  | 249 | 4.4× |
+  | 32  | 61 ms  | 527 | 9.3× |
+  | 128 | 256 ms | 500 | 8.8× |
+  | 256 | 520 ms | 492 | 8.7× |
+
+  Prefill wins at every length; throughput is a flat ~490–527 tok/s for M≥32,
+  well above the 208 decode target.
+- Two GEMM optimizations, both bit-exact, got there from an initial 2842 ms /
+  481 ms-TTFT (M=256 / M=12):
+  1. **8-wide unroll of the inner dot loop** (shared-mem weight row × x): the
+     loop was ALU/latency-bound, not bandwidth-bound → **2.84×** (2842→1000 ms).
+  2. **Shrinking the LDS weight-row tile 2048→256 floats** (8 KB→1 KB): an
+     8 KB tile capped occupancy at ~8 workgroups/WGP on RDNA3.5, so weight-read
+     latency stalled. 1 KB lifts that → **another ~2×** (1054→520 ms at M=256,
+     TTFT 133→48 ms). Sweep at M=256: 2048→243, 512→313, **256→492**, 128→408
+     tok/s. Note the read pattern was *already* coalesced (identical to the
+     192 GB/s decode matvec) — occupancy, not coalescing, was the wall.
+
+  Net: **2842→520 ms (5.5×) at M=256; 481→48 ms (10×) TTFT**.
+- Bind groups + scratch buffers are cached (built once, lazily; only
+  `m_rows`/embeddings/cos-sin are rewritten per call) — avoids a ~70 MB
+  realloc + ~208 bind-group rebuilds per call (matters for repeated/server
+  prefills). It did not by itself move single-call TTFT — the floor was GPU
+  occupancy, fixed above.
+
+### iGPU chat fast-lane — wired into the server (new)
+
+The resident GPU engine is now reachable from real chat requests, not just
+tests. Build with `--features gpu` and start with `ZLLM_GPU=1`: at startup the
+server loads a `GpuModel` from the configured GGUF (logged "chat fast-lane
+enabled") and stores it on `AppState`; it's reloaded on model swap.
+
+- Both the blocking (`generate_blocking`) and **streaming (`chat_stream`,
+  SSE)** chat paths gain a GPU fast-path that early-returns (same shape as the
+  spec-decode redirect) when a request is on the **fast lane** — inspection off
+  (`POST /v1/inspect/enabled {false}`), no spec-decode / PLD / early-exit /
+  grammar, prompt 1..=512 tokens. The whole request runs on the iGPU:
+  `prefill_forward` fills the resident KV cache, then GPU decode (greedy uses
+  the 4-byte argmax readback; sampling reads full logits). Streaming emits the
+  standard per-token SSE deltas + final chunk + `[DONE]`. The candle pool path
+  is untouched for everything else.
+- Verified end-to-end against the live server (Llama-3.2-1B, 8060S): coherent
+  blocking + streaming completions, correct `finish_reason`/usage, proper SSE
+  framing; **warm prefill 487 tok/s** in-process (cold 205 — the bind-group
+  cache earning its keep across requests), decode ~42–54 tok/s under server
+  load.
+- Serialized through a `Mutex<Option<GpuModel>>` (one resident KV cache).
+  Explicit fast-lane trades: no candle prefix-cache reuse (re-prefills each
+  request — best for cold/long prompts, not cached multi-turn) and no
+  inspection hooks. All feature-gated; default (CPU) build unchanged.
+
 ### Also folded in (in-progress backend work)
 
 AVX-512 Q4_K `vec_dot` + 8×8 repack kernels (CPU, gated off by default),

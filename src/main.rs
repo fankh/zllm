@@ -267,6 +267,36 @@ async fn main() -> anyhow::Result<()> {
                 },
             ));
 
+            // Optional resident iGPU engine, loaded once at startup when the
+            // model exists and `ZLLM_GPU=1`. The chat fast-lane (inspection
+            // off, no spec/PLD/early-exit/grammar, prompt ≤512) routes whole
+            // requests here — batched prefill + GPU decode. On any failure we
+            // log and run CPU-only. Reloaded on model swap (see rest.rs).
+            #[cfg(feature = "gpu")]
+            let gpu_engine: Arc<Mutex<Option<backend::gpu::GpuModel>>> = {
+                let loaded = if model_exists && std::env::var("ZLLM_GPU").is_ok() {
+                    let t = std::time::Instant::now();
+                    match backend::gpu::GpuContext::new().and_then(|ctx| {
+                        backend::gpu::GpuModel::load(model_path.to_str().unwrap_or(""), ctx)
+                    }) {
+                        Ok(gm) => {
+                            tracing::info!(
+                                "GPU engine loaded in {} ms — chat fast-lane enabled (ZLLM_GPU=1)",
+                                t.elapsed().as_millis()
+                            );
+                            Some(gm)
+                        }
+                        Err(e) => {
+                            tracing::warn!("GPU engine load failed ({e}); running CPU-only");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                Arc::new(Mutex::new(loaded))
+            };
+
             let state = AppState {
                 pool: Arc::new(pool_slots),
                 tokenizer: Arc::new(RwLock::new(tokenizer)),
@@ -288,6 +318,8 @@ async fn main() -> anyhow::Result<()> {
                 early_exit_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 early_exit_min_layer: Arc::new(std::sync::atomic::AtomicUsize::new(12)),
                 early_exit_threshold_bits: Arc::new(std::sync::atomic::AtomicU32::new(0.30_f32.to_bits())),
+                #[cfg(feature = "gpu")]
+                gpu: gpu_engine,
             };
 
             let rest_addr = format!("0.0.0.0:{}", cfg.server.rest_port);

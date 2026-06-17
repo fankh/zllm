@@ -48,6 +48,12 @@ pub struct GpuContext {
     /// removing the separate silu_mul dispatch. Q4_K / Q6_K variants.
     q4k_down_pipeline: wgpu::ComputePipeline,
     q6k_down_pipeline: wgpu::ComputePipeline,
+    /// Batched Q4_K GEMM for prefill (weight row reused across M prompt rows).
+    q4k_gemm_pipeline: wgpu::ComputePipeline,
+    q6k_gemm_pipeline: wgpu::ComputePipeline,
+    bnorm_pipeline: wgpu::ComputePipeline,
+    brope_pipeline: wgpu::ComputePipeline,
+    bsdpa_pipeline: wgpu::ComputePipeline,
 }
 
 /// A dense f32 weight matrix resident on the GPU (row-major).
@@ -128,6 +134,11 @@ impl GpuContext {
         let argmax_pipeline = Self::make_pipeline(&device, "argmax", ARGMAX_WGSL);
         let q4k_down_pipeline = Self::make_pipeline(&device, "q4k-down", Q4K_DOWN_WGSL);
         let q6k_down_pipeline = Self::make_pipeline(&device, "q6k-down", Q6K_DOWN_WGSL);
+        let q4k_gemm_pipeline = Self::make_pipeline(&device, "q4k-gemm", Q4K_GEMM_WGSL);
+        let q6k_gemm_pipeline = Self::make_pipeline(&device, "q6k-gemm", Q6K_GEMM_WGSL);
+        let bnorm_pipeline = Self::make_pipeline(&device, "bnorm", BNORM_WGSL);
+        let brope_pipeline = Self::make_pipeline(&device, "brope", BROPE_WGSL);
+        let bsdpa_pipeline = Self::make_pipeline(&device, "bsdpa", BSDPA_WGSL);
 
         Ok(Self {
             device,
@@ -145,7 +156,108 @@ impl GpuContext {
             argmax_pipeline,
             q4k_down_pipeline,
             q6k_down_pipeline,
+            q4k_gemm_pipeline,
+            q6k_gemm_pipeline,
+            bnorm_pipeline,
+            brope_pipeline,
+            bsdpa_pipeline,
         })
+    }
+
+    // ---- prefill (batched) op recorders; build params+bind group per call ----
+    fn gemm_params(&self, n_rows: usize, n_cols: usize, m_rows: usize, acc: u32) -> (wgpu::Buffer, u32) {
+        use wgpu::util::DeviceExt;
+        let gx = (n_rows as u32).min(65535);
+        let buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[n_rows as u32, (n_cols / 256) as u32, n_cols as u32, m_rows as u32, gx, acc, 0u32, 0u32]),
+            usage: wgpu::BufferUsages::UNIFORM });
+        (buf, gx)
+    }
+    fn record_gemm(&self, enc: &mut wgpu::CommandEncoder, w: &ResidentWeight, x: &wgpu::Buffer, out: &wgpu::Buffer, n_cols: usize, m_rows: usize, acc: u32) {
+        let n_rows = w.n_rows();
+        let (pbuf, gx) = self.gemm_params(n_rows, n_cols, m_rows, acc);
+        let (pipe, bg) = match w {
+            ResidentWeight::Q4(w) => (&self.q4k_gemm_pipeline, self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None, layout: &self.q4k_gemm_pipeline.get_bind_group_layout(0),
+                entries: &[bge(0, &w.w_buf), bge(1, x), bge(2, out), bge(3, &pbuf)] })),
+            ResidentWeight::Q6(w) => (&self.q6k_gemm_pipeline, self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None, layout: &self.q6k_gemm_pipeline.get_bind_group_layout(0),
+                entries: &[bge(0, &w.ql), bge(1, &w.qh), bge(2, &w.scales), bge(3, &w.d), bge(4, x), bge(5, out), bge(6, &pbuf)] })),
+            ResidentWeight::F32(_) => unreachable!(),
+        };
+        let mut p = enc.begin_compute_pass(&Default::default());
+        p.set_pipeline(pipe);
+        p.set_bind_group(0, &bg, &[]);
+        p.dispatch_workgroups(gx, (n_rows as u32).div_ceil(gx), 1);
+    }
+    fn record_bnorm(&self, enc: &mut wgpu::CommandEncoder, x: &wgpu::Buffer, wgt: &wgpu::Buffer, y: &wgpu::Buffer, n: usize, eps: f32, m_rows: usize) {
+        use wgpu::util::DeviceExt;
+        let pbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::cast_slice(&[n as u32, eps.to_bits()]), usage: wgpu::BufferUsages::UNIFORM });
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.bnorm_pipeline.get_bind_group_layout(0),
+            entries: &[bge(0, x), bge(1, wgt), bge(2, y), bge(3, &pbuf)] });
+        let mut p = enc.begin_compute_pass(&Default::default());
+        p.set_pipeline(&self.bnorm_pipeline); p.set_bind_group(0, &bg, &[]);
+        p.dispatch_workgroups(m_rows as u32, 1, 1);
+    }
+    fn record_brope(&self, enc: &mut wgpu::CommandEncoder, buf: &wgpu::Buffer, cos: &wgpu::Buffer, sin: &wgpu::Buffer, n_head: usize, head_dim: usize, m_rows: usize) {
+        use wgpu::util::DeviceExt;
+        let pbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::cast_slice(&[n_head as u32, head_dim as u32, m_rows as u32, 0u32]), usage: wgpu::BufferUsages::UNIFORM });
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.brope_pipeline.get_bind_group_layout(0),
+            entries: &[bge(0, buf), bge(1, cos), bge(2, sin), bge(3, &pbuf)] });
+        let total = (m_rows * n_head * (head_dim / 2)) as u32;
+        let mut p = enc.begin_compute_pass(&Default::default());
+        p.set_pipeline(&self.brope_pipeline); p.set_bind_group(0, &bg, &[]);
+        p.dispatch_workgroups(total.div_ceil(64), 1, 1);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn record_bsdpa(&self, enc: &mut wgpu::CommandEncoder, q: &wgpu::Buffer, kc: &wgpu::Buffer, vc: &wgpu::Buffer, out: &wgpu::Buffer, n_head: usize, n_kv_head: usize, head_dim: usize, m_rows: usize, pos: usize) {
+        use wgpu::util::DeviceExt;
+        let pbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::cast_slice(&[n_head as u32, n_kv_head as u32, head_dim as u32, m_rows as u32, pos as u32, 0u32, 0u32, 0u32]), usage: wgpu::BufferUsages::UNIFORM });
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.bsdpa_pipeline.get_bind_group_layout(0),
+            entries: &[bge(0, q), bge(1, kc), bge(2, vc), bge(3, out), bge(4, &pbuf)] });
+        let mut p = enc.begin_compute_pass(&Default::default());
+        p.set_pipeline(&self.bsdpa_pipeline); p.set_bind_group(0, &bg, &[]);
+        p.dispatch_workgroups(((m_rows * n_head) as u32).div_ceil(64), 1, 1);
+    }
+
+    /// Standalone batched Q4_K GEMM (upload + dispatch + readback), for
+    /// validation/benchmark. `x` is `m_rows * n_cols` (row-major); returns
+    /// `m_rows * n_rows`. `n_cols` must be ≤ 2048.
+    pub fn gemm_q4k_f32(&self, weight_bytes: &[u8], n_rows: usize, nb: usize, x: &[f32], m_rows: usize) -> Vec<f32> {
+        use wgpu::util::DeviceExt;
+        let n_cols = nb * 256;
+        assert_eq!(weight_bytes.len(), n_rows * nb * 144);
+        assert_eq!(x.len(), m_rows * n_cols);
+        assert!(n_cols <= 2048, "Q4_K GEMM shared-mem row is 2048");
+        let w_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("gemm-w"), contents: weight_bytes, usage: wgpu::BufferUsages::STORAGE });
+        let x_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("gemm-x"), contents: bytemuck::cast_slice(x), usage: wgpu::BufferUsages::STORAGE });
+        let out_buf = self.alloc_activation(m_rows * n_rows, true);
+        let gx = (n_rows as u32).min(65535);
+        let p_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("gemm-p"),
+            contents: bytemuck::cast_slice(&[n_rows as u32, nb as u32, n_cols as u32, m_rows as u32, gx, 0u32, 0u32, 0u32]),
+            usage: wgpu::BufferUsages::UNIFORM });
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.q4k_gemm_pipeline.get_bind_group_layout(0), entries: &[
+                bge(0, &w_buf), bge(1, &x_buf), bge(2, &out_buf), bge(3, &p_buf) ] });
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.q4k_gemm_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(gx, (n_rows as u32).div_ceil(gx), 1);
+        }
+        self.queue.submit([enc.finish()]);
+        self.read_buffer(&out_buf, m_rows * n_rows)
     }
 
     fn make_pipeline(device: &wgpu::Device, label: &str, wgsl: &str) -> wgpu::ComputePipeline {
@@ -699,6 +811,269 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         let oi = p.out_base + row;
         if (p.acc == 1u) { outp[oi] = outp[oi] + partial[0]; } else { outp[oi] = partial[0]; }
     }
+}
+"#;
+
+/// Batched Q4_K GEMM for PREFILL: `out[m,n] = sum_k dequant(W)[n,k] * x[m,k]`
+/// for m in 0..M prompt rows. One workgroup per output row n: the 64 threads
+/// cooperatively dequantize weight row n into shared memory ONCE, then each
+/// thread computes that row's dot against its strided set of prompt rows —
+/// so each weight is read once and reused across all M rows (the compute-
+/// bound amortization that makes prefill fast). x is [M, n_cols] row-major,
+/// out is [M, n_rows] row-major. n_cols ≤ 2048 (shared-mem row).
+const Q4K_GEMM_WGSL: &str = r#"
+struct GP { n_rows: u32, nb: u32, n_cols: u32, m_rows: u32, gx: u32, acc: u32, p0: u32, p1: u32 };
+@group(0) @binding(0) var<storage, read>       wq:   array<u32>;
+@group(0) @binding(1) var<storage, read>       x:    array<f32>;
+@group(0) @binding(2) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(3) var<uniform>             p:    GP;
+const BLOCK_U32: u32 = 36u;
+// 256-wide tile (1 KB LDS) — the sweet spot on RDNA3.5: small enough that LDS
+// no longer caps workgroup occupancy (8 KB tile → only ~8 workgroups/WGP, so
+// weight-read latency stalled), big enough that the per-chunk barrier count and
+// dequant parallelism stay healthy. Measured ~2x throughput + 2.8x lower TTFT
+// vs a 2048 tile. (Sweep: 2048→243, 512→313, 256→492, 128→408 tok/s at M=256.)
+const TILE: u32 = 256u;
+var<workgroup> wrow: array<f32, 256>;
+
+// K-tiled batched GEMM: a workgroup owns output row n. The weight row is
+// dequantized into shared mem one TILE-wide chunk at a time and reused across
+// all M prompt rows; per-thread accumulators carry across chunks. acc[8] caps
+// M at 512 (longer prompts are processed in M-chunks by the caller).
+// workgroup_size 64 (2 wave32s) is the sweet spot — 128 dropped occupancy and
+// was ~4x slower at M=256, despite halving per-thread dot rows.
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let n = wid.x + wid.y * p.gx;
+    if (n >= p.n_rows) { return; }
+    let t = lid.x;
+    var acc: array<f32, 8>;
+    for (var i: u32 = 0u; i < 8u; i = i + 1u) { acc[i] = 0.0; }
+    let n_chunks = (p.n_cols + TILE - 1u) / TILE;
+    for (var chunk: u32 = 0u; chunk < n_chunks; chunk = chunk + 1u) {
+        let col0 = chunk * TILE;
+        let cn = min(TILE, p.n_cols - col0);   // cols in this chunk
+        // Cooperatively dequantize this chunk of weight row n into wrow, one
+        // sub-block per thread (the scale unpack is done once per sub-block;
+        // a per-element variant that uses all 64 threads was tried and lost —
+        // the redundant per-element scale unpacking cost more than idle threads).
+        let sub_start = col0 / 32u;            // global sub-block index in the row
+        let sub_count = cn / 32u;
+        var sg = t;
+        loop {
+            if (sg >= sub_count) { break; }
+            let gsub = sub_start + sg;
+            let b = gsub / 8u;
+            let sub = gsub % 8u;
+            let blk = (n * p.nb + b) * BLOCK_U32;
+            let dd = unpack2x16float(wq[blk]);
+            let d = dd.x; let dmin = dd.y;
+            var u0 = wq[blk + 1u]; var u1 = wq[blk + 2u]; var u2 = wq[blk + 3u];
+            let u3 = ((u2 >> 4u) & 0x0f0f0f0fu) | (((u1 >> 6u) & 0x03030303u) << 4u);
+            let uaux = u1 & 0x3f3f3f3fu;
+            u1 = (u2 & 0x0f0f0f0fu) | (((u0 >> 6u) & 0x03030303u) << 4u);
+            u2 = uaux;
+            u0 = u0 & 0x3f3f3f3fu;
+            var sc: f32; var mn: f32;
+            if (sub < 4u) { sc = f32((u0 >> (sub*8u)) & 0xffu); mn = f32((u2 >> (sub*8u)) & 0xffu); }
+            else          { sc = f32((u1 >> ((sub-4u)*8u)) & 0xffu); mn = f32((u3 >> ((sub-4u)*8u)) & 0xffu); }
+            let pair = sub / 2u;
+            let hi = (sub & 1u) == 1u;
+            let qs0 = blk + 4u + pair * 8u;
+            let dst = sg * 32u;
+            let dsc = d * sc; let dmn = dmin * mn;
+            for (var w: u32 = 0u; w < 8u; w = w + 1u) {
+                let word = wq[qs0 + w];
+                for (var bsel: u32 = 0u; bsel < 4u; bsel = bsel + 1u) {
+                    let byte = (word >> (bsel * 8u)) & 0xffu;
+                    var q: u32; if (hi) { q = byte >> 4u; } else { q = byte & 0x0fu; }
+                    wrow[dst + w * 4u + bsel] = dsc * f32(q) - dmn;
+                }
+            }
+            sg = sg + 64u;
+        }
+        workgroupBarrier();
+        var mi: u32 = 0u; var m = t;
+        loop {
+            if (m >= p.m_rows) { break; }
+            let xb = m * p.n_cols + col0;
+            var dot: f32 = 0.0;
+            // cn is always a multiple of 32 — unroll the inner dot 8-wide so the
+            // driver vectorizes the shared-mem weight reads + x loads (this loop
+            // is ALU/latency-bound, not bandwidth-bound: the unroll is ~2.4x).
+            for (var k: u32 = 0u; k < cn; k = k + 8u) {
+                dot = dot + wrow[k] * x[xb + k] + wrow[k + 1u] * x[xb + k + 1u]
+                          + wrow[k + 2u] * x[xb + k + 2u] + wrow[k + 3u] * x[xb + k + 3u]
+                          + wrow[k + 4u] * x[xb + k + 4u] + wrow[k + 5u] * x[xb + k + 5u]
+                          + wrow[k + 6u] * x[xb + k + 6u] + wrow[k + 7u] * x[xb + k + 7u];
+            }
+            acc[mi] = acc[mi] + dot;
+            mi = mi + 1u; m = m + 64u;
+        }
+        workgroupBarrier();
+    }
+    var mi: u32 = 0u; var m = t;
+    loop {
+        if (m >= p.m_rows) { break; }
+        let oi = m * p.n_rows + n;
+        if (p.acc == 1u) { outp[oi] = outp[oi] + acc[mi]; } else { outp[oi] = acc[mi]; }
+        mi = mi + 1u; m = m + 64u;
+    }
+}
+"#;
+
+/// Batched Q6_K GEMM for prefill (K-tiled), mirroring Q4K_GEMM but with the
+/// Q6_K per-element dequant into the shared weight-row tile.
+const Q6K_GEMM_WGSL: &str = r#"
+struct GP { n_rows: u32, nb: u32, n_cols: u32, m_rows: u32, gx: u32, acc: u32, p0: u32, p1: u32 };
+@group(0) @binding(0) var<storage, read>       ql:   array<u32>;
+@group(0) @binding(1) var<storage, read>       qh:   array<u32>;
+@group(0) @binding(2) var<storage, read>       scl:  array<f32>;
+@group(0) @binding(3) var<storage, read>       dd:   array<f32>;
+@group(0) @binding(4) var<storage, read>       x:    array<f32>;
+@group(0) @binding(5) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(6) var<uniform>             p:    GP;
+const TILE: u32 = 256u;                   // 1 KB LDS — see Q4K_GEMM note on occupancy
+var<workgroup> wrow: array<f32, 256>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let n = wid.x + wid.y * p.gx;
+    if (n >= p.n_rows) { return; }
+    let t = lid.x;
+    var acc: array<f32, 8>;
+    for (var i: u32 = 0u; i < 8u; i = i + 1u) { acc[i] = 0.0; }
+    let n_chunks = (p.n_cols + TILE - 1u) / TILE;
+    for (var chunk: u32 = 0u; chunk < n_chunks; chunk = chunk + 1u) {
+        let col0 = chunk * TILE;
+        let cn = min(TILE, p.n_cols - col0);
+        var e = t;
+        loop {
+            if (e >= cn) { break; }
+            let col = col0 + e;
+            let b = col / 256u;
+            let pp = col % 256u;
+            let half = pp / 128u;
+            let pq = pp % 128u;
+            let sub = pq / 32u;
+            let l = pq % 32u;
+            let blk = n * p.nb + b;
+            let ql_l = l + (sub & 1u) * 32u;
+            let ql_bi = blk * 128u + half * 64u + ql_l;
+            let ql_byte = (ql[ql_bi >> 2u] >> ((ql_bi & 3u) * 8u)) & 0xffu;
+            let nib = select(ql_byte >> 4u, ql_byte & 0xfu, sub < 2u);
+            let qh_bi = blk * 64u + half * 32u + l;
+            let qh_byte = (qh[qh_bi >> 2u] >> ((qh_bi & 3u) * 8u)) & 0xffu;
+            let qbits = (qh_byte >> (sub * 2u)) & 3u;
+            let q = i32(nib | (qbits << 4u)) - 32;
+            let scale = scl[blk * 16u + half * 8u + (l / 16u) + 2u * sub];
+            wrow[e] = dd[blk] * scale * f32(q);
+            e = e + 64u;
+        }
+        workgroupBarrier();
+        var mi: u32 = 0u; var m = t;
+        loop {
+            if (m >= p.m_rows) { break; }
+            let xb = m * p.n_cols + col0;
+            var dot: f32 = 0.0;
+            for (var k: u32 = 0u; k < cn; k = k + 8u) {
+                dot = dot + wrow[k] * x[xb + k] + wrow[k + 1u] * x[xb + k + 1u]
+                          + wrow[k + 2u] * x[xb + k + 2u] + wrow[k + 3u] * x[xb + k + 3u]
+                          + wrow[k + 4u] * x[xb + k + 4u] + wrow[k + 5u] * x[xb + k + 5u]
+                          + wrow[k + 6u] * x[xb + k + 6u] + wrow[k + 7u] * x[xb + k + 7u];
+            }
+            acc[mi] = acc[mi] + dot;
+            mi = mi + 1u; m = m + 64u;
+        }
+        workgroupBarrier();
+    }
+    var mi: u32 = 0u; var m = t;
+    loop {
+        if (m >= p.m_rows) { break; }
+        let oi = m * p.n_rows + n;
+        if (p.acc == 1u) { outp[oi] = outp[oi] + acc[mi]; } else { outp[oi] = acc[mi]; }
+        mi = mi + 1u; m = m + 64u;
+    }
+}
+"#;
+
+/// Batched RMSNorm: one workgroup per prompt row m of `x[M, n]` → `y[M, n]`.
+const BNORM_WGSL: &str = r#"
+struct NP { n: u32, eps: u32 };
+@group(0) @binding(0) var<storage, read>       x:   array<f32>;
+@group(0) @binding(1) var<storage, read>       wgt: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y:   array<f32>;
+@group(0) @binding(3) var<uniform>             np:  NP;
+var<workgroup> partial: array<f32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let m = wid.x; let t = lid.x; let n = np.n; let base = m * n;
+    var s: f32 = 0.0; var i = t;
+    loop { if (i >= n) { break; } let v = x[base + i]; s = s + v * v; i = i + 256u; }
+    partial[t] = s; workgroupBarrier();
+    var stride = 128u;
+    loop { if (stride == 0u) { break; } if (t < stride) { partial[t] = partial[t] + partial[t + stride]; } workgroupBarrier(); stride = stride / 2u; }
+    let inv = 1.0 / sqrt(partial[0] / f32(n) + bitcast<f32>(np.eps));
+    i = t; loop { if (i >= n) { break; } y[base + i] = x[base + i] * inv * wgt[i]; i = i + 256u; }
+}
+"#;
+
+/// Batched interleaved RoPE over M tokens; cos/sin are `[M, head_dim/2]`
+/// (precomputed for positions pos..pos+M). One thread per (token, head, pair).
+const BROPE_WGSL: &str = r#"
+struct RP { n_head: u32, head_dim: u32, m_rows: u32, pad: u32 };
+@group(0) @binding(0) var<storage, read_write> x:    array<f32>;
+@group(0) @binding(1) var<storage, read>       cosb: array<f32>;
+@group(0) @binding(2) var<storage, read>       sinb: array<f32>;
+@group(0) @binding(3) var<uniform>             p:    RP;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let half = p.head_dim / 2u;
+    let per = p.n_head * half;
+    let idx = gid.x;
+    if (idx >= p.m_rows * per) { return; }
+    let m = idx / per; let r = idx % per;
+    let h = r / half; let j = r % half;
+    let c = cosb[m * half + j]; let s = sinb[m * half + j];
+    let base = m * (p.n_head * p.head_dim) + h * p.head_dim + 2u * j;
+    let a = x[base]; let b = x[base + 1u];
+    x[base] = a * c - b * s; x[base + 1u] = a * s + b * c;
+}
+"#;
+
+/// Batched causal GQA SDPA for prefill: thread per (token m, query head h);
+/// query at position pos+m attends causally to cache positions 0..=pos+m.
+const BSDPA_WGSL: &str = r#"
+struct SP { n_head: u32, n_kv_head: u32, head_dim: u32, m_rows: u32, pos: u32, p0: u32, p1: u32, p2: u32 };
+@group(0) @binding(0) var<storage, read>       q:    array<f32>;
+@group(0) @binding(1) var<storage, read>       kc:   array<f32>;
+@group(0) @binding(2) var<storage, read>       vc:   array<f32>;
+@group(0) @binding(3) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(4) var<uniform>             p:    SP;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= p.m_rows * p.n_head) { return; }
+    let m = idx / p.n_head; let h = idx % p.n_head;
+    let hd = p.head_dim;
+    let kvh = h / (p.n_head / p.n_kv_head);
+    let scale = 1.0 / sqrt(f32(hd));
+    let seq_len = p.pos + m + 1u;
+    let q_base = m * (p.n_head * hd) + h * hd;
+    var av: array<f32, 128>;
+    for (var d: u32 = 0u; d < hd; d = d + 1u) { av[d] = 0.0; }
+    var mx: f32 = -1e30; var l: f32 = 0.0;
+    for (var t: u32 = 0u; t < seq_len; t = t + 1u) {
+        let kv_base = (t * p.n_kv_head + kvh) * hd;
+        var s: f32 = 0.0;
+        for (var d: u32 = 0u; d < hd; d = d + 1u) { s = s + q[q_base + d] * kc[kv_base + d]; }
+        s = s * scale;
+        let m_new = max(mx, s); let corr = exp(mx - m_new); let pe = exp(s - m_new);
+        l = l * corr + pe;
+        for (var d: u32 = 0u; d < hd; d = d + 1u) { av[d] = av[d] * corr + pe * vc[kv_base + d]; }
+        mx = m_new;
+    }
+    let inv = 1.0 / l;
+    for (var d: u32 = 0u; d < hd; d = d + 1u) { outp[q_base + d] = av[d] * inv; }
 }
 "#;
 
@@ -1509,6 +1884,43 @@ struct GpuLayer {
     k_cache: wgpu::Buffer, v_cache: wgpu::Buffer,
 }
 
+/// Max prompt length the cached prefill path supports. The batched GEMM's
+/// per-thread `acc[8]` over a 64-wide workgroup processes up to 8*64 = 512
+/// prompt rows; longer prompts must be chunked by the caller.
+pub const MAX_PREFILL_M: usize = 512;
+
+/// One cached prefill GEMM: the bind group (built once against persistent
+/// scratch + shared param buffers), which pipeline it needs, and its
+/// M-independent output-row count (for the dispatch grid).
+struct PrefillGemm { bg: wgpu::BindGroup, q6: bool, n_rows: u32 }
+
+/// Cached bind groups for one layer's prefill pass (built once on first
+/// prefill). Mirrors `LayerOps` but for the batched [M,*] buffers.
+struct PrefillLayerBg {
+    attn_norm: wgpu::BindGroup,
+    wq: PrefillGemm, wk: PrefillGemm, wv: PrefillGemm, wo: PrefillGemm,
+    rope_q: wgpu::BindGroup, rope_k: wgpu::BindGroup, sdpa: wgpu::BindGroup,
+    ffn_norm: wgpu::BindGroup, w1: PrefillGemm, w3: PrefillGemm,
+    silu: wgpu::BindGroup, w2: PrefillGemm,
+}
+
+/// Everything prefill needs that can be allocated/bound ONCE and reused
+/// across calls: max-M scratch buffers, the handful of shared param uniforms
+/// (only `m_rows` is rewritten per call), and per-layer cached bind groups.
+/// Built lazily on the first `prefill_forward` so decode-only users don't pay
+/// the ~70 MB + bind-group cost.
+struct PrefillCache {
+    x_b: wgpu::Buffer, normed_b: wgpu::Buffer, q_b: wgpu::Buffer,
+    k_b: wgpu::Buffer, v_b: wgpu::Buffer, attn_b: wgpu::Buffer,
+    gate_b: wgpu::Buffer, up_b: wgpu::Buffer, h_b: wgpu::Buffer,
+    cos_b: wgpu::Buffer, sin_b: wgpu::Buffer,
+    // shared param uniforms (constants baked; `m_rows` rewritten each call).
+    p_wq: wgpu::Buffer, p_wkv: wgpu::Buffer, p_wo: wgpu::Buffer,
+    p_w13: wgpu::Buffer, p_w2: wgpu::Buffer,
+    p_rope_q: wgpu::Buffer, p_rope_k: wgpu::Buffer, p_sdpa: wgpu::Buffer,
+    layers: Vec<PrefillLayerBg>,
+}
+
 /// A Llama model resident on the GPU: every weight uploaded once, KV cache
 /// per layer on the GPU. `forward(token, pos)` runs the entire decode token
 /// in ONE command buffer (1 CPU↔GPU sync) — the design that makes GPU
@@ -1533,6 +1945,8 @@ pub struct GpuModel {
     pub n_embd: usize, n_head: usize, n_kv_head: usize, head_dim: usize,
     n_inter: usize, pub vocab: usize, eps: f32,
     max_seq: usize,
+    // Built lazily on the first prefill_forward (decode-only users skip it).
+    prefill_cache: std::sync::OnceLock<PrefillCache>,
 }
 
 impl GpuModel {
@@ -1709,6 +2123,7 @@ impl GpuModel {
             x_buf, cos_buf, sin_buf, normed, q, k, v, attn_out, o, gate, up, h: hh, ffn_out, logits,
             norm_p, rope_q_p, rope_k_p, sdpa_p, final_norm_op, lm_op, argmax_out, argmax_op, argmax_read,
             n_embd, n_head, n_kv_head, head_dim, n_inter, vocab, eps, max_seq,
+            prefill_cache: std::sync::OnceLock::new(),
         })
     }
 
@@ -1717,8 +2132,8 @@ impl GpuModel {
     /// token inputs. Shared by `forward` and `forward_argmax`.
     fn record_forward(&self, enc: &mut wgpu::CommandEncoder, token: u32, pos: usize) {
         let ctx = &self.ctx;
-        let (n_embd, n_head, n_kv_head, head_dim, n_inter) =
-            (self.n_embd, self.n_head, self.n_kv_head, self.head_dim, self.n_inter);
+        let (n_embd, n_head, n_kv_head, head_dim) =
+            (self.n_embd, self.n_head, self.n_kv_head, self.head_dim);
         let half = head_dim / 2;
         let kv_dim = n_kv_head * head_dim;
         let seq_len = (pos + 1) as u32;
@@ -1729,7 +2144,6 @@ impl GpuModel {
         ctx.queue.write_buffer(&self.sin_buf, 0, bytemuck::cast_slice(&self.sin[pos * half..pos * half + half]));
         ctx.queue.write_buffer(&self.sdpa_p, 0, bytemuck::cast_slice(&[n_head as u32, n_kv_head as u32, head_dim as u32, seq_len]));
 
-        let inter_wg = (n_inter as u32).div_ceil(64);
         let head_wg = (n_head as u32).div_ceil(64);
         let rope_q_wg = ((n_head * head_dim / 2) as u32).div_ceil(64);
         let rope_k_wg = ((n_kv_head * head_dim / 2) as u32).div_ceil(64);
@@ -1790,6 +2204,185 @@ impl GpuModel {
         let v = bytemuck::cast_slice::<u8, u32>(&slice.get_mapped_range())[0];
         self.argmax_read.unmap();
         v
+    }
+
+    /// Build the persistent prefill scratch buffers, shared param uniforms,
+    /// and per-layer cached bind groups ONCE (lazily, on first prefill). All
+    /// op shapes are identical across layers, so only a handful of distinct
+    /// param uniforms are needed; only `m_rows` is rewritten per call. This
+    /// removes ~208 per-call bind-group + param-buffer creations (the
+    /// M-independent TTFT floor).
+    fn build_prefill_cache(&self) -> PrefillCache {
+        use wgpu::util::DeviceExt;
+        let max_m = MAX_PREFILL_M;
+        let (n_embd, n_head, n_kv_head, head_dim, n_inter) =
+            (self.n_embd, self.n_head, self.n_kv_head, self.head_dim, self.n_inter);
+        let kv_dim = n_kv_head * head_dim;
+        let attn_dim = n_head * head_dim;
+        let half = head_dim / 2;
+        let dev = &self.ctx.device;
+
+        // `readable=true` adds COPY_SRC (buffers copied out: normed_b → last-row
+        // logits input; k_b/v_b → the resident KV cache).
+        let mk = |len: usize, src: bool| self.ctx.alloc_activation(len, src);
+        let x_b = mk(max_m * n_embd, false);
+        let normed_b = mk(max_m * n_embd, true);
+        let q_b = mk(max_m * attn_dim, false);
+        let k_b = mk(max_m * kv_dim, true);
+        let v_b = mk(max_m * kv_dim, true);
+        let attn_b = mk(max_m * attn_dim, false);
+        let gate_b = mk(max_m * n_inter, false);
+        let up_b = mk(max_m * n_inter, false);
+        let h_b = mk(max_m * n_inter, false);
+        let cos_b = mk(max_m * half, false);
+        let sin_b = mk(max_m * half, false);
+
+        // Shared GEMM/RoPE/SDPA param uniforms (m_rows placeholder 0, written
+        // per call). The GP layout is [n_rows, nb, n_cols, m_rows, gx, acc, _, _].
+        let gemm_p = |n_rows: usize, n_cols: usize, acc: u32| {
+            let gx = (n_rows as u32).min(65535);
+            dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("prefill-gemm-p"),
+                contents: bytemuck::cast_slice(&[n_rows as u32, (n_cols / 256) as u32, n_cols as u32, 0u32, gx, acc, 0u32, 0u32]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST })
+        };
+        let p_wq = gemm_p(attn_dim, n_embd, 0);
+        let p_wkv = gemm_p(kv_dim, n_embd, 0);
+        let p_wo = gemm_p(n_embd, attn_dim, 1);
+        let p_w13 = gemm_p(n_inter, n_embd, 0);
+        let p_w2 = gemm_p(n_embd, n_inter, 1);
+        let rope_p = |nh: usize| dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("prefill-rope-p"),
+            contents: bytemuck::cast_slice(&[nh as u32, head_dim as u32, 0u32, 0u32]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST });
+        let p_rope_q = rope_p(n_head);
+        let p_rope_k = rope_p(n_kv_head);
+        let p_sdpa = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("prefill-sdpa-p"),
+            contents: bytemuck::cast_slice(&[n_head as u32, n_kv_head as u32, head_dim as u32, 0u32, 0u32, 0u32, 0u32, 0u32]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST });
+
+        let bg = |pipe: &wgpu::ComputePipeline, entries: &[wgpu::BindGroupEntry]| {
+            dev.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipe.get_bind_group_layout(0), entries })
+        };
+        let build_gemm = |w: &ResidentWeight, x: &wgpu::Buffer, out: &wgpu::Buffer, p: &wgpu::Buffer| -> PrefillGemm {
+            match w {
+                ResidentWeight::Q4(q) => PrefillGemm {
+                    bg: bg(&self.ctx.q4k_gemm_pipeline, &[bge(0, &q.w_buf), bge(1, x), bge(2, out), bge(3, p)]),
+                    q6: false, n_rows: q.n_rows as u32 },
+                ResidentWeight::Q6(q) => PrefillGemm {
+                    bg: bg(&self.ctx.q6k_gemm_pipeline, &[bge(0, &q.ql), bge(1, &q.qh), bge(2, &q.scales), bge(3, &q.d), bge(4, x), bge(5, out), bge(6, p)]),
+                    q6: true, n_rows: q.n_rows as u32 },
+                ResidentWeight::F32(_) => unreachable!("prefill weights are Q4/Q6"),
+            }
+        };
+
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            layers.push(PrefillLayerBg {
+                // bnorm shares self.norm_p ([n_embd, eps] — same NP layout).
+                attn_norm: bg(&self.ctx.bnorm_pipeline, &[bge(0, &x_b), bge(1, &layer.attn_norm_w), bge(2, &normed_b), bge(3, &self.norm_p)]),
+                wq: build_gemm(&layer.wq, &normed_b, &q_b, &p_wq),
+                wk: build_gemm(&layer.wk, &normed_b, &k_b, &p_wkv),
+                wv: build_gemm(&layer.wv, &normed_b, &v_b, &p_wkv),
+                rope_q: bg(&self.ctx.brope_pipeline, &[bge(0, &q_b), bge(1, &cos_b), bge(2, &sin_b), bge(3, &p_rope_q)]),
+                rope_k: bg(&self.ctx.brope_pipeline, &[bge(0, &k_b), bge(1, &cos_b), bge(2, &sin_b), bge(3, &p_rope_k)]),
+                sdpa: bg(&self.ctx.bsdpa_pipeline, &[bge(0, &q_b), bge(1, &layer.k_cache), bge(2, &layer.v_cache), bge(3, &attn_b), bge(4, &p_sdpa)]),
+                wo: build_gemm(&layer.wo, &attn_b, &x_b, &p_wo),
+                ffn_norm: bg(&self.ctx.bnorm_pipeline, &[bge(0, &x_b), bge(1, &layer.ffn_norm_w), bge(2, &normed_b), bge(3, &self.norm_p)]),
+                w1: build_gemm(&layer.w1, &normed_b, &gate_b, &p_w13),
+                w3: build_gemm(&layer.w3, &normed_b, &up_b, &p_w13),
+                silu: bg(&self.ctx.silu_mul_pipeline, &[bge(0, &gate_b), bge(1, &up_b), bge(2, &h_b)]),
+                w2: build_gemm(&layer.w2, &h_b, &x_b, &p_w2),
+            });
+        }
+        PrefillCache {
+            x_b, normed_b, q_b, k_b, v_b, attn_b, gate_b, up_b, h_b, cos_b, sin_b,
+            p_wq, p_wkv, p_wo, p_w13, p_w2, p_rope_q, p_rope_k, p_sdpa, layers,
+        }
+    }
+
+    /// PREFILL: process the whole prompt in ONE batched forward. Every GEMM
+    /// reuses each weight row across all M prompt rows (compute-bound — the
+    /// iGPU's strength), filling the resident KV cache for positions 0..M.
+    /// Returns the last token's logits (the first decode step continues from
+    /// position M). Supports 1..=512 tokens (the GEMM's per-thread acc[8] caps
+    /// M at 512); longer prompts must be chunked by the caller. All bind groups
+    /// + scratch buffers are cached (built once), so a call only rewrites
+    /// `m_rows`, the embeddings, and cos/sin, then records against the cache.
+    pub fn prefill_forward(&self, prompt: &[u32]) -> Vec<f32> {
+        let ctx = &self.ctx;
+        let (n_embd, n_head, n_kv_head, head_dim, n_inter) =
+            (self.n_embd, self.n_head, self.n_kv_head, self.head_dim, self.n_inter);
+        let half = head_dim / 2;
+        let kv_dim = n_kv_head * head_dim;
+        let m = prompt.len();
+        assert!((1..=MAX_PREFILL_M).contains(&m), "prefill supports 1..={MAX_PREFILL_M} tokens (got {m})");
+        let c = self.prefill_cache.get_or_init(|| self.build_prefill_cache());
+
+        // Only m_rows varies per call (all op shapes are baked). m_rows lives at
+        // u32 index 3 (byte 12) of GP/SP and index 2 (byte 8) of RP.
+        let m_u32 = m as u32;
+        let mb: &[u8] = bytemuck::cast_slice(std::slice::from_ref(&m_u32));
+        for (p, off) in [(&c.p_wq, 12), (&c.p_wkv, 12), (&c.p_wo, 12), (&c.p_w13, 12),
+                         (&c.p_w2, 12), (&c.p_rope_q, 8), (&c.p_rope_k, 8), (&c.p_sdpa, 12)] {
+            ctx.queue.write_buffer(p, off, mb);
+        }
+        // Gather the prompt's embedding rows → batched residual stream [M, n_embd].
+        let mut x_host = vec![0f32; m * n_embd];
+        for (i, &tk) in prompt.iter().enumerate() {
+            x_host[i * n_embd..(i + 1) * n_embd]
+                .copy_from_slice(&self.embed[tk as usize * n_embd..(tk as usize + 1) * n_embd]);
+        }
+        ctx.queue.write_buffer(&c.x_b, 0, bytemuck::cast_slice(&x_host));
+        ctx.queue.write_buffer(&c.cos_b, 0, bytemuck::cast_slice(&self.cos[0..m * half]));
+        ctx.queue.write_buffer(&c.sin_b, 0, bytemuck::cast_slice(&self.sin[0..m * half]));
+
+        // Pass recorders over cached bind groups (M-dependent dispatch sizes).
+        let pass = |enc: &mut wgpu::CommandEncoder, pipe: &wgpu::ComputePipeline, b: &wgpu::BindGroup, gx: u32| {
+            let mut p = enc.begin_compute_pass(&Default::default());
+            p.set_pipeline(pipe); p.set_bind_group(0, b, &[]); p.dispatch_workgroups(gx, 1, 1);
+        };
+        let rec_gemm = |enc: &mut wgpu::CommandEncoder, g: &PrefillGemm| {
+            let pipe = if g.q6 { &ctx.q6k_gemm_pipeline } else { &ctx.q4k_gemm_pipeline };
+            let gx = g.n_rows.min(65535);
+            let mut p = enc.begin_compute_pass(&Default::default());
+            p.set_pipeline(pipe); p.set_bind_group(0, &g.bg, &[]);
+            p.dispatch_workgroups(gx, g.n_rows.div_ceil(gx), 1);
+        };
+        let mu = m as u32;
+        let rope_q_wg = ((m * n_head * half) as u32).div_ceil(64);
+        let rope_k_wg = ((m * n_kv_head * half) as u32).div_ceil(64);
+        let sdpa_wg = ((m * n_head) as u32).div_ceil(64);
+        let silu_wg = ((m * n_inter) as u32).div_ceil(64);
+
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        for (li, layer) in self.layers.iter().enumerate() {
+            let b = &c.layers[li];
+            pass(&mut enc, &ctx.bnorm_pipeline, &b.attn_norm, mu);   // one workgroup per row
+            rec_gemm(&mut enc, &b.wq);
+            rec_gemm(&mut enc, &b.wk);
+            rec_gemm(&mut enc, &b.wv);
+            pass(&mut enc, &ctx.brope_pipeline, &b.rope_q, rope_q_wg);
+            pass(&mut enc, &ctx.brope_pipeline, &b.rope_k, rope_k_wg);
+            // K/V for positions 0..M land contiguously at the front of the cache
+            // ([M, kv_dim] row-major == the (t*n_kv_head+kvh)*head_dim layout BSDPA reads).
+            enc.copy_buffer_to_buffer(&c.k_b, 0, &layer.k_cache, 0, (m * kv_dim * 4) as u64);
+            enc.copy_buffer_to_buffer(&c.v_b, 0, &layer.v_cache, 0, (m * kv_dim * 4) as u64);
+            pass(&mut enc, &ctx.bsdpa_pipeline, &b.sdpa, sdpa_wg);
+            rec_gemm(&mut enc, &b.wo);                               // += residual
+            pass(&mut enc, &ctx.bnorm_pipeline, &b.ffn_norm, mu);
+            rec_gemm(&mut enc, &b.w1);
+            rec_gemm(&mut enc, &b.w3);
+            pass(&mut enc, &ctx.silu_mul_pipeline, &b.silu, silu_wg);
+            rec_gemm(&mut enc, &b.w2);                               // += residual
+        }
+        // Final norm over all rows; LM head only needs the LAST row's logits.
+        ctx.record_bnorm(&mut enc, &c.x_b, &self.final_norm_w, &c.normed_b, n_embd, self.eps, m);
+        enc.copy_buffer_to_buffer(&c.normed_b, ((m - 1) * n_embd * 4) as u64, &self.normed, 0, (n_embd * 4) as u64);
+        ctx.pass_matvec(&mut enc, &self.lm_head, &self.lm_op);
+        ctx.queue.submit([enc.finish()]);
+        ctx.read_buffer(&self.logits, self.vocab)
     }
 }
 
@@ -2115,6 +2708,167 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         eprintln!("GPU Q6_K matvec vs candle dequant: max_abs_err = {max_abs:.5}");
         assert!(max_abs < 0.05, "GPU Q6_K matvec error too high: {max_abs}");
+    }
+
+    /// Validate the batched Q4_K GEMM (prefill) against the CPU dequant
+    /// oracle on a real Q4_K weight, with M prompt rows.
+    #[test]
+    fn gpu_q4k_gemm_matches_cpu() {
+        use candle_core::{Device, Tensor};
+        use candle_core::quantized::{QTensor, GgmlDType};
+        use crate::backend::candle::q4k_repack::{BlockQ4K, dequantize_q4k_block, QK_K};
+
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU ({e}); skip"); return; } };
+        let n_rows = 512usize; let nb = 8usize; let n_cols = nb * QK_K; let m_rows = 8usize;
+        let mut w = vec![0f32; n_rows * n_cols];
+        for i in 0..w.len() { w[i] = (((i as i64).wrapping_mul(2654435761) & 0xFFFF) as f32 / 32768.0 - 1.0) * 0.5; }
+        let qt = QTensor::quantize(&Tensor::from_vec(w, (n_rows, n_cols), &Device::Cpu).unwrap(), GgmlDType::Q4K).unwrap();
+        let bytes = qt.data().unwrap();
+        let x: Vec<f32> = (0..m_rows * n_cols).map(|i| ((i % 31) as f32 - 15.0) * 0.04).collect();
+
+        let gpu = ctx.gemm_q4k_f32(&bytes, n_rows, nb, &x, m_rows);
+
+        let blocks: &[BlockQ4K] = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const BlockQ4K, n_rows * nb) };
+        let mut buf = [0f32; QK_K];
+        let mut deq = vec![0f32; n_rows * n_cols];
+        for n in 0..n_rows { for b in 0..nb { dequantize_q4k_block(&blocks[n * nb + b], &mut buf);
+            for k in 0..QK_K { deq[n * n_cols + b * QK_K + k] = buf[k]; } } }
+        let mut max_abs = 0f32;
+        for m in 0..m_rows { for n in 0..n_rows {
+            let mut acc = 0f64;
+            for k in 0..n_cols { acc += (deq[n * n_cols + k] as f64) * (x[m * n_cols + k] as f64); }
+            max_abs = max_abs.max((gpu[m * n_rows + n] - acc as f32).abs());
+        } }
+        eprintln!("GPU Q4_K GEMM vs CPU (M={m_rows}): max_abs_err = {max_abs:.5}");
+        assert!(max_abs < 0.05, "GPU Q4_K GEMM error too high: {max_abs}");
+    }
+
+    /// Prefill amortization: time the batched GEMM (M rows in one dispatch)
+    /// vs running the matvec M separate times. Shows the compute-bound win.
+    /// `cargo test --release --features gpu --lib gpu_prefill_amortization -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gpu_prefill_amortization() {
+        use candle_core::{Device, Tensor};
+        use candle_core::quantized::{QTensor, GgmlDType};
+        use std::time::Instant;
+        let ctx = GpuContext::new().expect("GPU");
+        let n_rows = 2048usize; let nb = 8usize; let n_cols = nb * 256; let m_rows = 128usize;
+        let mut w = vec![0f32; n_rows * n_cols];
+        for i in 0..w.len() { w[i] = (((i as i64).wrapping_mul(2654435761) & 0xFFFF) as f32 / 32768.0 - 1.0) * 0.5; }
+        let bytes = QTensor::quantize(&Tensor::from_vec(w, (n_rows, n_cols), &Device::Cpu).unwrap(), GgmlDType::Q4K).unwrap().data().unwrap().to_vec();
+        let x: Vec<f32> = (0..m_rows * n_cols).map(|i| ((i % 31) as f32 - 15.0) * 0.04).collect();
+        // warm + time GEMM (M rows, one dispatch)
+        let _ = ctx.gemm_q4k_f32(&bytes, n_rows, nb, &x, m_rows);
+        let iters = 20;
+        let t0 = Instant::now();
+        for _ in 0..iters { let _ = ctx.gemm_q4k_f32(&bytes, n_rows, nb, &x, m_rows); }
+        let gemm_ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        // matvec M times (one row each)
+        let row0 = &x[0..n_cols];
+        let _ = ctx.matmul_q4k_f32(&bytes, n_rows, nb, row0);
+        let t1 = Instant::now();
+        for _ in 0..iters { for m in 0..m_rows { let _ = ctx.matmul_q4k_f32(&bytes, n_rows, nb, &x[m*n_cols..(m+1)*n_cols]); } }
+        let mv_ms = t1.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        eprintln!("prefill {m_rows} rows: GEMM {gemm_ms:.2}ms vs {m_rows}x matvec {mv_ms:.2}ms  => {:.1}x faster (amortization)", mv_ms / gemm_ms);
+    }
+
+    /// THE PREFILL PAYOFF: load the real Llama-3.2-1B, run the whole prompt
+    /// through `prefill_forward` in ONE batched pass, verify the last-token
+    /// logits agree with candle's batched CPU forward (same prompt), confirm
+    /// the GPU continues decoding correctly off the prefilled KV cache, and
+    /// report prefill tok/s + TTFT.
+    /// `cargo test --release --features gpu --lib gpu_prefill_vs_candle -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gpu_prefill_vs_candle_and_bench() {
+        use std::time::Instant;
+        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU: {e}"); return; } };
+        let model = GpuModel::load(path, ctx).expect("load");
+        let argmax = |v: &[f32]| -> u32 { let mut bi = 0u32; let mut bv = f32::MIN; for (i, &x) in v.iter().enumerate() { if x > bv { bv = x; bi = i as u32; } } bi };
+
+        // A multi-token prompt (token IDs need not be meaningful — both paths
+        // process the identical sequence; this exercises the batched GEMMs +
+        // causal SDPA at M>1).
+        let prompt: Vec<u32> = vec![128000, 9906, 1917, 374, 264, 1296, 315, 279, 6500, 2068, 13, 758];
+        let m = prompt.len();
+
+        // GPU prefill (one batched pass fills the KV cache for 0..M).
+        let warm = model.prefill_forward(&prompt);
+        let _ = &warm;
+        let t0 = Instant::now();
+        let gpu_logits = model.prefill_forward(&prompt);
+        let ttft = t0.elapsed();
+        let gpu_first = argmax(&gpu_logits);
+
+        // GPU continues decoding off the prefilled cache (pos starts at M).
+        let n_gen = 12usize;
+        let mut gpu_gen = vec![gpu_first];
+        let mut next = gpu_first;
+        let mut pos = m;
+        for _ in 1..n_gen { next = model.forward_argmax(next, pos); gpu_gen.push(next); pos += 1; }
+
+        // Candle CPU reference: batched forward over the prompt, then greedy.
+        use crate::backend::candle::backend::CandleCpuBackend;
+        use crate::backend::traits::{Backend, QuantConfig};
+        let mut cb = CandleCpuBackend::new();
+        cb.load_model(std::path::Path::new(path), &QuantConfig { method: "gguf".into(), bits: 4 }).expect("candle load");
+        let clog = cb.forward_logits(&prompt).unwrap();
+        let cand_first = argmax(&clog);
+        let mut cand_gen = vec![cand_first];
+        let mut cnext = cand_first;
+        for _ in 1..n_gen { let l = cb.forward_logits(&[cnext]).unwrap(); cnext = argmax(&l); cand_gen.push(cnext); }
+
+        // Last-token logits comparison (the pure prefill check).
+        let n = gpu_logits.len().min(clog.len());
+        let (mut dot, mut ng, mut nc, mut max_abs) = (0f64, 0f64, 0f64, 0f32);
+        for i in 0..n {
+            dot += gpu_logits[i] as f64 * clog[i] as f64;
+            ng += (gpu_logits[i] as f64).powi(2);
+            nc += (clog[i] as f64).powi(2);
+            max_abs = max_abs.max((gpu_logits[i] - clog[i]).abs());
+        }
+        let cosine = dot / (ng.sqrt() * nc.sqrt());
+        eprintln!("prefill TTFT: {:.1} ms for {m} tokens => {:.1} tok/s prefill", ttft.as_secs_f64() * 1e3, m as f64 / ttft.as_secs_f64());
+        eprintln!("last-token logits: argmax gpu={gpu_first} candle={cand_first}, cosine={cosine:.5}, max_abs={max_abs:.4}");
+        eprintln!("GPU gen:    {gpu_gen:?}");
+        eprintln!("candle gen: {cand_gen:?}");
+        let agree = gpu_gen.iter().zip(&cand_gen).take_while(|(a, b)| a == b).count();
+        eprintln!("GPU/candle agree on first {agree}/{n_gen} tokens after prefill");
+
+        // Prefill latency/throughput sweep (averaged — single-shot is noisy).
+        // prefill_forward reads back the logits, so each call self-drains the
+        // GPU; timing N calls / N is a fair per-call number. Compare each
+        // against the sequential-decode cost (M * decode_ms) for the same M.
+        let decode_ms = {
+            // Fill the cache 0..16 so decode SDPA scans a realistic short
+            // context (decoding at pos>>0 over unfilled cache is meaningless).
+            let p: Vec<u32> = (0..16).map(|i| (i as u32 * 977 + 11) % model.vocab as u32).collect();
+            let _ = model.prefill_forward(&p);
+            let mut tok = 1u32; let mut pos = 16usize;
+            let _ = model.forward_argmax(tok, pos); pos += 1;  // warm
+            let t = Instant::now();
+            for _ in 0..16 { tok = model.forward_argmax(tok, pos); pos += 1; }
+            t.elapsed().as_secs_f64() * 1e3 / 16.0
+        };
+        eprintln!("(decode reference: {decode_ms:.2} ms/token)");
+        for &mm in &[12usize, 32, 128, 256] {
+            let p: Vec<u32> = (0..mm).map(|i| (i as u32 * 977 + 11) % model.vocab as u32).collect();
+            let _ = model.prefill_forward(&p);           // warm
+            let iters = 5;
+            let t = Instant::now();
+            for _ in 0..iters { let _ = model.prefill_forward(&p); }
+            let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+            eprintln!("prefill M={mm:>3}: {ms:6.1} ms ({:5.0} tok/s) | {mm} seq-decodes ~{:6.1} ms => {:.2}x",
+                mm as f64 / (ms / 1e3), mm as f64 * decode_ms, (mm as f64 * decode_ms) / ms);
+        }
+
+        assert_eq!(gpu_first, cand_first, "prefill last-token argmax disagrees with candle");
+        // Greedy output is byte-identical to candle (the strong check); cosine
+        // just guards against silent drift (f32 GEMM noise over 16 layers ~1e-3).
+        assert!(cosine > 0.998, "prefill logits diverge from candle (cosine {cosine:.5})");
+        assert!(agree >= 6, "GPU prefill+decode diverges from candle too early ({agree}); cache or wiring bug");
     }
 
     /// Diagnostic: dump every GGUF tensor's ggml dtype so we know which

@@ -108,6 +108,15 @@ pub struct AppState {
     /// AtomicF32). Default 0.30 — calibrated against typical
     /// Llama 3.2 1B per-layer IPR distributions.
     pub early_exit_threshold_bits: Arc<AtomicU32>,
+    /// Optional resident iGPU inference engine (cargo feature `gpu`,
+    /// enabled at startup via `ZLLM_GPU=1`). When `Some` and a request is
+    /// on the "fast lane" (inspection off + no spec-decode / PLD / early-exit
+    /// / grammar) with a prompt of 1..=512 tokens, the whole generation runs
+    /// on the iGPU — batched prefill (fills the resident KV cache) + decode —
+    /// bypassing the candle pool. Serialized through the Mutex because the
+    /// GpuModel has a single resident KV cache. Reloaded on model swap.
+    #[cfg(feature = "gpu")]
+    pub gpu: Arc<Mutex<Option<crate::backend::gpu::GpuModel>>>,
 }
 
 /// Round-robin tie-breaker when every pool slot is busy. Atomic so
@@ -583,6 +592,27 @@ async fn select_model(
     }
     drop(guards);
 
+    // Reload the GPU engine for the new model (else the fast-lane would keep
+    // serving the OLD weights). Same gate as startup; on any failure (e.g. a
+    // non-Llama arch the GPU loader doesn't support) we disable the GPU
+    // fast-lane and fall back to the candle pool for this model.
+    #[cfg(feature = "gpu")]
+    if std::env::var("ZLLM_GPU").is_ok() {
+        let path_str = gguf_path.to_str().unwrap_or("").to_string();
+        let loaded = crate::backend::gpu::GpuContext::new()
+            .and_then(|ctx| crate::backend::gpu::GpuModel::load(&path_str, ctx));
+        match loaded {
+            Ok(m) => {
+                *s.gpu.lock().expect("gpu poisoned") = Some(m);
+                tracing::info!("GPU engine reloaded for swapped model");
+            }
+            Err(e) => {
+                *s.gpu.lock().expect("gpu poisoned") = None;
+                tracing::warn!("GPU reload failed ({e}); GPU fast-lane disabled for this model");
+            }
+        }
+    }
+
     *s.tokenizer.write().expect("tokenizer poisoned") = new_tok;
     *s.current_model.write().expect("current_model poisoned") = req.id.clone();
 
@@ -955,6 +985,63 @@ fn generate_spec_decode(
     (text, prompt_len, generated_ids.len(), finish_reason)
 }
 
+/// Whole-request generation on the resident iGPU engine: batched prefill
+/// over the prompt (fills the GPU KV cache for positions 0..M) then decode
+/// off that cache. Sampling/stop/detokenize match `generate_blocking`. The
+/// caller holds the GpuModel lock for the duration (one resident KV cache,
+/// so GPU requests serialize). Does NOT use the candle prefix cache or fire
+/// inspection hooks — that's the explicit fast-lane trade. Same 4-tuple.
+#[cfg(feature = "gpu")]
+fn generate_gpu(
+    s: &AppState,
+    model: &crate::backend::gpu::GpuModel,
+    prompt_tokens: &[u32],
+    max_tokens: usize,
+    sampler_cfg: &SamplerConfig,
+) -> (String, usize, usize, &'static str) {
+    let prompt_len = prompt_tokens.len();
+    let eos = s.tokenizer.read().unwrap().eos_token_id().unwrap_or(128001);
+    // Greedy decode (temperature 0) can use the GPU argmax path, which reads
+    // back 4 bytes instead of the 128k-wide logit vector each token (~40% more
+    // decode tok/s). Sampling needs the full logits on the CPU.
+    let greedy = sampler_cfg.temperature == 0.0;
+    // Prefill the whole prompt in one batched pass; returns the last token's
+    // logits (the first sample) and leaves the KV cache filled for 0..M.
+    let t_prefill = std::time::Instant::now();
+    let first_logits = model.prefill_forward(prompt_tokens);
+    let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1e3;
+    let mut generated: Vec<u32> = Vec::new();
+    let mut finish_reason: &'static str = "length";
+    let mut pos = prompt_len;
+    let t_decode = std::time::Instant::now();
+    let mut next = sample(&first_logits, sampler_cfg);
+    loop {
+        if next == eos || next == 128009 {
+            finish_reason = "stop";
+            break;
+        }
+        generated.push(next);
+        if generated.len() >= max_tokens {
+            break;
+        }
+        next = if greedy {
+            model.forward_argmax(next, pos) // GPU argmax, 4-byte readback
+        } else {
+            sample(&model.forward(next, pos), sampler_cfg)
+        };
+        pos += 1;
+    }
+    let dec_s = t_decode.elapsed().as_secs_f64();
+    tracing::info!(
+        "GPU fast-lane: prefill {prompt_len} tok in {prefill_ms:.0} ms ({:.0} tok/s), decoded {} tok at {:.0} tok/s",
+        prompt_len as f64 / (prefill_ms / 1e3),
+        generated.len(),
+        generated.len() as f64 / dec_s.max(1e-6),
+    );
+    let text = s.tokenizer.read().unwrap().decode(&generated).unwrap_or_default();
+    (text, prompt_len, generated.len(), finish_reason)
+}
+
 fn generate_blocking(
     s: &AppState,
     prompt_tokens: Vec<u32>,
@@ -978,6 +1065,25 @@ fn generate_blocking(
         });
         if has_draft {
             return generate_spec_decode(s, prompt_tokens, max_tokens, sampler_cfg);
+        }
+    }
+    // iGPU fast-lane: run the whole request on the resident GPU engine
+    // (batched prefill + decode) when nothing CPU-only is active and the
+    // prompt fits the batched-prefill cap. Returns the same 4-tuple. Mirrors
+    // the spec-decode early return above; leaves the candle path untouched.
+    #[cfg(feature = "gpu")]
+    {
+        let gpu_eligible = !inspect_on
+            && !s.pld_enabled.load(Ordering::Relaxed)
+            && !s.early_exit_enabled.load(Ordering::Relaxed)
+            && fsm.is_none()
+            && (1..=crate::backend::gpu::MAX_PREFILL_M).contains(&prompt_tokens.len());
+        if gpu_eligible {
+            if let Ok(guard) = s.gpu.lock() {
+                if let Some(model) = guard.as_ref() {
+                    return generate_gpu(s, model, &prompt_tokens, max_tokens, sampler_cfg);
+                }
+            }
         }
     }
     let prompt_len = prompt_tokens.len();
@@ -1217,6 +1323,77 @@ fn chat_stream(
 
     tokio::task::spawn_blocking(move || {
         let eos = s.tokenizer.read().unwrap().eos_token_id().unwrap_or(128001);
+
+        // iGPU fast-lane (streaming): same eligibility as generate_blocking's
+        // GPU path. Streams tokens from the resident GPU engine over SSE, then
+        // returns — bypassing the candle slot entirely. Greedy uses the 4-byte
+        // argmax readback; sampling reads full logits.
+        #[cfg(feature = "gpu")]
+        {
+            let inspect_on = s.inspection_enabled.load(Ordering::Relaxed);
+            let gpu_eligible = !inspect_on
+                && !s.pld_enabled.load(Ordering::Relaxed)
+                && !s.early_exit_enabled.load(Ordering::Relaxed)
+                && fsm.is_none()
+                && (1..=crate::backend::gpu::MAX_PREFILL_M).contains(&prompt_tokens.len());
+            if gpu_eligible {
+                if let Ok(guard) = s.gpu.lock() {
+                    if let Some(model) = guard.as_ref() {
+                        let greedy = sampler_cfg.temperature == 0.0;
+                        let prompt_len = prompt_tokens.len();
+                        let t_prefill = std::time::Instant::now();
+                        let first_logits = model.prefill_forward(&prompt_tokens);
+                        let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1e3;
+                        let mut finish_reason: &'static str = "length";
+                        let mut pos = prompt_len;
+                        let mut generated = 0usize;
+                        let mut next = sample(&first_logits, &sampler_cfg);
+                        let t_decode = std::time::Instant::now();
+                        loop {
+                            if next == eos || next == 128009 {
+                                finish_reason = "stop";
+                                break;
+                            }
+                            let text = s.tokenizer.read().unwrap().decode(&[next]).unwrap_or_default();
+                            let chunk = json!({
+                                "id": id, "object": "chat.completion.chunk",
+                                "created": now, "model": model_id,
+                                "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
+                            });
+                            if tx.unbounded_send(Ok(Event::default().data(chunk.to_string()))).is_err() {
+                                break;
+                            }
+                            generated += 1;
+                            if generated >= max_tokens {
+                                break;
+                            }
+                            next = if greedy {
+                                model.forward_argmax(next, pos)
+                            } else {
+                                sample(&model.forward(next, pos), &sampler_cfg)
+                            };
+                            pos += 1;
+                        }
+                        let dec_s = t_decode.elapsed().as_secs_f64();
+                        tracing::info!(
+                            "GPU fast-lane (stream): prefill {prompt_len} tok in {prefill_ms:.0} ms ({:.0} tok/s), streamed {generated} tok at {:.0} tok/s",
+                            prompt_len as f64 / (prefill_ms / 1e3),
+                            generated as f64 / dec_s.max(1e-6),
+                        );
+                        let final_chunk = json!({
+                            "id": id, "object": "chat.completion.chunk",
+                            "created": now, "model": model_id,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+                        });
+                        let _ = tx.unbounded_send(Ok(Event::default().data(final_chunk.to_string())));
+                        let _ = tx.unbounded_send(Ok(Event::default().data("[DONE]")));
+                        tx.disconnect();
+                        return;
+                    }
+                }
+            }
+        }
+
         let mut all_tokens = prompt_tokens;
         let mut slot = acquire_slot(&s.pool);
         let BackendSlot { backend, prompt_cache, .. } = &mut *slot;
