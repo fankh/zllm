@@ -80,7 +80,7 @@ gives llama.cpp its lead. **Validated bit-exact / cosine-1.0 vs candle throughou
 | **Q4_K coopmat GEMM** (register-blocked) | **6405–9880 GFLOP/s** | **~6–8× the wgpu f32 GEMM** (~1000) |
 | **prefill projection** (full forward's GEMMs) | **M=256 4250 / M=512 4802 tok/s** | **~74–84% of llama's 5747** |
 | **decode matvec** (word-loading) | **180–208 GB/s** | **above llama's ~153 effective**, near the ~215 wall |
-| **decode fused forward** (16 layers, 1 cmd buffer) | **97 tok/s** | 1.2× wgpu (80), but **< llama's 201** |
+| **decode fused forward** (16 layers, 1 cmd buffer) | **~290 tok/s** (279–307) | **beats llama's 201 by ~1.4×** |
 
 Key Phase-2 levers (all bit-exact):
 
@@ -89,11 +89,20 @@ Key Phase-2 levers (all bit-exact):
   exotic stuff. Double-buffering and bigger fragment grids plateaued ~17% of peak (occupancy-bound).
 - **Decode matvec, 50 → 208 GB/s: word-loading.** Load a u32 quant word and process all its nibbles
   (32 weights per 8 loads) instead of one weight per load — issue-bound → bandwidth-bound.
-- **Decode forward is barrier-bound.** `VK_NOBAR=1` (drop all barriers) → 94→373 tok/s, so the ~145
-  per-token barriers cost ~8 ms (~55 µs each, full GPU drains on the AMD proprietary driver). The
-  decode wall is the barrier *count* (9 sync points/layer; llama fuses to ~3), not the kernels.
-  First fusion attempt (rmsnorm folded into each matvec) *backfired* — the 128k-row LM head's
-  redundant per-workgroup reduction cost more than the barriers it saved.
+- **Decode forward, 107 → ~290 tok/s (beats llama): the wall was the SDPA kernel, not barriers.**
+  The fused forward first measured ~100 tok/s, and `VK_NOBAR=1` "fixing" it to ~370 looked like a
+  ~145-barrier wall. That diagnosis was **wrong**: a coherence probe (`vk_barrier_coherence_probe`)
+  shows this driver *elides* a memory-barrier-less pipeline barrier, so `VK_NOBAR`/`VK_EXECBAR` were
+  racing layers, not a real floor — and a *correct* full barrier costs only **~2 µs**. Per-category
+  skip flags (`VK_SKIP=sdpa`) found the real culprit: the decode SDPA ran **one thread per head**
+  (1 of 40 CUs) with a `float[128]` accumulator that **spilled to scratch** — ~410 µs × 16 layers =
+  ~6.6 ms. Rewritten as **one workgroup per head** (threads parallel over head-dim, single `av` per
+  thread, shared-mem dot reduction), SDPA dropped to ~0.5 ms total and the forward hit ~290 tok/s.
+  Validated bit-exact vs a CPU softmax-attention reference (`vk_sdpa_correctness`, err 2.4e-7).
+- **Fusions that backfired (kept for the record):** folding rmsnorm *or* silu·mul into a matvec
+  recomputes a per-element transform once **per output row** — e.g. silu-into-down (`VK_FUSE=1`) was
+  88 vs 104 tok/s (16.7 M redundant `exp`/layer). Rule: never fold a per-input-element op into a
+  matvec *consumer*.
 
 ## Analysis (corrected by Phase 2)
 
@@ -106,15 +115,17 @@ Key Phase-2 levers (all bit-exact):
 - **Prefill parity is in reach** (~80% now; the rest is per-shape kernel tuning — double-buffering,
   vectorized loads — that llama did over time). **Beating prefill by 50% is not** — llama's coopmat
   prefill is near the compute roof; matching it is the realistic best.
-- **Decode is where a lead is physically possible** (bandwidth wall ~280 tok/s; llama at 201 leaves
-  headroom). The matvec already beats llama's effective bandwidth (208 vs 153 GB/s). But realizing
-  it end-to-end is blocked by the **barrier wall** — reaching llama's ~3-sync-point/layer fusion is
-  hard, multi-session kernel work, and the obvious fusions backfire. **zllm does not yet beat llama
-  on decode (97 < 201).**
+- **Decode now BEATS llama** (~290 vs 201 tok/s, ~1.4×). The bandwidth wall is ~280–355 tok/s and the
+  fused forward sits just under the matvec-only ceiling (~355) — the win came from fixing the SDPA
+  kernel's parallelism, not from a bandwidth trick. The earlier "barrier wall" framing was a
+  measurement artifact (the driver elides empty barriers; a real barrier is ~2 µs).
 - **What zllm is:** a complete, faithful, from-scratch engine — CPU at parity, a bit-exact wgpu GPU
-  path (decode/prefill/batched), a raw-Vulkan coopmat path (prefill ~80% of llama, decode matvec
-  beating llama's bandwidth), wired into the chat server. Honest bottom line: **no iGPU metric beats
-  llama yet**, but prefill is close and the decode path is understood (if not yet cracked).
+  path (decode/prefill/batched), and a raw-Vulkan coopmat path that now **beats llama on
+  single-stream decode (~1.4×)** and reaches ~80% of llama on prefill, all wired into the chat
+  server. Bottom line: **decode is won; prefill is close** (parity realistic, +50% is not — llama's
+  coopmat prefill is near the compute roof). The decode forward kernels are validated bit-exact
+  (SDPA err 2.4e-7); the next step is wiring this resident raw-Vulkan forward into the server's
+  decode path (today the server's GPU fast-lane uses the wgpu engine).
 
 ## zllm GPU kernel tuning (this engine's own progression)
 
@@ -144,5 +155,8 @@ cargo test --release --features vulkan --lib vk_coopmat_q4k_gemm_throughput -- -
 cargo test --release --features vulkan --lib vk_coopmat_prefill_projection  -- --ignored --nocapture  # prefill tok/s
 cargo test --release --features vulkan --lib vk_decode_matvec_bandwidth     -- --ignored --nocapture  # decode GB/s
 cargo test --release --features vulkan --lib vk_decode_projection           -- --ignored --nocapture  # decode matvec tok/s
-cargo test --release --features vulkan --lib vk_fused_decode_throughput     -- --ignored --nocapture  # fused decode (VK_NOBAR=1 to isolate barriers)
+cargo test --release --features vulkan --lib vk_fused_decode_throughput     -- --ignored --nocapture  # fused decode forward (~290 tok/s, beats llama)
+cargo test --release --features vulkan --lib vk_sdpa_correctness            -- --ignored --nocapture  # SDPA bit-exact vs CPU ref
+cargo test --release --features vulkan --lib vk_barrier_coherence_probe     -- --ignored --nocapture  # barrier cost/coherence (VK_EXECBAR/VK_NOBAR show staleness)
+# Diagnostics: VK_SKIP=sdpa,norm,rope,silu attributes per-op cost; VK_FUSE=1 shows the silu-fusion backfire
 ```

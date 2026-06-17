@@ -46,7 +46,7 @@ All kernels **bit-exact / cosine-1.0 vs candle**. Where it landed vs the targets
 | Q4_K GEMM throughput | ~1000 (wgpu) | **6400–9900 GFLOP/s** | — | ✅ 6–8× wgpu |
 | **prefill** (projection) | 490 | **~4250–4800 tok/s** | ~3000–4500 | ✅ **hit (~74–84% of llama)** |
 | **decode matvec** | 50 GB/s | **208 GB/s** | >153 | ✅ beats llama's effective bus |
-| **decode** (fused forward) | 80 (wgpu) | **97 tok/s** | 240–250 | ❌ blocked by barrier wall |
+| **decode** (fused forward) | 80 (wgpu) | **~290 tok/s** | 240–250 | ✅ **beats llama's 201 (~1.4×)** |
 
 **What worked:**
 - **Prefill: register blocking was the lever, not the exotic stuff.** A 128×128 tile / 16-subgroup
@@ -54,21 +54,26 @@ All kernels **bit-exact / cosine-1.0 vs candle**. Where it landed vs the targets
   ~17% of peak (occupancy-bound on this part).
 - **Decode matvec: word-loading** (process all 8 nibbles of a loaded u32) took it 50 → 208 GB/s,
   above llama's ~153 effective.
+- **Decode forward, 107 → ~290 tok/s — the wall was the SDPA kernel, not barriers.** The fused
+  forward stalled at ~100 tok/s and `VK_NOBAR=1` "fixing" it to ~370 *looked* like a 145-barrier
+  wall. Wrong diagnosis: a coherence probe showed this driver elides empty pipeline barriers (so
+  `VK_NOBAR`/`VK_EXECBAR` were racing layers, not a floor) and a *correct* barrier is only ~2 µs.
+  `VK_SKIP=sdpa` found it: decode SDPA ran **one thread per head** (1 of 40 CUs) with a `float[128]`
+  accumulator that **spilled to scratch** — ~6.6 ms/token. Rewritten as **one workgroup per head**
+  (parallel over head-dim, single `av`/thread), it dropped to ~0.5 ms and the forward beat llama.
+  Validated bit-exact vs a CPU reference (err 2.4e-7).
 - **Toolchain:** no SDK needed — prebuilt glslang compiles coopmat GLSL → committed `.spv`.
 
-**What's blocked — the decode fused forward (97 tok/s, < llama's 201):**
-- `VK_NOBAR=1` shows the ~145 per-token barriers cost ~8 ms (~55 µs each, full GPU drains on the
-  AMD proprietary driver). The decode wall is the **barrier count** (9 sync points/layer vs llama's
-  ~3), not the kernels (matvecs overlap to 2.7 ms).
-- The obvious fix — fold rmsnorm into the matvecs — **backfired** (the 128k-row LM head's redundant
-  per-workgroup reduction cost more than it saved). rmsnorm must fold into the *preceding* op, and
-  reaching ~3 sync points/layer needs the full mega-fusion (flash-attn, QKV+RoPE fused,
-  norm+residual folded) — hard, multi-session kernel work.
+**Fusions that backfired (kept for the record):** folding rmsnorm *or* silu·mul into a matvec
+recomputes a per-element transform once **per output row** (silu-into-down was 88 vs 104 tok/s,
+16.7 M redundant `exp`/layer). Rule: never fold a per-input-element op into a matvec *consumer*.
 
-**Honest bottom line:** the "no hardware ceiling — it's kernel software" framing was right; prefill
-went from 8.5% → ~80% of llama with validated coopmat kernels. But **no iGPU metric beats llama
-yet** — prefill is close (parity is the realistic best; +50% isn't), and decode's path is
-understood (cut barriers via fusion) but not cracked. Remaining work below is the *hard* part.
+**Honest bottom line:** the "no hardware ceiling — it's kernel software" framing was right.
+**Decode now beats llama (~290 vs 201, ~1.4×)** and prefill reaches ~80% — both with validated
+bit-exact coopmat/raw-Vulkan kernels. Prefill parity is the realistic ceiling (+50% isn't — llama's
+coopmat prefill is near the compute roof). The remaining work is **wiring this resident raw-Vulkan
+decode forward into the server** (today the server's GPU fast-lane uses the wgpu engine; the
+raw-Vulkan path lives in `--features vulkan` tests).
 
 ---
 

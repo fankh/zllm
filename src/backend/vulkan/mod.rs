@@ -15,10 +15,13 @@ const COOPMAT_MATMUL_SPV: &[u8] = include_bytes!("shaders/coopmat_matmul.spv");
 const COOPMAT_GEMM_SPV: &[u8] = include_bytes!("shaders/coopmat_gemm.spv");
 const COOPMAT_Q4K_GEMM_SPV: &[u8] = include_bytes!("shaders/coopmat_q4k_gemm.spv");
 const DECODE_MATVEC_Q4K_SPV: &[u8] = include_bytes!("shaders/decode_matvec_q4k.spv");
+const DECODE_MATVEC_DOWN_Q4K_SPV: &[u8] = include_bytes!("shaders/decode_matvec_down_q4k.spv");
 const RMSNORM_SPV: &[u8] = include_bytes!("shaders/rmsnorm.spv");
 const ROPE_SPV: &[u8] = include_bytes!("shaders/rope.spv");
 const SDPA_DECODE_SPV: &[u8] = include_bytes!("shaders/sdpa_decode.spv");
 const SILU_MUL_SPV: &[u8] = include_bytes!("shaders/silu_mul.spv");
+const INC_SPV: &[u8] = include_bytes!("shaders/inc.spv");
+const INC_COH_SPV: &[u8] = include_bytes!("shaders/inc_coh.spv");
 
 /// A minimal raw-Vulkan compute context with cooperative matrix enabled.
 pub struct VkContext {
@@ -955,6 +958,174 @@ mod tests {
         };
         unsafe { fused_decode_inner(&ctx); }
     }
+
+    /// BARRIER-COHERENCE PROBE: chains N `b[i]+=1` dispatches with a barrier
+    /// between each, then checks every element == N. Run under each barrier mode
+    /// to learn whether the cheap (execution-only) barrier is correctness-safe on
+    /// this GPU — if so, the ~55us cache-flush of the full barrier is avoidable.
+    /// `cargo test --release --features vulkan --lib vk_barrier_coherence -- --ignored --nocapture`
+    /// then re-run with VK_EXECBAR=1 and VK_NOBAR=1 and compare.
+    #[test]
+    #[ignore]
+    fn vk_barrier_coherence_probe() {
+        let ctx = match VkContext::new() {
+            Ok(c) => c,
+            Err(e) => { eprintln!("no Vulkan coopmat device ({e}); skipping"); return; }
+        };
+        unsafe { barrier_coherence_inner(&ctx); }
+    }
+
+    /// SDPA CORRECTNESS: runs the parallel decode-SDPA kernel on pseudo-random
+    /// GQA q/K/V and compares to a CPU softmax-attention reference. Guards the
+    /// workgroup-per-head rewrite (which gave the decode forward its lead).
+    /// `cargo test --release --features vulkan --lib vk_sdpa_correctness -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_sdpa_correctness() {
+        let ctx = match VkContext::new() {
+            Ok(c) => c,
+            Err(e) => { eprintln!("no Vulkan coopmat device ({e}); skipping"); return; }
+        };
+        unsafe { sdpa_correctness_inner(&ctx); }
+    }
+}
+
+#[cfg(test)]
+unsafe fn sdpa_correctness_inner(ctx: &VkContext) {
+    use ash::vk;
+    let dev = &ctx.device;
+    let (n_head, n_kv, hd, seq_len) = (32usize, 8usize, 64usize, 32usize);
+    let qn = n_head * hd; let kvn = seq_len * n_kv * hd;
+    let rnd = |i: usize, s: usize| (((i.wrapping_mul(2654435761).wrapping_add(s.wrapping_mul(40503))) & 0xFFFF) as f32 / 32768.0 - 1.0);
+    let qd: Vec<f32> = (0..qn).map(|i| rnd(i, 1)).collect();
+    let kd: Vec<f32> = (0..kvn).map(|i| rnd(i, 2)).collect();
+    let vd: Vec<f32> = (0..kvn).map(|i| rnd(i, 3)).collect();
+
+    let mkbuf = |data: &[f32]| { let (b, _m, p) = ctx.uma_buffer((data.len() * 4) as u64).unwrap(); std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, p, data.len() * 4); b };
+    let q = mkbuf(&qd); let kc = mkbuf(&kd); let vc = mkbuf(&vd);
+    let (out, _mo, out_ptr) = ctx.uma_buffer((qn * 4) as u64).unwrap();
+    let (ub, _mu, up) = ctx.uma_buffer(16).unwrap();
+    let pv = [n_head as u32, n_kv as u32, hd as u32, seq_len as u32];
+    std::ptr::copy_nonoverlapping(pv.as_ptr() as *const u8, up, 16);
+
+    let (sd_p, sd_l, sd_sl, _m) = ctx.make_pipeline_raw(SDPA_DECODE_SPV, 4);
+    let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&[
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(4),
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(1),
+    ]), None).unwrap();
+    let set = dev.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(std::slice::from_ref(&sd_sl))).unwrap()[0];
+    let infos: Vec<[vk::DescriptorBufferInfo; 1]> = [q, kc, vc, out].iter().map(|&b| [vk::DescriptorBufferInfo::default().buffer(b).range(vk::WHOLE_SIZE)]).collect();
+    let ui = [vk::DescriptorBufferInfo::default().buffer(ub).range(vk::WHOLE_SIZE)];
+    let mut writes: Vec<vk::WriteDescriptorSet> = infos.iter().enumerate().map(|(i, info)|
+        vk::WriteDescriptorSet::default().dst_set(set).dst_binding(i as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(info)).collect();
+    writes.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(4).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&ui));
+    dev.update_descriptor_sets(&writes, &[]);
+
+    let cmd_pool = dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family), None).unwrap();
+    let cmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).unwrap()[0];
+    dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+    dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, sd_p);
+    dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, sd_l, 0, &[set], &[]);
+    dev.cmd_dispatch(cmd, n_head as u32, 1, 1);
+    dev.end_command_buffer(cmd).unwrap();
+    let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+    let cmds = [cmd]; let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+    dev.queue_submit(ctx.queue, &[submit], fence).unwrap();
+    dev.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+
+    // CPU reference: standard softmax attention per head with GQA.
+    let scale = 1.0 / (hd as f32).sqrt();
+    let mut refo = vec![0f32; qn];
+    for h in 0..n_head {
+        let kvh = h / (n_head / n_kv);
+        let mut sc = vec![0f32; seq_len];
+        let mut mx = f32::MIN;
+        for t in 0..seq_len {
+            let mut s = 0f32;
+            for d in 0..hd { s += qd[h * hd + d] * kd[(t * n_kv + kvh) * hd + d]; }
+            sc[t] = s * scale; mx = mx.max(sc[t]);
+        }
+        let mut den = 0f32;
+        for t in 0..seq_len { sc[t] = (sc[t] - mx).exp(); den += sc[t]; }
+        for d in 0..hd {
+            let mut a = 0f32;
+            for t in 0..seq_len { a += sc[t] * vd[(t * n_kv + kvh) * hd + d]; }
+            refo[h * hd + d] = a / den;
+        }
+    }
+    let op = out_ptr as *const f32;
+    let (mut max_err, mut argmax) = (0f32, 0usize);
+    for i in 0..qn { let e = (*op.add(i) - refo[i]).abs(); if e > max_err { max_err = e; argmax = i; } }
+    eprintln!("SDPA correctness: max_abs_err={max_err:.3e} at {argmax} (gpu={} cpu={}) => {}",
+        *op.add(argmax), refo[argmax], if max_err < 1e-3 { "PASS" } else { "FAIL" });
+    assert!(max_err < 1e-3, "SDPA mismatch: {max_err}");
+}
+
+#[cfg(test)]
+unsafe fn barrier_coherence_inner(ctx: &VkContext) {
+    use ash::vk;
+    let dev = &ctx.device;
+    let n: usize = 8192;
+    let steps: u32 = 64;
+    let (buf, _m, ptr) = ctx.uma_buffer((n * 4) as u64).unwrap();
+    std::ptr::write_bytes(ptr, 0, n * 4); // b[i] = 0
+    let (b, _m2, up) = ctx.uma_buffer(16).unwrap();
+    let pv = [n as u32, 0u32, 0u32, 0u32];
+    std::ptr::copy_nonoverlapping(pv.as_ptr() as *const u8, up, 16);
+    let coh = std::env::var("VK_COH").is_ok(); // VK_COH=1 uses the `coherent` buffer shader
+    let (p_p, p_l, p_sl, _m) = ctx.make_pipeline_raw(if coh { INC_COH_SPV } else { INC_SPV }, 1);
+
+    let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(2).pool_sizes(&[
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(2),
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(2),
+    ]), None).unwrap();
+    let set = dev.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(std::slice::from_ref(&p_sl))).unwrap()[0];
+    let bi = [vk::DescriptorBufferInfo::default().buffer(buf).range(vk::WHOLE_SIZE)];
+    let ui = [vk::DescriptorBufferInfo::default().buffer(b).range(vk::WHOLE_SIZE)];
+    dev.update_descriptor_sets(&[
+        vk::WriteDescriptorSet::default().dst_set(set).dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&bi),
+        vk::WriteDescriptorSet::default().dst_set(set).dst_binding(1).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&ui),
+    ], &[]);
+
+    let no_barriers = std::env::var("VK_NOBAR").is_ok();
+    let exec_bar = std::env::var("VK_EXECBAR").is_ok();
+    let buf_bar = std::env::var("VK_BUFBAR").is_ok(); // BufferMemoryBarrier scoped to the buffer
+    let cmd_pool = dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family), None).unwrap();
+    let cmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).unwrap()[0];
+    let barr = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
+    let bbar = [vk::BufferMemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).buffer(buf).offset(0).size(vk::WHOLE_SIZE)];
+    let cs = vk::PipelineStageFlags::COMPUTE_SHADER;
+    dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+    dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p_p);
+    dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, p_l, 0, &[set], &[]);
+    let no_barriers2 = no_barriers; // capture for the closure
+    for s in 0..steps {
+        dev.cmd_dispatch(cmd, (n as u32).div_ceil(64), 1, 1);
+        if s + 1 < steps && !no_barriers2 {
+            if exec_bar      { dev.cmd_pipeline_barrier(cmd, cs, cs, vk::DependencyFlags::empty(), &[], &[], &[]); }
+            else if buf_bar  { dev.cmd_pipeline_barrier(cmd, cs, cs, vk::DependencyFlags::empty(), &[], &bbar, &[]); }
+            else             { dev.cmd_pipeline_barrier(cmd, cs, cs, vk::DependencyFlags::empty(), &[barr], &[], &[]); }
+        }
+    }
+    dev.end_command_buffer(cmd).unwrap();
+    let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+    let cmds = [cmd];
+    let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+    // Correctness from one submit (buffer started at 0).
+    dev.queue_submit(ctx.queue, &[submit], fence).unwrap();
+    dev.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+    let fp = ptr as *const f32;
+    let (mut mn, mut mx, mut wrong) = (f32::MAX, f32::MIN, 0u32);
+    for i in 0..n { let v = *fp.add(i); mn = mn.min(v); mx = mx.max(v); if (v - steps as f32).abs() > 0.5 { wrong += 1; } }
+    // Timing: resubmit the same cmd buffer (values keep accumulating; we only time).
+    let iters = 50;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters { dev.reset_fences(&[fence]).unwrap(); dev.queue_submit(ctx.queue, &[submit], fence).unwrap(); dev.wait_for_fences(&[fence], true, u64::MAX).unwrap(); }
+    let us_per_bar = t0.elapsed().as_secs_f64() * 1e6 / (iters as f64 * (steps - 1) as f64);
+    let mode = format!("{}{}", if no_barriers { "NOBAR" } else if exec_bar { "EXEC-only" } else if buf_bar { "BUFBAR" } else { "FULL" }, if coh { "+coherent" } else { "" });
+    eprintln!("barrier [{mode}]: got min={mn} max={mx} wrong={wrong}/{n} => {} | ~{us_per_bar:.1} us/barrier",
+        if wrong == 0 { "CORRECT" } else { "STALE" });
 }
 
 #[cfg(test)]
@@ -986,7 +1157,8 @@ unsafe fn fused_decode_inner(ctx: &VkContext) {
     let w2 = buf_bytes(&q4k(n_embd, n_inter)); let lm = buf_bytes(&q4k(vocab, n_embd));
     let normw = buf_f32(n_embd); let cosb = buf_f32(hd / 2); let sinb = buf_f32(hd / 2);
     let x = buf_f32(n_embd); let normed = buf_f32(n_embd); let q = buf_f32(n_embd); let k = buf_f32(kv_dim); let v = buf_f32(kv_dim);
-    let attn = buf_f32(n_embd); let gate = buf_f32(n_inter); let up = buf_f32(n_inter); let h = buf_f32(n_inter); let logits = buf_f32(vocab);
+    let attn = buf_f32(n_embd); let gate = buf_f32(n_inter); let up = buf_f32(n_inter); let h = buf_f32(n_inter);
+    let (logits, _lmm, logits_ptr) = ctx.uma_buffer((vocab * 4) as u64).unwrap(); // keep ptr for correctness check
     let kc = buf_f32(max_seq * kv_dim); let vc = buf_f32(max_seq * kv_dim);
 
     // Pipelines (storage-buffer count per kernel).
@@ -995,6 +1167,7 @@ unsafe fn fused_decode_inner(ctx: &VkContext) {
     let (ro_p, ro_l, ro_sl, _m2) = ctx.make_pipeline_raw(ROPE_SPV, 3);
     let (sd_p, sd_l, sd_sl, _m3) = ctx.make_pipeline_raw(SDPA_DECODE_SPV, 4);
     let (si_p, si_l, si_sl, _m4) = ctx.make_pipeline_raw(SILU_MUL_SPV, 3);
+    let (dn_p, dn_l, dn_sl, _m5) = ctx.make_pipeline_raw(DECODE_MATVEC_DOWN_Q4K_SPV, 4); // fused silu·mul + down
 
     let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(20).pool_sizes(&[
         vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(80),
@@ -1026,6 +1199,7 @@ unsafe fn fused_decode_inner(ctx: &VkContext) {
     let s_w3 = mkset(mv_sl, &[w3, normed, up], mvuni(n_inter, n_embd));
     let s_si = mkset(si_sl, &[gate, up, h], uni([n_inter as u32, 0, 0, 0]));
     let s_w2 = mkset(mv_sl, &[w2, h, x], mvuni(n_embd, n_inter));
+    let s_w2d = mkset(dn_sl, &[w2, gate, up, x], mvuni(n_embd, n_inter)); // fused: reads gate+up, silu·mul inline
     let s_lm = mkset(mv_sl, &[lm, normed, logits], mvuni(vocab, n_embd));
 
     let cmd_pool = dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family), None).unwrap();
@@ -1038,26 +1212,50 @@ unsafe fn fused_decode_inner(ctx: &VkContext) {
         dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, l, 0, &[set], &[]);
         dev.cmd_dispatch(cmd, gx, gy, 1);
     };
-    // Diagnostic: VK_NOBAR=1 drops all barriers (incorrect, but isolates their
-    // cost). Result: ~145 barriers cost ~8 ms/token (94 -> 373 tok/s) — each is
-    // a ~55us full GPU drain on this driver. The barrier COUNT, not the kernels,
-    // is the decode wall; cutting it needs deep fusion (fewer sync points). A
-    // first attempt (rmsnorm folded into each matvec) backfired — the redundant
-    // per-workgroup reduction over the 128k-row LM head cost more than it saved.
+    // The decode wall was NOT the barriers. VK_NOBAR=1 (drop all barriers) and
+    // VK_EXECBAR=1 (execution-only) both hit ~370 tok/s — but the coherence probe
+    // proves both are STALE: this driver elides a memory-barrier-less pipeline
+    // barrier, so those numbers are racing layers, not a real floor. A *correct*
+    // full barrier is only ~2us (see vk_barrier_coherence_probe).
+    // The real wall was the SDPA kernel: one thread per head (1 of 40 CUs) with a
+    // float[128] accumulator that spilled to scratch — ~410us x 16 layers = ~6.6ms.
+    // VK_SKIP=sdpa isolated it (107 -> 358 tok/s). Rewritten as one workgroup per
+    // head (parallel over head-dim, no spill), the full forward is ~290 tok/s,
+    // beating llama's 201. Fusion experiments that backfired (kept for the record):
+    // rmsnorm-into-matvec and silu-into-down (VK_FUSE=1) both recompute a per-
+    // element transform once per output row — always a net loss.
     let no_barriers = std::env::var("VK_NOBAR").is_ok();
-    let bar = || { if !no_barriers { dev.cmd_pipeline_barrier(cmd, cs, cs, vk::DependencyFlags::empty(), &[barr], &[], &[]); } };
+    let exec_bar = std::env::var("VK_EXECBAR").is_ok(); // execution-only barrier (no mem flush) — isolates flush cost
+    let fuse_ffn = std::env::var("VK_FUSE").is_ok();     // VK_FUSE=1 folds silu into down (backfires: redundant exp/row)
+    // Per-category skip flags (VK_SKIP=norm,rope,sdpa,silu) to attribute the
+    // gap between the ~4.2ms serial-matvec floor and the ~10ms full forward.
+    let skip = std::env::var("VK_SKIP").unwrap_or_default();
+    let (skip_norm, skip_rope, skip_sdpa, skip_silu) =
+        (skip.contains("norm"), skip.contains("rope"), skip.contains("sdpa"), skip.contains("silu"));
+    let bar = || { if !no_barriers {
+        if exec_bar { dev.cmd_pipeline_barrier(cmd, cs, cs, vk::DependencyFlags::empty(), &[], &[], &[]); }
+        else        { dev.cmd_pipeline_barrier(cmd, cs, cs, vk::DependencyFlags::empty(), &[barr], &[], &[]); }
+    } };
     let mv = |set, n: usize| disp(mv_p, mv_l, set, gxof(n), (n as u32).div_ceil(gxof(n)));
     for _ in 0..n_layers {
-        disp(rn_p, rn_l, s_rn, 1, 1); bar();                                          // attn norm
+        if !skip_norm { disp(rn_p, rn_l, s_rn, 1, 1); bar(); }                         // attn norm
         mv(s_wq, n_embd); mv(s_wk, kv_dim); mv(s_wv, kv_dim); bar();                   // QKV
-        disp(ro_p, ro_l, s_rq, ((n_head * hd / 2) as u32).div_ceil(64), 1);
-        disp(ro_p, ro_l, s_rk, ((n_kv * hd / 2) as u32).div_ceil(64), 1); bar();       // RoPE q,k
-        disp(sd_p, sd_l, s_sd, (n_head as u32).div_ceil(64), 1); bar();                // SDPA
+        if !skip_rope {
+            disp(ro_p, ro_l, s_rq, ((n_head * hd / 2) as u32).div_ceil(64), 1);
+            disp(ro_p, ro_l, s_rk, ((n_kv * hd / 2) as u32).div_ceil(64), 1); bar();   // RoPE q,k
+        }
+        if !skip_sdpa { disp(sd_p, sd_l, s_sd, n_head as u32, 1); bar(); }             // SDPA (1 workgroup/head)
         mv(s_wo, n_embd); bar();                                                       // O proj
-        disp(rn_p, rn_l, s_rn, 1, 1); bar();                                          // ffn norm
+        if !skip_norm { disp(rn_p, rn_l, s_rn, 1, 1); bar(); }                         // ffn norm
         mv(s_w1, n_inter); mv(s_w3, n_inter); bar();                                   // gate, up
-        disp(si_p, si_l, s_si, (n_inter as u32).div_ceil(64), 1); bar();              // silu·mul
-        mv(s_w2, n_embd); bar();                                                       // down proj
+        if fuse_ffn {
+            // Fused: down-proj reads gate+up and computes silu(gate)*up inline. This
+            // BACKFIRES (88 vs 104) — silu/exp is recomputed once per output row.
+            disp(dn_p, dn_l, s_w2d, gxof(n_embd), (n_embd as u32).div_ceil(gxof(n_embd))); bar();
+        } else {
+            if !skip_silu { disp(si_p, si_l, s_si, (n_inter as u32).div_ceil(64), 1); bar(); } // silu·mul
+            mv(s_w2, n_embd); bar();                                                   // down proj
+        }
     }
     disp(rn_p, rn_l, s_rn, 1, 1); bar();                                              // final norm
     mv(s_lm, vocab);                                                                   // LM head
@@ -1071,6 +1269,13 @@ unsafe fn fused_decode_inner(ctx: &VkContext) {
     let t0 = Instant::now();
     for _ in 0..toks { dev.reset_fences(&[fence]).unwrap(); dev.queue_submit(ctx.queue, &[submit], fence).unwrap(); dev.wait_for_fences(&[fence], true, u64::MAX).unwrap(); }
     let per = t0.elapsed().as_secs_f64() * 1e3 / toks as f64;
+    // Correctness probe: checksum the logits. Full-barrier is the reference; if
+    // exec-only/coherent modes match it, the lighter barrier is safe on this GPU.
+    let lp = logits_ptr as *const f32;
+    let (mut checksum, mut nan) = (0f64, 0u32);
+    let mut first = [0f32; 4];
+    for i in 0..vocab { let v = *lp.add(i); if v.is_nan() { nan += 1; } checksum += v as f64; if i < 4 { first[i] = v; } }
     eprintln!("FUSED decode forward: {per:.3} ms/token => {:.0} tok/s", 1000.0 / per);
-    eprintln!("  vs current wgpu decode ~80 tok/s; llama.cpp iGPU 201; matvec-only projection 237");
+    eprintln!("  logits checksum={checksum:.4} nan={nan} first={first:?}");
+    eprintln!("  vs wgpu decode ~80; llama.cpp iGPU 201 (BEATEN); matvec-only ceiling ~355");
 }

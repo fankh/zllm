@@ -1,0 +1,52 @@
+// Fused FFN down: out[N] = dequant(W2)[N,K] · (silu(gate)*up), K=n_inter.
+// The activation silu(gate[k])*up[k] is computed inline in the matvec dot —
+// folding the separate silu·mul dispatch + its barrier away (no redundant work).
+#version 450 core
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly  buffer WQ { uint  wq[];   };  // Q4_K w2 [N,K]
+layout(binding = 1) readonly  buffer G_ { float gate[]; };  // [K]
+layout(binding = 2) readonly  buffer U_ { float up[];   };  // [K]
+layout(binding = 3) writeonly buffer O_ { float outp[]; };  // [N]
+layout(binding = 4) uniform   P_ { uint N; uint K; uint nb; uint gx; } p;
+shared float part[64];
+void main() {
+    uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * p.gx;
+    uint t = gl_LocalInvocationID.x;
+    if (row >= p.N) { part[t] = 0.0; return; }
+    uint total_sub = p.nb * 8u;
+    float acc = 0.0;
+    uint g = t;
+    while (g < total_sub) {
+        uint b = g / 8u; uint sub = g % 8u;
+        uint blk = (row * p.nb + b) * 36u;
+        vec2 dd = unpackHalf2x16(wq[blk]); float d = dd.x; float dmin = dd.y;
+        uint u0 = wq[blk + 1u]; uint u1 = wq[blk + 2u]; uint u2 = wq[blk + 3u];
+        uint u3 = ((u2 >> 4u) & 0x0f0f0f0fu) | (((u1 >> 6u) & 0x03030303u) << 4u);
+        uint uaux = u1 & 0x3f3f3f3fu;
+        u1 = (u2 & 0x0f0f0f0fu) | (((u0 >> 6u) & 0x03030303u) << 4u);
+        u2 = uaux; u0 = u0 & 0x3f3f3f3fu;
+        float sc; float mn;
+        if (sub < 4u) { sc = float((u0 >> (sub * 8u)) & 0xffu); mn = float((u2 >> (sub * 8u)) & 0xffu); }
+        else          { sc = float((u1 >> ((sub - 4u) * 8u)) & 0xffu); mn = float((u3 >> ((sub - 4u) * 8u)) & 0xffu); }
+        uint pair = sub / 2u; bool hi = (sub & 1u) == 1u;
+        uint qs0 = blk + 4u + pair * 8u;
+        uint xb = b * 256u + sub * 32u;
+        float dot = 0.0; float xsum = 0.0;
+        for (uint w = 0u; w < 8u; w = w + 1u) {
+            uint word = wq[qs0 + w];
+            for (uint bsel = 0u; bsel < 4u; bsel = bsel + 1u) {
+                uint byte = (word >> (bsel * 8u)) & 0xffu;
+                uint q = hi ? (byte >> 4u) : (byte & 0x0fu);
+                uint xi = xb + w * 4u + bsel;
+                float gv = gate[xi];
+                float xv = (gv / (1.0 + exp(-gv))) * up[xi];   // silu(gate)*up
+                dot += float(q) * xv; xsum += xv;
+            }
+        }
+        acc += d * sc * dot - dmin * mn * xsum;
+        g += 64u;
+    }
+    part[t] = acc; barrier();
+    for (uint st = 32u; st > 0u; st >>= 1u) { if (t < st) part[t] += part[t + st]; barrier(); }
+    if (t == 0u) { outp[row] = part[0]; }
+}
