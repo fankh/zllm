@@ -14,6 +14,7 @@ use std::ffi::CStr;
 const COOPMAT_MATMUL_SPV: &[u8] = include_bytes!("shaders/coopmat_matmul.spv");
 const COOPMAT_GEMM_SPV: &[u8] = include_bytes!("shaders/coopmat_gemm.spv");
 const COOPMAT_Q4K_GEMM_SPV: &[u8] = include_bytes!("shaders/coopmat_q4k_gemm.spv");
+const DECODE_MATVEC_Q4K_SPV: &[u8] = include_bytes!("shaders/decode_matvec_q4k.spv");
 
 /// A minimal raw-Vulkan compute context with cooperative matrix enabled.
 pub struct VkContext {
@@ -539,6 +540,99 @@ impl VkContext {
         }
         Ok((out, ms))
     }
+
+    /// Decode matvec (Q4_K): out[N] = dequant(W)[N,K] · x[K], M=1. Returns
+    /// out[N] (last run) + total GPU ms over `iters`. The bandwidth-bound
+    /// decode kernel (subgroup-per-row, subgroupAdd reduction, no LDS/barrier).
+    pub fn decode_matvec_q4k(&self, weight_bytes: &[u8], n: usize, nb: usize, x: &[f32], iters: u32) -> Result<(Vec<f32>, f64), String> {
+        let k = nb * 256;
+        assert_eq!(weight_bytes.len(), n * nb * 144);
+        assert_eq!(x.len(), k);
+        unsafe { self.decode_matvec_q4k_inner(weight_bytes, n, nb, x, iters) }
+    }
+
+    unsafe fn decode_matvec_q4k_inner(&self, weight_bytes: &[u8], n: usize, nb: usize, x: &[f32], iters: u32) -> Result<(Vec<f32>, f64), String> {
+        use std::time::Instant;
+        let dev = &self.device;
+        let k = nb * 256;
+        let (w_buf, w_mem, w_ptr) = self.uma_buffer(weight_bytes.len() as u64)?;
+        let (x_buf, x_mem, x_ptr) = self.uma_buffer((k * 4) as u64)?;
+        let (o_buf, o_mem, o_ptr) = self.uma_buffer((n * 4) as u64)?;
+        let (p_buf, p_mem, p_ptr) = self.uma_buffer(16)?;
+        std::ptr::copy_nonoverlapping(weight_bytes.as_ptr(), w_ptr, weight_bytes.len());
+        std::ptr::copy_nonoverlapping(x.as_ptr() as *const u8, x_ptr, k * 4);
+        let gx = (n as u32).min(65535);
+        let dims = [n as u32, k as u32, nb as u32, gx];
+        std::ptr::copy_nonoverlapping(dims.as_ptr() as *const u8, p_ptr, 16);
+
+        let spv = ash::util::read_spv(&mut std::io::Cursor::new(DECODE_MATVEC_Q4K_SPV)).map_err(|e| format!("read_spv: {e}"))?;
+        let module = dev.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spv), None).map_err(|e| format!("module: {e}"))?;
+
+        let mut bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..3)
+            .map(|b| vk::DescriptorSetLayoutBinding::default().binding(b).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE))
+            .collect();
+        bindings.push(vk::DescriptorSetLayoutBinding::default().binding(3).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE));
+        let set_layout = dev.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).map_err(|e| format!("setlayout: {e}"))?;
+        let pipeline_layout = dev.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(std::slice::from_ref(&set_layout)), None).map_err(|e| format!("playout: {e}"))?;
+
+        let entry = std::ffi::CString::new("main").unwrap();
+        let mut req_sg = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(32);
+        let stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE).module(module).name(&entry)
+            .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS).push_next(&mut req_sg);
+        let pipeline = dev.create_compute_pipelines(vk::PipelineCache::null(),
+            &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(pipeline_layout)], None)
+            .map_err(|(_, e)| format!("pipeline: {e}"))?[0];
+
+        let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&[
+            vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(3),
+            vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(1),
+        ]), None).map_err(|e| format!("pool: {e}"))?;
+        let set = dev.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(std::slice::from_ref(&set_layout))).map_err(|e| format!("allocset: {e}"))?[0];
+        let info = |buf| [vk::DescriptorBufferInfo::default().buffer(buf).range(vk::WHOLE_SIZE)];
+        let (wi, xi, oi, pi) = (info(w_buf), info(x_buf), info(o_buf), info(p_buf));
+        let writes = [
+            vk::WriteDescriptorSet::default().dst_set(set).dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&wi),
+            vk::WriteDescriptorSet::default().dst_set(set).dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&xi),
+            vk::WriteDescriptorSet::default().dst_set(set).dst_binding(2).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&oi),
+            vk::WriteDescriptorSet::default().dst_set(set).dst_binding(3).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&pi),
+        ];
+        dev.update_descriptor_sets(&writes, &[]);
+
+        let cmd_pool = dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(self.queue_family), None).map_err(|e| format!("cmdpool: {e}"))?;
+        let cmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).map_err(|e| format!("cmdbuf: {e}"))?[0];
+        let gy = (n as u32).div_ceil(gx);
+        dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).map_err(|e| format!("begin: {e}"))?;
+        dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+        dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, pipeline_layout, 0, &[set], &[]);
+        let barrier = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
+        for _ in 0..iters {
+            dev.cmd_dispatch(cmd, gx, gy, 1);
+            dev.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[barrier], &[], &[]);
+        }
+        dev.end_command_buffer(cmd).map_err(|e| format!("end: {e}"))?;
+        let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| format!("fence: {e}"))?;
+        let cmds = [cmd];
+        let t0 = Instant::now();
+        dev.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence).map_err(|e| format!("submit: {e}"))?;
+        dev.wait_for_fences(&[fence], true, u64::MAX).map_err(|e| format!("wait: {e}"))?;
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        let mut out = vec![0f32; n];
+        std::ptr::copy_nonoverlapping(o_ptr as *const f32, out.as_mut_ptr(), n);
+
+        dev.destroy_fence(fence, None);
+        dev.destroy_command_pool(cmd_pool, None);
+        dev.destroy_descriptor_pool(pool, None);
+        dev.destroy_pipeline(pipeline, None);
+        dev.destroy_pipeline_layout(pipeline_layout, None);
+        dev.destroy_descriptor_set_layout(set_layout, None);
+        dev.destroy_shader_module(module, None);
+        for (buf, mem) in [(w_buf, w_mem), (x_buf, x_mem), (o_buf, o_mem), (p_buf, p_mem)] {
+            dev.unmap_memory(mem); dev.destroy_buffer(buf, None); dev.free_memory(mem, None);
+        }
+        Ok((out, ms))
+    }
 }
 
 impl Drop for VkContext {
@@ -726,5 +820,55 @@ mod tests {
             eprintln!("coopmat prefill GEMM projection: M={m:>4} -> {forward_ms:6.1} ms/forward (GEMMs only) => {tok_s:5.0} tok/s");
         }
         eprintln!("  vs current wgpu prefill ~492 tok/s (incl norm/rope/sdpa); llama.cpp iGPU 5747");
+    }
+
+    /// DECODE matvec: validate vs the candle Q4_K oracle, then measure the
+    /// streaming bandwidth (GB/s) — the metric that bounds decode tok/s. The
+    /// achievable bus is ~215 GB/s; llama.cpp gets ~153 effective (201 tok/s),
+    /// so >153 here projects a decode lead.
+    /// `cargo test --release --features vulkan --lib vk_decode_matvec -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_decode_matvec_bandwidth() {
+        use candle_core::{Device, Tensor};
+        use candle_core::quantized::{QTensor, GgmlDType};
+        let ctx = match VkContext::new() {
+            Ok(c) => c,
+            Err(e) => { eprintln!("no Vulkan coopmat device ({e}); skipping"); return; }
+        };
+        // Correctness vs candle dequant oracle (f32 → tight).
+        let (n, nb) = (256usize, 2usize);
+        let k = nb * 256;
+        let mut w = vec![0f32; n * k];
+        for i in 0..w.len() { w[i] = (((i as i64).wrapping_mul(2654435761) & 0xFFFF) as f32 / 32768.0 - 1.0) * 0.5; }
+        let qt = QTensor::quantize(&Tensor::from_vec(w, (n, k), &Device::Cpu).unwrap(), GgmlDType::Q4K).unwrap();
+        let bytes = qt.data().unwrap();
+        let deq: Vec<f32> = qt.dequantize(&Device::Cpu).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let x: Vec<f32> = (0..k).map(|i| ((i % 23) as f32 - 11.0) * 0.03).collect();
+        let (gpu, _) = ctx.decode_matvec_q4k(&bytes, n, nb, &x, 1).expect("matvec");
+        let mut max_abs = 0f32;
+        for nn in 0..n {
+            let mut acc = 0f64;
+            for kk in 0..k { acc += (deq[nn * k + kk] as f64) * (x[kk] as f64); }
+            max_abs = max_abs.max((gpu[nn] - acc as f32).abs());
+        }
+        eprintln!("decode matvec vs candle oracle: max_abs_err = {max_abs:.5}");
+        assert!(max_abs < 0.05, "decode matvec wrong: {max_abs}");
+
+        // Streaming bandwidth on representative decode weights.
+        for &(n, k) in &[(8192usize, 2048usize), (128256, 2048)] {
+            let nb = k / 256;
+            let mut w = vec![0f32; n * k];
+            for i in 0..w.len() { w[i] = (((i as i64).wrapping_mul(2654435761) & 0xFFFF) as f32 / 32768.0 - 1.0) * 0.5; }
+            let bytes = QTensor::quantize(&Tensor::from_vec(w, (n, k), &Device::Cpu).unwrap(), GgmlDType::Q4K).unwrap().data().unwrap().to_vec();
+            let x: Vec<f32> = (0..k).map(|i| ((i % 23) as f32 - 11.0) * 0.02).collect();
+            let _ = ctx.decode_matvec_q4k(&bytes, n, nb, &x, 4).expect("warm");
+            let iters = 50u32;
+            let (_, ms) = ctx.decode_matvec_q4k(&bytes, n, nb, &x, iters).expect("bench");
+            let gbps = bytes.len() as f64 * iters as f64 / (ms / 1e3) / 1e9;
+            eprintln!("decode matvec N={n:>6} K={k}: {:.3} ms/iter, {gbps:5.0} GB/s ({:.1} MB weight)",
+                ms / iters as f64, bytes.len() as f64 / 1e6);
+        }
+        eprintln!("  llama.cpp decode ~153 GB/s effective (201 tok/s); achievable bus ~215 GB/s (~280 tok/s wall)");
     }
 }
