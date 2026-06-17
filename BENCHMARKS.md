@@ -133,9 +133,16 @@ Key Phase-2 levers (all bit-exact):
   path (decode/prefill/batched), and a raw-Vulkan coopmat path that now **beats llama on
   single-stream decode (~1.4×)** and reaches ~80% of llama on prefill, all wired into the chat
   server. Bottom line: **decode is won; prefill is close** (parity realistic, +50% is not — llama's
-  coopmat prefill is near the compute roof). The decode forward kernels are validated bit-exact
-  (SDPA err 2.4e-7); the next step is wiring this resident raw-Vulkan forward into the server's
-  decode path (today the server's GPU fast-lane uses the wgpu engine).
+  coopmat prefill is near the compute roof).
+- **The raw-Vulkan forward is now a real-weight server engine** (`VkModel`, `--features vulkan`,
+  `ZLLM_VK=1`): loads the actual GGUF, runs the validated decode kernels with a resident KV cache,
+  **bit-exact vs candle (greedy 24/24 tokens)**, wired into the chat fast-lane (blocking + streaming)
+  and verified live. On real weights the server decodes **~122 tok/s** (beats CPU/wgpu's 63 by ~1.9×)
+  — below the ~290 kernel ceiling because the Q6_K weights (`attn_v`, `ffn_down`, tied LM head) stream
+  more (the SoA repack expands i8 scales → f32) and prefill is sequential. The first real-weight cliff
+  was the readback: reading the 513 KB logit vector from write-combined host memory cost ~8.5 ms/token
+  — fixed with a GPU argmax (4-byte readback, 59 → 114 tok/s). Remaining: word-load the Q6_K matvec +
+  keep scales i8, and batched prefill via the coopmat GEMM.
 
 ## zllm GPU kernel tuning (this engine's own progression)
 
@@ -167,6 +174,8 @@ cargo test --release --features vulkan --lib vk_decode_matvec_bandwidth     -- -
 cargo test --release --features vulkan --lib vk_decode_projection           -- --ignored --nocapture  # decode matvec tok/s
 cargo test --release --features vulkan --lib vk_fused_decode_throughput     -- --ignored --nocapture  # fused decode forward (~290 tok/s, beats llama)
 cargo test --release --features vulkan --lib vk_sdpa_correctness            -- --ignored --nocapture  # SDPA (single + flash) bit-exact vs CPU ref
+cargo test --release --features vulkan --lib vk_model_vs_candle             -- --ignored --nocapture  # real-weight VkModel: greedy 24/24 vs candle + tok/s
+# Server fast-lane: build --features vulkan, run with ZLLM_VK=1, POST /v1/inspect/enabled {false}, then chat
 VK_SEQ=512 cargo test --release --features vulkan --lib vk_fused_decode_throughput -- --ignored --nocapture  # decode at a given context depth
 cargo test --release --features vulkan --lib vk_barrier_coherence_probe     -- --ignored --nocapture  # barrier cost/coherence (VK_EXECBAR/VK_NOBAR show staleness)
 # Diagnostics: VK_SKIP=sdpa,norm,rope,silu attributes per-op cost; VK_FUSE=1 shows the silu-fusion backfire

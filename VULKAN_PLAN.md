@@ -74,12 +74,19 @@ All kernels **bit-exact / cosine-1.0 vs candle**. Where it landed vs the targets
 recomputes a per-element transform once **per output row** (silu-into-down was 88 vs 104 tok/s,
 16.7 M redundant `exp`/layer). Rule: never fold a per-input-element op into a matvec *consumer*.
 
+**Now a real-weight server engine.** `VkModel` (`--features vulkan`, `ZLLM_VK=1`) loads the actual
+GGUF and runs the validated decode kernels with a resident KV cache — **bit-exact vs candle (greedy
+24/24)** — wired into the chat fast-lane (blocking + streaming) and verified live. Real-weight server
+decode is **~122 tok/s** (beats CPU/wgpu's 63 by ~1.9×), below the ~290 kernel ceiling because the
+Q6_K weights (`attn_v`, `ffn_down`, tied LM head) stream more and prefill is sequential. Biggest
+real-weight fix so far: the 513 KB logit readback from write-combined host memory cost ~8.5 ms/token
+→ GPU argmax (4-byte readback) took it 59 → 114 tok/s.
+
 **Honest bottom line:** the "no hardware ceiling — it's kernel software" framing was right.
-**Decode now beats llama (~290 vs 201, ~1.4×)** and prefill reaches ~80% — both with validated
-bit-exact coopmat/raw-Vulkan kernels. Prefill parity is the realistic ceiling (+50% isn't — llama's
-coopmat prefill is near the compute roof). The remaining work is **wiring this resident raw-Vulkan
-decode forward into the server** (today the server's GPU fast-lane uses the wgpu engine; the
-raw-Vulkan path lives in `--features vulkan` tests).
+**Decode kernels beat llama (~290 vs 201, ~1.4×)** and prefill reaches ~80% — all validated bit-exact.
+The remaining work is **closing the real-weight gap to the kernel ceiling**: word-load the Q6_K matvec
+(keep scales i8 to cut bandwidth ~25%), batched prefill via the coopmat GEMM (sequential prefill caps
+the fast-lane at 128 tokens today), and record-once + uniform-update to cut per-token CPU overhead.
 
 ---
 
