@@ -1038,7 +1038,14 @@ unsafe fn fused_decode_inner(ctx: &VkContext) {
         dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, l, 0, &[set], &[]);
         dev.cmd_dispatch(cmd, gx, gy, 1);
     };
-    let bar = || dev.cmd_pipeline_barrier(cmd, cs, cs, vk::DependencyFlags::empty(), &[barr], &[], &[]);
+    // Diagnostic: VK_NOBAR=1 drops all barriers (incorrect, but isolates their
+    // cost). Result: ~145 barriers cost ~8 ms/token (94 -> 373 tok/s) — each is
+    // a ~55us full GPU drain on this driver. The barrier COUNT, not the kernels,
+    // is the decode wall; cutting it needs deep fusion (fewer sync points). A
+    // first attempt (rmsnorm folded into each matvec) backfired — the redundant
+    // per-workgroup reduction over the 128k-row LM head cost more than it saved.
+    let no_barriers = std::env::var("VK_NOBAR").is_ok();
+    let bar = || { if !no_barriers { dev.cmd_pipeline_barrier(cmd, cs, cs, vk::DependencyFlags::empty(), &[barr], &[], &[]); } };
     let mv = |set, n: usize| disp(mv_p, mv_l, set, gxof(n), (n as u32).div_ceil(gxof(n)));
     for _ in 0..n_layers {
         disp(rn_p, rn_l, s_rn, 1, 1); bar();                                          // attn norm
