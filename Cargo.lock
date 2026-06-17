@@ -4602,6 +4602,7 @@ name = "zllm"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "ash",
  "axum",
  "bitvec",
  "bytemuck",
@@ -4611,6 +4612,7 @@ dependencies = [
  "clap",
  "core_affinity",
  "futures",
+ "half",
  "hf-hub",
  "pollster",
  "prometheus",
