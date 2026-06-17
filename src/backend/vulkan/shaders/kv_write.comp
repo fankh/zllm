@@ -1,0 +1,9 @@
+// Write a roped K (or V) vector into the resident KV cache at position `base`
+// (= pos*kv_dim). Lets the forward be recorded once and resubmitted: only the
+// `base` uniform is updated per token (no per-token command re-record).
+#version 450 core
+layout(local_size_x = 64) in;
+layout(binding = 0) writeonly buffer DST_ { float dst[]; };
+layout(binding = 1) readonly  buffer SRC_ { float src[]; };
+layout(binding = 2) uniform   P_ { uint n; uint base; uint p0; uint p1; } p;
+void main() { uint i = gl_GlobalInvocationID.x; if (i >= p.n) { return; } dst[p.base + i] = src[i]; }

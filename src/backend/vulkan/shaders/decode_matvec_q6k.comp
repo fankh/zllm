@@ -1,0 +1,43 @@
+// Q6_K decode matvec (LM head): out[N] = dequant(W)[N,K] · x[K]. Reads the
+// repacked struct-of-arrays (ql 128B/blk, qh 64B/blk, scales 16 f32/blk, d
+// f32/blk) — raw Q6_K's 210-byte blocks aren't u32-aligned. Dequant mirrors
+// ggml dequantize_row_q6_K: q=((ql&0xF)|(qh_bits<<4))-32, val=d*scale*q.
+// One workgroup (64 threads) per output row; shared-mem tree reduction.
+#version 450 core
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly  buffer QL_ { uint  ql[];   };
+layout(binding = 1) readonly  buffer QH_ { uint  qh[];   };
+layout(binding = 2) readonly  buffer SC_ { float scl[];  };
+layout(binding = 3) readonly  buffer DD_ { float dd[];   };
+layout(binding = 4) readonly  buffer X_  { float x[];    };
+layout(binding = 5) writeonly buffer O_  { float outp[]; };
+layout(binding = 6) uniform   P_ { uint n_rows; uint nb; uint gx; uint pad; } p;
+shared float partial[64];
+void main() {
+    uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * p.gx;
+    if (row >= p.n_rows) { return; }
+    uint t = gl_LocalInvocationID.x;
+    uint ncols = p.nb * 256u;
+    float acc = 0.0;
+    uint e = t;
+    while (e < ncols) {
+        uint b = e / 256u; uint pp = e % 256u;
+        uint hf = pp / 128u; uint pq = pp % 128u;
+        uint sub = pq / 32u; uint l = pq % 32u;
+        uint blk = row * p.nb + b;
+        uint ql_l = l + (sub & 1u) * 32u;
+        uint ql_bi = blk * 128u + hf * 64u + ql_l;
+        uint ql_byte = (ql[ql_bi >> 2u] >> ((ql_bi & 3u) * 8u)) & 0xffu;
+        uint nib = (sub < 2u) ? (ql_byte & 0xfu) : (ql_byte >> 4u);
+        uint qh_bi = blk * 64u + hf * 32u + l;
+        uint qh_byte = (qh[qh_bi >> 2u] >> ((qh_bi & 3u) * 8u)) & 0xffu;
+        uint qbits = (qh_byte >> (sub * 2u)) & 3u;
+        int q = int(nib | (qbits << 4u)) - 32;
+        float scale = scl[blk * 16u + hf * 8u + (l / 16u) + 2u * sub];
+        acc += dd[blk] * scale * float(q) * x[e];
+        e += 64u;
+    }
+    partial[t] = acc; barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) { if (t < s) { partial[t] += partial[t + s]; } barrier(); }
+    if (t == 0u) { outp[row] = partial[0]; }
+}
