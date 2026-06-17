@@ -13,6 +13,7 @@ use std::ffi::CStr;
 
 const COOPMAT_MATMUL_SPV: &[u8] = include_bytes!("shaders/coopmat_matmul.spv");
 const COOPMAT_GEMM_SPV: &[u8] = include_bytes!("shaders/coopmat_gemm.spv");
+const COOPMAT_Q4K_GEMM_SPV: &[u8] = include_bytes!("shaders/coopmat_q4k_gemm.spv");
 
 /// A minimal raw-Vulkan compute context with cooperative matrix enabled.
 pub struct VkContext {
@@ -442,6 +443,102 @@ impl VkContext {
         }
         Ok((out, ms))
     }
+
+    /// Q4_K coopmat prefill GEMM (Phase 2.1): C[M,N] = x[M,K] * dequant(W)[K,N]
+    /// where W is a raw Q4_K weight matrix [N,K] (`weight_bytes` = N*nb*144).
+    /// The weight is dequantized into the fp16 LDS tile before the coopmat
+    /// multiply. Returns C[M,N] (last run) + total GPU ms over `iters`.
+    /// This is the kernel that replaces the wgpu f32 Q4_K GEMM in prefill.
+    pub fn coopmat_q4k_gemm(&self, weight_bytes: &[u8], n: usize, nb: usize, x: &[f32], m: usize, iters: u32) -> Result<(Vec<f32>, f64), String> {
+        let k = nb * 256;
+        assert_eq!(weight_bytes.len(), n * nb * 144);
+        assert_eq!(x.len(), m * k);
+        assert!(m % 64 == 0 && n % 64 == 0);
+        unsafe { self.coopmat_q4k_gemm_inner(weight_bytes, n, nb, x, m, iters) }
+    }
+
+    unsafe fn coopmat_q4k_gemm_inner(&self, weight_bytes: &[u8], n: usize, nb: usize, x: &[f32], m: usize, iters: u32) -> Result<(Vec<f32>, f64), String> {
+        use std::time::Instant;
+        let dev = &self.device;
+        let k = nb * 256;
+        let (a_buf, a_mem, a_ptr) = self.uma_buffer((m * k * 2) as u64)?;
+        let (w_buf, w_mem, w_ptr) = self.uma_buffer(weight_bytes.len() as u64)?;
+        let (c_buf, c_mem, c_ptr) = self.uma_buffer((m * n * 4) as u64)?;
+        let (p_buf, p_mem, p_ptr) = self.uma_buffer(16)?;
+        let a16: Vec<u16> = x.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect();
+        std::ptr::copy_nonoverlapping(a16.as_ptr() as *const u8, a_ptr, m * k * 2);
+        std::ptr::copy_nonoverlapping(weight_bytes.as_ptr(), w_ptr, weight_bytes.len());
+        let dims = [m as u32, n as u32, k as u32, nb as u32];
+        std::ptr::copy_nonoverlapping(dims.as_ptr() as *const u8, p_ptr, 16);
+
+        let spv = ash::util::read_spv(&mut std::io::Cursor::new(COOPMAT_Q4K_GEMM_SPV)).map_err(|e| format!("read_spv: {e}"))?;
+        let module = dev.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spv), None).map_err(|e| format!("module: {e}"))?;
+
+        let mut bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..3)
+            .map(|b| vk::DescriptorSetLayoutBinding::default().binding(b).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE))
+            .collect();
+        bindings.push(vk::DescriptorSetLayoutBinding::default().binding(3).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE));
+        let set_layout = dev.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).map_err(|e| format!("setlayout: {e}"))?;
+        let pipeline_layout = dev.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(std::slice::from_ref(&set_layout)), None).map_err(|e| format!("playout: {e}"))?;
+
+        let entry = std::ffi::CString::new("main").unwrap();
+        let mut req_sg = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(32);
+        let stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE).module(module).name(&entry)
+            .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS).push_next(&mut req_sg);
+        let pipeline = dev.create_compute_pipelines(vk::PipelineCache::null(),
+            &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(pipeline_layout)], None)
+            .map_err(|(_, e)| format!("pipeline: {e}"))?[0];
+
+        let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&[
+            vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(3),
+            vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(1),
+        ]), None).map_err(|e| format!("pool: {e}"))?;
+        let set = dev.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(std::slice::from_ref(&set_layout))).map_err(|e| format!("allocset: {e}"))?[0];
+        let info = |buf| [vk::DescriptorBufferInfo::default().buffer(buf).range(vk::WHOLE_SIZE)];
+        let (ai, wi, ci, pi) = (info(a_buf), info(w_buf), info(c_buf), info(p_buf));
+        let writes = [
+            vk::WriteDescriptorSet::default().dst_set(set).dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&ai),
+            vk::WriteDescriptorSet::default().dst_set(set).dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&wi),
+            vk::WriteDescriptorSet::default().dst_set(set).dst_binding(2).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&ci),
+            vk::WriteDescriptorSet::default().dst_set(set).dst_binding(3).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&pi),
+        ];
+        dev.update_descriptor_sets(&writes, &[]);
+
+        let cmd_pool = dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(self.queue_family), None).map_err(|e| format!("cmdpool: {e}"))?;
+        let cmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).map_err(|e| format!("cmdbuf: {e}"))?[0];
+        let gx = (n / 64) as u32; let gy = (m / 64) as u32;
+        dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).map_err(|e| format!("begin: {e}"))?;
+        dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+        dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, pipeline_layout, 0, &[set], &[]);
+        let barrier = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
+        for _ in 0..iters {
+            dev.cmd_dispatch(cmd, gx, gy, 1);
+            dev.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[barrier], &[], &[]);
+        }
+        dev.end_command_buffer(cmd).map_err(|e| format!("end: {e}"))?;
+        let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| format!("fence: {e}"))?;
+        let cmds = [cmd];
+        let t0 = Instant::now();
+        dev.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence).map_err(|e| format!("submit: {e}"))?;
+        dev.wait_for_fences(&[fence], true, u64::MAX).map_err(|e| format!("wait: {e}"))?;
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        let mut out = vec![0f32; m * n];
+        std::ptr::copy_nonoverlapping(c_ptr as *const f32, out.as_mut_ptr(), m * n);
+
+        dev.destroy_fence(fence, None);
+        dev.destroy_command_pool(cmd_pool, None);
+        dev.destroy_descriptor_pool(pool, None);
+        dev.destroy_pipeline(pipeline, None);
+        dev.destroy_pipeline_layout(pipeline_layout, None);
+        dev.destroy_descriptor_set_layout(set_layout, None);
+        dev.destroy_shader_module(module, None);
+        for (buf, mem) in [(a_buf, a_mem), (w_buf, w_mem), (c_buf, c_mem), (p_buf, p_mem)] {
+            dev.unmap_memory(mem); dev.destroy_buffer(buf, None); dev.free_memory(mem, None);
+        }
+        Ok((out, ms))
+    }
 }
 
 impl Drop for VkContext {
@@ -531,5 +628,57 @@ mod tests {
             eprintln!("coopmat GEMM M={m:>4} N={n} K={k}: {per:6.3} ms/iter, {gflops:6.0} GFLOP/s", );
         }
         eprintln!("  reference: wgpu f32 Q4_K GEMM ~1000 GFLOP/s (M=256, 2.09ms); 8060S fp16 coopmat peak ~59000 GFLOP/s");
+    }
+
+    /// PHASE 2.1: the real Q4_K coopmat prefill GEMM (dequant folded into the
+    /// LDS staging). Validate vs the candle Q4_K dequant oracle, then measure
+    /// throughput — the number that directly replaces the wgpu f32 Q4_K GEMM.
+    /// `cargo test --release --features vulkan --lib vk_coopmat_q4k -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_coopmat_q4k_gemm_throughput() {
+        use candle_core::{Device, Tensor};
+        use candle_core::quantized::{QTensor, GgmlDType};
+        let ctx = match VkContext::new() {
+            Ok(c) => c,
+            Err(e) => { eprintln!("no Vulkan coopmat device ({e}); skipping"); return; }
+        };
+        // Correctness: small shape vs candle dequant oracle (f16 path → cosine).
+        let (n, nb, m) = (128usize, 2usize, 128usize);
+        let k = nb * 256;
+        let mut w = vec![0f32; n * k];
+        for i in 0..w.len() { w[i] = (((i as i64).wrapping_mul(2654435761) & 0xFFFF) as f32 / 32768.0 - 1.0) * 0.5; }
+        let qt = QTensor::quantize(&Tensor::from_vec(w, (n, k), &Device::Cpu).unwrap(), GgmlDType::Q4K).unwrap();
+        let bytes = qt.data().unwrap();
+        let deq: Vec<f32> = qt.dequantize(&Device::Cpu).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let x: Vec<f32> = (0..m * k).map(|i| ((i % 31) as f32 - 15.0) * 0.02).collect();
+        let (gpu, _) = ctx.coopmat_q4k_gemm(&bytes, n, nb, &x, m, 1).expect("q4k gemm");
+        let (mut dot, mut ng, mut nc) = (0f64, 0f64, 0f64);
+        for mm in 0..8 { for nn in 0..n {
+            let mut acc = 0f64;
+            for kk in 0..k { acc += (x[mm * k + kk] as f64) * (deq[nn * k + kk] as f64); }
+            let g = gpu[mm * n + nn] as f64;
+            dot += g * acc; ng += g * g; nc += acc * acc;
+        } }
+        let cos = dot / (ng.sqrt() * nc.sqrt());
+        eprintln!("coopmat Q4_K GEMM vs candle oracle: cosine = {cos:.5}");
+        assert!(cos > 0.99, "coopmat Q4_K GEMM wrong: cosine {cos}");
+
+        // Throughput at prefill scale (N=K=2048), the wgpu-GEMM replacement.
+        let (n, nb) = (2048usize, 8usize);
+        let k = nb * 256;
+        let mut w = vec![0f32; n * k];
+        for i in 0..w.len() { w[i] = (((i as i64).wrapping_mul(2654435761) & 0xFFFF) as f32 / 32768.0 - 1.0) * 0.5; }
+        let bytes = QTensor::quantize(&Tensor::from_vec(w, (n, k), &Device::Cpu).unwrap(), GgmlDType::Q4K).unwrap().data().unwrap().to_vec();
+        for &m in &[256usize, 512, 2048] {
+            let x: Vec<f32> = (0..m * k).map(|i| ((i % 31) as f32 - 15.0) * 0.01).collect();
+            let _ = ctx.coopmat_q4k_gemm(&bytes, n, nb, &x, m, 2).expect("warm");
+            let iters = 30u32;
+            let (_, ms) = ctx.coopmat_q4k_gemm(&bytes, n, nb, &x, m, iters).expect("bench");
+            let per = ms / iters as f64;
+            let gflops = 2.0 * (m * n * k) as f64 / (per / 1e3) / 1e9;
+            eprintln!("coopmat Q4_K GEMM M={m:>4} N={n} K={k}: {per:6.3} ms/iter, {gflops:6.0} GFLOP/s");
+        }
+        eprintln!("  vs wgpu f32 Q4_K GEMM: M=256 2.09ms (~1030 GFLOP/s), M=512 3.74ms (~1150)");
     }
 }
