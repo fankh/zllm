@@ -1,0 +1,17 @@
+// Decode RMSNorm: y = x * rsqrt(mean(x^2)+eps) * w, one vector (n_embd).
+#version 450 core
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly  buffer X_ { float x[]; };
+layout(binding = 1) readonly  buffer W_ { float w[]; };
+layout(binding = 2) writeonly buffer Y_ { float y[]; };
+layout(binding = 3) uniform   P_ { uint n; uint eps_bits; } p;
+shared float part[256];
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    float s = 0.0;
+    for (uint i = t; i < p.n; i += 256u) { float v = x[i]; s += v * v; }
+    part[t] = s; barrier();
+    for (uint st = 128u; st > 0u; st >>= 1u) { if (t < st) part[t] += part[t + st]; barrier(); }
+    float inv = inversesqrt(part[0] / float(p.n) + uintBitsToFloat(p.eps_bits));
+    for (uint i = t; i < p.n; i += 256u) { y[i] = x[i] * inv * w[i]; }
+}

@@ -15,6 +15,10 @@ const COOPMAT_MATMUL_SPV: &[u8] = include_bytes!("shaders/coopmat_matmul.spv");
 const COOPMAT_GEMM_SPV: &[u8] = include_bytes!("shaders/coopmat_gemm.spv");
 const COOPMAT_Q4K_GEMM_SPV: &[u8] = include_bytes!("shaders/coopmat_q4k_gemm.spv");
 const DECODE_MATVEC_Q4K_SPV: &[u8] = include_bytes!("shaders/decode_matvec_q4k.spv");
+const RMSNORM_SPV: &[u8] = include_bytes!("shaders/rmsnorm.spv");
+const ROPE_SPV: &[u8] = include_bytes!("shaders/rope.spv");
+const SDPA_DECODE_SPV: &[u8] = include_bytes!("shaders/sdpa_decode.spv");
+const SILU_MUL_SPV: &[u8] = include_bytes!("shaders/silu_mul.spv");
 
 /// A minimal raw-Vulkan compute context with cooperative matrix enabled.
 pub struct VkContext {
@@ -196,6 +200,26 @@ impl VkContext {
             .map_memory(mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
             .map_err(|e| format!("map_memory: {e}"))? as *mut u8;
         Ok((buf, mem, ptr))
+    }
+
+    /// Generic compute pipeline from SPIR-V: `n_storage` storage buffers at
+    /// bindings 0.., then a uniform at binding `n_storage`. Returns the pipeline
+    /// + its layouts (caller destroys). Used by the fused decode forward.
+    unsafe fn make_pipeline_raw(&self, spv: &[u8], n_storage: u32) -> (vk::Pipeline, vk::PipelineLayout, vk::DescriptorSetLayout, vk::ShaderModule) {
+        let words = ash::util::read_spv(&mut std::io::Cursor::new(spv)).unwrap();
+        let module = self.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None).unwrap();
+        let mut bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..n_storage)
+            .map(|b| vk::DescriptorSetLayoutBinding::default().binding(b).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE))
+            .collect();
+        bindings.push(vk::DescriptorSetLayoutBinding::default().binding(n_storage).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE));
+        let set_layout = self.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).unwrap();
+        let layout = self.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(std::slice::from_ref(&set_layout)), None).unwrap();
+        let entry = std::ffi::CString::new("main").unwrap();
+        let stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE).module(module).name(&entry);
+        let pipeline = self.device.create_compute_pipelines(vk::PipelineCache::null(),
+            &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout)], None).unwrap()[0];
+        (pipeline, layout, set_layout, module)
     }
 
     /// Spike: compute C[16,16] = A[16,16] * B[16,16] on the GPU via a single
@@ -912,4 +936,134 @@ mod tests {
         eprintln!("decode matvec projection: {forward_ms:.3} ms/token (matvecs only) => {tok_s:.0} tok/s");
         eprintln!("  vs current wgpu decode ~80 tok/s; llama.cpp iGPU 201; bandwidth wall ~280");
     }
+
+    /// FUSED DECODE FORWARD: the whole token forward (16 layers of
+    /// rmsnorm→QKV→RoPE→SDPA→O→rmsnorm→gate/up→silu→down, then final norm + LM
+    /// head) recorded in ONE command buffer with minimal per-dependency
+    /// barriers (the hand-managed barriers wgpu can't do). Dummy resident
+    /// weights — this measures whether the fused forward holds the ~237 tok/s
+    /// matvec throughput once the small ops + real barriers are included.
+    /// `cargo test --release --features vulkan --lib vk_fused_decode -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_fused_decode_throughput() {
+        use candle_core::{Device, Tensor};
+        use candle_core::quantized::{QTensor, GgmlDType};
+        let ctx = match VkContext::new() {
+            Ok(c) => c,
+            Err(e) => { eprintln!("no Vulkan coopmat device ({e}); skipping"); return; }
+        };
+        unsafe { fused_decode_inner(&ctx); }
+    }
+}
+
+#[cfg(test)]
+unsafe fn fused_decode_inner(ctx: &VkContext) {
+    use ash::vk;
+    use candle_core::{Device, Tensor};
+    use candle_core::quantized::{QTensor, GgmlDType};
+    use std::time::Instant;
+    let dev = &ctx.device;
+    // Llama-3.2-1B config.
+    let (n_embd, n_head, n_kv, hd, n_inter, vocab, n_layers, max_seq) =
+        (2048usize, 32usize, 8usize, 64usize, 8192usize, 128256usize, 16usize, 64usize);
+    let kv_dim = n_kv * hd;
+    let seq_len = 32u32; // realistic short-context decode depth
+    let eps = 1e-5f32;
+
+    let q4k = |n: usize, k: usize| -> Vec<u8> {
+        let mut w = vec![0f32; n * k];
+        for i in 0..w.len() { w[i] = (((i as i64).wrapping_mul(2654435761) & 0xFFFF) as f32 / 32768.0 - 1.0) * 0.5; }
+        QTensor::quantize(&Tensor::from_vec(w, (n, k), &Device::Cpu).unwrap(), GgmlDType::Q4K).unwrap().data().unwrap().to_vec()
+    };
+    let buf_bytes = |bytes: &[u8]| { let (b, _m, p) = ctx.uma_buffer(bytes.len() as u64).unwrap(); std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len()); b };
+    let buf_f32 = |len: usize| { let (b, _m, _p) = ctx.uma_buffer((len * 4) as u64).unwrap(); b };
+    let uni = |d: [u32; 4]| { let (b, _m, p) = ctx.uma_buffer(16).unwrap(); std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, p, 16); b };
+
+    // Resident dummy weights (shared across layers) + activations + KV cache.
+    let wq = buf_bytes(&q4k(n_embd, n_embd)); let wk = buf_bytes(&q4k(kv_dim, n_embd)); let wv = buf_bytes(&q4k(kv_dim, n_embd));
+    let wo = buf_bytes(&q4k(n_embd, n_embd)); let w1 = buf_bytes(&q4k(n_inter, n_embd)); let w3 = buf_bytes(&q4k(n_inter, n_embd));
+    let w2 = buf_bytes(&q4k(n_embd, n_inter)); let lm = buf_bytes(&q4k(vocab, n_embd));
+    let normw = buf_f32(n_embd); let cosb = buf_f32(hd / 2); let sinb = buf_f32(hd / 2);
+    let x = buf_f32(n_embd); let normed = buf_f32(n_embd); let q = buf_f32(n_embd); let k = buf_f32(kv_dim); let v = buf_f32(kv_dim);
+    let attn = buf_f32(n_embd); let gate = buf_f32(n_inter); let up = buf_f32(n_inter); let h = buf_f32(n_inter); let logits = buf_f32(vocab);
+    let kc = buf_f32(max_seq * kv_dim); let vc = buf_f32(max_seq * kv_dim);
+
+    // Pipelines (storage-buffer count per kernel).
+    let (mv_p, mv_l, mv_sl, _m0) = ctx.make_pipeline_raw(DECODE_MATVEC_Q4K_SPV, 3);
+    let (rn_p, rn_l, rn_sl, _m1) = ctx.make_pipeline_raw(RMSNORM_SPV, 3);
+    let (ro_p, ro_l, ro_sl, _m2) = ctx.make_pipeline_raw(ROPE_SPV, 3);
+    let (sd_p, sd_l, sd_sl, _m3) = ctx.make_pipeline_raw(SDPA_DECODE_SPV, 4);
+    let (si_p, si_l, si_sl, _m4) = ctx.make_pipeline_raw(SILU_MUL_SPV, 3);
+
+    let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(20).pool_sizes(&[
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(80),
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(20),
+    ]), None).unwrap();
+    let mkset = |sl: vk::DescriptorSetLayout, bufs: &[vk::Buffer], u: vk::Buffer| -> vk::DescriptorSet {
+        let set = dev.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(std::slice::from_ref(&sl))).unwrap()[0];
+        let mut infos: Vec<[vk::DescriptorBufferInfo; 1]> = bufs.iter().map(|&b| [vk::DescriptorBufferInfo::default().buffer(b).range(vk::WHOLE_SIZE)]).collect();
+        infos.push([vk::DescriptorBufferInfo::default().buffer(u).range(vk::WHOLE_SIZE)]);
+        let writes: Vec<vk::WriteDescriptorSet> = infos.iter().enumerate().map(|(i, info)| {
+            let ty = if i + 1 == infos.len() { vk::DescriptorType::UNIFORM_BUFFER } else { vk::DescriptorType::STORAGE_BUFFER };
+            vk::WriteDescriptorSet::default().dst_set(set).dst_binding(i as u32).descriptor_type(ty).buffer_info(info)
+        }).collect();
+        dev.update_descriptor_sets(&writes, &[]);
+        set
+    };
+    let gxof = |n: usize| (n as u32).min(65535);
+    let mvuni = |n: usize, kk: usize| uni([n as u32, kk as u32, (kk / 256) as u32, gxof(n)]);
+    // Descriptor sets (built once, reused every layer).
+    let s_rn = mkset(rn_sl, &[x, normw, normed], uni([n_embd as u32, eps.to_bits(), 0, 0]));
+    let s_wq = mkset(mv_sl, &[wq, normed, q], mvuni(n_embd, n_embd));
+    let s_wk = mkset(mv_sl, &[wk, normed, k], mvuni(kv_dim, n_embd));
+    let s_wv = mkset(mv_sl, &[wv, normed, v], mvuni(kv_dim, n_embd));
+    let s_rq = mkset(ro_sl, &[q, cosb, sinb], uni([n_head as u32, hd as u32, 0, 0]));
+    let s_rk = mkset(ro_sl, &[k, cosb, sinb], uni([n_kv as u32, hd as u32, 0, 0]));
+    let s_sd = mkset(sd_sl, &[q, kc, vc, attn], uni([n_head as u32, n_kv as u32, hd as u32, seq_len]));
+    let s_wo = mkset(mv_sl, &[wo, attn, x], mvuni(n_embd, n_embd));
+    let s_w1 = mkset(mv_sl, &[w1, normed, gate], mvuni(n_inter, n_embd));
+    let s_w3 = mkset(mv_sl, &[w3, normed, up], mvuni(n_inter, n_embd));
+    let s_si = mkset(si_sl, &[gate, up, h], uni([n_inter as u32, 0, 0, 0]));
+    let s_w2 = mkset(mv_sl, &[w2, h, x], mvuni(n_embd, n_inter));
+    let s_lm = mkset(mv_sl, &[lm, normed, logits], mvuni(vocab, n_embd));
+
+    let cmd_pool = dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family), None).unwrap();
+    let cmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).unwrap()[0];
+    let barr = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
+    let cs = vk::PipelineStageFlags::COMPUTE_SHADER;
+    dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+    let disp = |p: vk::Pipeline, l: vk::PipelineLayout, set: vk::DescriptorSet, gx: u32, gy: u32| {
+        dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p);
+        dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, l, 0, &[set], &[]);
+        dev.cmd_dispatch(cmd, gx, gy, 1);
+    };
+    let bar = || dev.cmd_pipeline_barrier(cmd, cs, cs, vk::DependencyFlags::empty(), &[barr], &[], &[]);
+    let mv = |set, n: usize| disp(mv_p, mv_l, set, gxof(n), (n as u32).div_ceil(gxof(n)));
+    for _ in 0..n_layers {
+        disp(rn_p, rn_l, s_rn, 1, 1); bar();                                          // attn norm
+        mv(s_wq, n_embd); mv(s_wk, kv_dim); mv(s_wv, kv_dim); bar();                   // QKV
+        disp(ro_p, ro_l, s_rq, ((n_head * hd / 2) as u32).div_ceil(64), 1);
+        disp(ro_p, ro_l, s_rk, ((n_kv * hd / 2) as u32).div_ceil(64), 1); bar();       // RoPE q,k
+        disp(sd_p, sd_l, s_sd, (n_head as u32).div_ceil(64), 1); bar();                // SDPA
+        mv(s_wo, n_embd); bar();                                                       // O proj
+        disp(rn_p, rn_l, s_rn, 1, 1); bar();                                          // ffn norm
+        mv(s_w1, n_inter); mv(s_w3, n_inter); bar();                                   // gate, up
+        disp(si_p, si_l, s_si, (n_inter as u32).div_ceil(64), 1); bar();              // silu·mul
+        mv(s_w2, n_embd); bar();                                                       // down proj
+    }
+    disp(rn_p, rn_l, s_rn, 1, 1); bar();                                              // final norm
+    mv(s_lm, vocab);                                                                   // LM head
+    dev.end_command_buffer(cmd).unwrap();
+
+    let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+    let cmds = [cmd];
+    let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+    for _ in 0..3 { dev.reset_fences(&[fence]).unwrap(); dev.queue_submit(ctx.queue, &[submit], fence).unwrap(); dev.wait_for_fences(&[fence], true, u64::MAX).unwrap(); } // warm
+    let toks = 30;
+    let t0 = Instant::now();
+    for _ in 0..toks { dev.reset_fences(&[fence]).unwrap(); dev.queue_submit(ctx.queue, &[submit], fence).unwrap(); dev.wait_for_fences(&[fence], true, u64::MAX).unwrap(); }
+    let per = t0.elapsed().as_secs_f64() * 1e3 / toks as f64;
+    eprintln!("FUSED decode forward: {per:.3} ms/token => {:.0} tok/s", 1000.0 / per);
+    eprintln!("  vs current wgpu decode ~80 tok/s; llama.cpp iGPU 201; matvec-only projection 237");
 }

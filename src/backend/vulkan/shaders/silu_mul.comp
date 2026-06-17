@@ -1,0 +1,13 @@
+// FFN gate: h = silu(gate) * up.
+#version 450 core
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly  buffer G_ { float gate[]; };
+layout(binding = 1) readonly  buffer U_ { float up[];   };
+layout(binding = 2) writeonly buffer H_ { float h[];    };
+layout(binding = 3) uniform   P_ { uint n; uint p0; uint p1; uint p2; } p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) { return; }
+    float g = gate[i];
+    h[i] = (g / (1.0 + exp(-g))) * up[i];
+}

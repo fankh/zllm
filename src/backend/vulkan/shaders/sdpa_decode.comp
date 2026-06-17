@@ -1,0 +1,29 @@
+// Decode GQA SDPA: one query at the latest position attends KV cache 0..seq_len-1
+// via online (flash) softmax. Thread per query head.
+#version 450 core
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly  buffer Q_  { float q[];    };  // [n_head*hd]
+layout(binding = 1) readonly  buffer KC_ { float kc[];   };  // [seq, n_kv*hd]
+layout(binding = 2) readonly  buffer VC_ { float vc[];   };
+layout(binding = 3) writeonly buffer O_  { float outp[]; };  // [n_head*hd]
+layout(binding = 4) uniform   P_ { uint n_head; uint n_kv; uint hd; uint seq_len; } p;
+void main() {
+    uint h = gl_GlobalInvocationID.x;
+    if (h >= p.n_head) { return; }
+    uint kvh = h / (p.n_head / p.n_kv);
+    float scale = 1.0 / sqrt(float(p.hd));
+    uint qb = h * p.hd;
+    float av[128]; for (uint d = 0u; d < p.hd; d++) { av[d] = 0.0; }
+    float mx = -1e30; float l = 0.0;
+    for (uint t = 0u; t < p.seq_len; t++) {
+        uint kb = (t * p.n_kv + kvh) * p.hd;
+        float s = 0.0; for (uint d = 0u; d < p.hd; d++) { s += q[qb + d] * kc[kb + d]; }
+        s *= scale;
+        float mn = max(mx, s); float corr = exp(mx - mn); float pe = exp(s - mn);
+        l = l * corr + pe;
+        for (uint d = 0u; d < p.hd; d++) { av[d] = av[d] * corr + pe * vc[kb + d]; }
+        mx = mn;
+    }
+    float inv = 1.0 / l;
+    for (uint d = 0u; d < p.hd; d++) { outp[qb + d] = av[d] * inv; }
+}

@@ -1,0 +1,17 @@
+// Decode interleaved RoPE, in-place on q or k ([n_head*head_dim]) at one position.
+#version 450 core
+layout(local_size_x = 64) in;
+layout(binding = 0)          buffer XB_  { float xb[];   };
+layout(binding = 1) readonly buffer COS_ { float cosb[]; };  // [head_dim/2]
+layout(binding = 2) readonly buffer SIN_ { float sinb[]; };
+layout(binding = 3) uniform  P_ { uint n_head; uint head_dim; uint p0; uint p1; } p;
+void main() {
+    uint hd2 = p.head_dim / 2u;
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.n_head * hd2) { return; }
+    uint h = idx / hd2; uint j = idx % hd2;
+    float c = cosb[j]; float s = sinb[j];
+    uint base = h * p.head_dim + 2u * j;
+    float a = xb[base]; float b = xb[base + 1u];
+    xb[base] = a * c - b * s; xb[base + 1u] = a * s + b * c;
+}
