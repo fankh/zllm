@@ -22,33 +22,14 @@ layout(binding = 3) uniform   P_ { uint M; uint N; uint K; uint nb; } p;
 
 const uint BM = 64u;
 const uint BN = 64u;
-const uint BK = 16u;
+const uint BK = 16u;   // half a Q4_K sub-block — 4 KB LDS keeps occupancy high (BK=32/8 KB
+                       // was faster at M=512 but slower at M=256, the short-prompt case)
 shared float16_t As[BM * BK];
 shared float16_t Bs[BK * BN];
-
-// Dequantize one Q4_K weight at (output row n, input col k).
-float deq_q4k(uint n, uint k) {
-    uint b = k / 256u;
-    uint pp = k % 256u;
-    uint sub = pp / 32u;
-    uint local = pp % 32u;
-    uint blk = (n * p.nb + b) * 36u;
-    vec2 dd = unpackHalf2x16(wq[blk]);
-    float d = dd.x; float dmin = dd.y;
-    uint u0 = wq[blk + 1u]; uint u1 = wq[blk + 2u]; uint u2 = wq[blk + 3u];
-    uint u3 = ((u2 >> 4u) & 0x0f0f0f0fu) | (((u1 >> 6u) & 0x03030303u) << 4u);
-    uint uaux = u1 & 0x3f3f3f3fu;
-    u1 = (u2 & 0x0f0f0f0fu) | (((u0 >> 6u) & 0x03030303u) << 4u);
-    u2 = uaux; u0 = u0 & 0x3f3f3f3fu;
-    float sc; float mn;
-    if (sub < 4u) { sc = float((u0 >> (sub * 8u)) & 0xffu); mn = float((u2 >> (sub * 8u)) & 0xffu); }
-    else          { sc = float((u1 >> ((sub - 4u) * 8u)) & 0xffu); mn = float((u3 >> ((sub - 4u) * 8u)) & 0xffu); }
-    uint qs0 = blk + 4u + (sub / 2u) * 8u;
-    uint word = wq[qs0 + local / 4u];
-    uint byte = (word >> ((local % 4u) * 8u)) & 0xffu;
-    uint q = ((sub & 1u) == 1u) ? (byte >> 4u) : (byte & 0x0fu);
-    return d * sc * float(q) - dmin * mn;
-}
+// Cached per-row Q4_K dequant scale (d*scale and dmin*min) for the current
+// K-chunk's sub-block — unpacked once per weight row instead of per element.
+shared float dscLDS[BN];
+shared float dmnLDS[BN];
 
 void main() {
     uint tileM = gl_WorkGroupID.y * BM;
@@ -63,14 +44,43 @@ void main() {
     acc01 = acc00; acc10 = acc00; acc11 = acc00;
 
     for (uint k0 = 0u; k0 < p.K; k0 += BK) {
+        // A BK=16 chunk stays within one Q4_K sub-block, so b/sub/lo are
+        // constant across the chunk and the 6-bit scale is shared per weight row.
+        uint b = k0 / 256u;
+        uint sub = (k0 / 32u) % 8u;
+        uint lo = k0 % 32u;                 // 0 or 16 (half of the sub-block)
         for (uint i = tid; i < BM * BK; i += 128u) {
             uint r = i / BK; uint c = i % BK;
             As[i] = A[(tileM + r) * p.K + k0 + c];
         }
-        // B tile: dequant Q4_K, transposed into [BK][BN] (Bs[kk][nn] = W[tileN+nn][k0+kk]).
+        // Unpack the sub-block scale ONCE per weight row (64), cache in LDS.
+        for (uint i = tid; i < BN; i += 128u) {
+            uint n = tileN + i;
+            uint blk = (n * p.nb + b) * 36u;
+            vec2 dd = unpackHalf2x16(wq[blk]);
+            uint u0 = wq[blk + 1u]; uint u1 = wq[blk + 2u]; uint u2 = wq[blk + 3u];
+            uint u3 = ((u2 >> 4u) & 0x0f0f0f0fu) | (((u1 >> 6u) & 0x03030303u) << 4u);
+            uint uaux = u1 & 0x3f3f3f3fu;
+            u1 = (u2 & 0x0f0f0f0fu) | (((u0 >> 6u) & 0x03030303u) << 4u);
+            u2 = uaux; u0 = u0 & 0x3f3f3f3fu;
+            float scf; float mnf;
+            if (sub < 4u) { scf = float((u0 >> (sub * 8u)) & 0xffu); mnf = float((u2 >> (sub * 8u)) & 0xffu); }
+            else          { scf = float((u1 >> ((sub - 4u) * 8u)) & 0xffu); mnf = float((u3 >> ((sub - 4u) * 8u)) & 0xffu); }
+            dscLDS[i] = dd.x * scf;
+            dmnLDS[i] = dd.y * mnf;
+        }
+        barrier();
+        // B tile: extract the 4-bit quant + apply the cached scale (no per-
+        // element scale unpack). Bs[kk][nn] = dequant(W[tileN+nn][k0+kk]).
         for (uint i = tid; i < BK * BN; i += 128u) {
             uint kk = i / BN; uint nn = i % BN;
-            Bs[i] = float16_t(deq_q4k(tileN + nn, k0 + kk));
+            uint blk = ((tileN + nn) * p.nb + b) * 36u;
+            uint local = lo + kk;
+            uint qs0 = blk + 4u + (sub / 2u) * 8u;
+            uint word = wq[qs0 + local / 4u];
+            uint byte = (word >> ((local % 4u) * 8u)) & 0xffu;
+            uint q = ((sub & 1u) == 1u) ? (byte >> 4u) : (byte & 0x0fu);
+            Bs[i] = float16_t(dscLDS[nn] * float(q) - dmnLDS[nn]);
         }
         barrier();
 
