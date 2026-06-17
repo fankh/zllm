@@ -681,4 +681,50 @@ mod tests {
         }
         eprintln!("  vs wgpu f32 Q4_K GEMM: M=256 2.09ms (~1030 GFLOP/s), M=512 3.74ms (~1150)");
     }
+
+    /// END-TO-END PROJECTION: measure the coopmat Q4_K GEMM time for a full
+    /// Llama-3.2-1B forward's worth of GEMMs (the dominant prefill cost) and
+    /// project prefill tok/s — the number that replaces the current ~492.
+    /// (GEMM-only; norm/rope/sdpa would add some overhead, so this is an upper
+    /// bound on a coopmat prefill.)
+    /// `cargo test --release --features vulkan --lib vk_coopmat_prefill -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_coopmat_prefill_projection() {
+        use candle_core::{Device, Tensor};
+        use candle_core::quantized::{QTensor, GgmlDType};
+        let ctx = match VkContext::new() {
+            Ok(c) => c,
+            Err(e) => { eprintln!("no Vulkan coopmat device ({e}); skipping"); return; }
+        };
+        // Llama-3.2-1B per-layer GEMM shapes: (N_out, K_in, count/layer).
+        let shapes: [(usize, usize, usize); 4] = [
+            (2048, 2048, 2), // wq, wo
+            (512, 2048, 2),  // wk, wv
+            (8192, 2048, 2), // w1 (gate), w3 (up)
+            (2048, 8192, 1), // w2 (down)
+        ];
+        let n_layers = 16usize;
+        let mk_weight = |n: usize, k: usize| -> Vec<u8> {
+            let mut w = vec![0f32; n * k];
+            for i in 0..w.len() { w[i] = (((i as i64).wrapping_mul(2654435761) & 0xFFFF) as f32 / 32768.0 - 1.0) * 0.5; }
+            QTensor::quantize(&Tensor::from_vec(w, (n, k), &Device::Cpu).unwrap(), GgmlDType::Q4K).unwrap().data().unwrap().to_vec()
+        };
+        for &m in &[256usize, 512] {
+            let mut forward_ms = 0f64;
+            for &(n, k, count) in &shapes {
+                let nb = k / 256;
+                let bytes = mk_weight(n, k);
+                let x: Vec<f32> = (0..m * k).map(|i| ((i % 31) as f32 - 15.0) * 0.01).collect();
+                let _ = ctx.coopmat_q4k_gemm(&bytes, n, nb, &x, m, 2).expect("warm");
+                let iters = 30u32;
+                let (_, ms) = ctx.coopmat_q4k_gemm(&bytes, n, nb, &x, m, iters).expect("bench");
+                forward_ms += (ms / iters as f64) * count as f64;
+            }
+            forward_ms *= n_layers as f64;
+            let tok_s = m as f64 / (forward_ms / 1e3);
+            eprintln!("coopmat prefill GEMM projection: M={m:>4} -> {forward_ms:6.1} ms/forward (GEMMs only) => {tok_s:5.0} tok/s");
+        }
+        eprintln!("  vs current wgpu prefill ~492 tok/s (incl norm/rope/sdpa); llama.cpp iGPU 5747");
+    }
 }
