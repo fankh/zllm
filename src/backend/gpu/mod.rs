@@ -3060,54 +3060,108 @@ impl<'a> BatchedDecoder<'a> {
     /// blocks' KV is bit-identical to recomputing them (KV at position p depends
     /// only on tokens[0..=p]), so output is unchanged — just less prefill compute.
     pub fn prefill_slot_cached(&self, prompt: &[u32], slot: u32, samp: Option<(f32, u32)>) -> (u32, usize) {
-        let p = prompt.len();
-        assert!(p >= 1 && p <= self.max_seq);
-        let bsz = self.block_size;
-        // Never reuse the block holding the last position — we need its logits.
-        let max_reuse = (p - 1) / bsz;
-        // 1. Match the longest cached full-block prefix; reuse those blocks.
-        let mut cached_blocks = 0usize;
-        let mut hashes: Vec<u64> = Vec::with_capacity(max_reuse);
-        {
-            let mut bs = self.blocks.borrow_mut();
-            let mut prev_h = 0u64;
-            for lb in 0..max_reuse {
-                let h = prefix_block_hash(prev_h, &prompt[lb * bsz..(lb + 1) * bsz]);
-                hashes.push(h);
-                prev_h = h;
-                match bs.cache_map.get(&h).copied() {
-                    Some(phys) => {
-                        bs.refcount[phys as usize] += 1;
-                        bs.slot_blocks[slot as usize].push(phys);
-                        bs.table_host[slot as usize * self.max_blocks_per_seq + lb] = phys;
-                        cached_blocks += 1;
-                    }
-                    None => break,
-                }
-            }
-            bs.hits += cached_blocks as u64;
-        }
-        let cached_len = cached_blocks * bsz;
-        // 2. Prefill the suffix [cached_len .. p) (new blocks allocated on demand).
+        assert!(!prompt.is_empty() && prompt.len() <= self.max_seq);
+        let (cached_len, cached_blocks) = self.prefill_prefix_reuse(prompt, slot);
         let first = self.prefill_slot_from(prompt, slot, cached_len, samp);
-        // 3. Register the newly-filled FULL blocks so later prompts can reuse them.
-        {
-            let mut bs = self.blocks.borrow_mut();
-            let n_full = p / bsz;
-            let mut prev_h = if cached_blocks > 0 { hashes[cached_blocks - 1] } else { 0u64 };
-            bs.misses += (n_full - cached_blocks) as u64;
-            for lb in cached_blocks..n_full {
-                let h = prefix_block_hash(prev_h, &prompt[lb * bsz..(lb + 1) * bsz]);
-                prev_h = h;
-                let phys = bs.slot_blocks[slot as usize][lb];
-                // Only register if not already mapped (first writer owns the entry).
-                if !bs.cache_map.contains_key(&h) {
-                    bs.cache_map.insert(h, phys);
-                    bs.block_hash[phys as usize] = Some(h);
+        self.prefill_register(prompt, slot, cached_blocks);
+        (first, cached_len)
+    }
+
+    /// Reuse the longest cached full-block prefix of `prompt` for `slot` (refcount++
+    /// each reused block, point the slot's block table at it). Returns
+    /// (cached_len, cached_blocks). The block holding the last position is never
+    /// reused (its logits are needed), so cached_len < prompt.len().
+    fn prefill_prefix_reuse(&self, prompt: &[u32], slot: u32) -> (usize, usize) {
+        let bsz = self.block_size;
+        let max_reuse = (prompt.len() - 1) / bsz;
+        let mut cached_blocks = 0usize;
+        let mut bs = self.blocks.borrow_mut();
+        let mut prev_h = 0u64;
+        for lb in 0..max_reuse {
+            let h = prefix_block_hash(prev_h, &prompt[lb * bsz..(lb + 1) * bsz]);
+            prev_h = h;
+            match bs.cache_map.get(&h).copied() {
+                Some(phys) => {
+                    bs.refcount[phys as usize] += 1;
+                    bs.slot_blocks[slot as usize].push(phys);
+                    bs.table_host[slot as usize * self.max_blocks_per_seq + lb] = phys;
+                    cached_blocks += 1;
                 }
+                None => break,
             }
         }
-        (first, cached_len)
+        bs.hits += cached_blocks as u64;
+        (cached_blocks * bsz, cached_blocks)
+    }
+
+    /// Register `slot`'s newly-filled FULL blocks (logical `cached_blocks..n_full`)
+    /// in the prefix cache so later prompts can reuse them. Call once prefill is
+    /// complete (the blocks must be written).
+    fn prefill_register(&self, prompt: &[u32], slot: u32, cached_blocks: usize) {
+        let bsz = self.block_size;
+        let n_full = prompt.len() / bsz;
+        if cached_blocks >= n_full { return; }
+        let mut bs = self.blocks.borrow_mut();
+        let mut prev_h = 0u64;
+        for lb in 0..cached_blocks { prev_h = prefix_block_hash(prev_h, &prompt[lb * bsz..(lb + 1) * bsz]); }
+        bs.misses += (n_full - cached_blocks) as u64;
+        for lb in cached_blocks..n_full {
+            let h = prefix_block_hash(prev_h, &prompt[lb * bsz..(lb + 1) * bsz]);
+            prev_h = h;
+            let phys = bs.slot_blocks[slot as usize][lb];
+            if !bs.cache_map.contains_key(&h) { bs.cache_map.insert(h, phys); bs.block_hash[phys as usize] = Some(h); }
+        }
+    }
+
+    /// Number of prompt tokens prefilled per `prefill_chunk` call.
+    pub fn prefill_chunk_size(&self) -> usize { self.row_cap }
+
+    /// Max context length per sequence (positions).
+    pub fn max_seq_len(&self) -> usize { self.max_seq }
+
+    /// Prefill ONE chunk — positions `[start .. min(start+chunk_size, len))` — of
+    /// `prompt` into `slot` (the prefix `[0..start)` must already be resident).
+    /// Returns (new_start, first_token_if_complete). When the chunk reaches the
+    /// prompt's end it also runs the lm_head and returns the first generated token.
+    /// Lets the scheduler interleave a long prompt's prefill with decode steps.
+    pub fn prefill_chunk(&self, prompt: &[u32], slot: u32, start: usize, samp: Option<(f32, u32)>) -> (usize, Option<u32>) {
+        let ctx = &self.model.ctx;
+        let p = prompt.len();
+        assert!(start < p);
+        let (n_embd, eps) = (self.model.n_embd, self.model.eps);
+        let end = (start + self.row_cap).min(p);
+        let m = end - start;
+        let toks = &prompt[start..end];
+        let positions: Vec<u32> = (start..end).map(|x| x as u32).collect();
+        let slots = vec![slot; m];
+        self.write_inputs(toks, &positions, &slots);
+        let phys = self.prepare_paging(m, &positions, &slots);
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        self.record_layers(&mut enc, m, &phys);
+        let is_last = end == p;
+        let (tarr, sarr): ([f32; 1], [u32; 1]);
+        let sampling = match samp { Some((t, s)) => { (tarr, sarr) = ([t], [s]); Some((&tarr[..], &sarr[..])) } None => None };
+        if is_last {
+            ctx.record_bnorm(&mut enc, &self.x_b, &self.model.final_norm_w, &self.normed_b, n_embd, eps, m);
+            let src = if m > 1 {
+                enc.copy_buffer_to_buffer(&self.normed_b, ((m - 1) * n_embd * 4) as u64, &self.q_b, 0, (n_embd * 4) as u64);
+                &self.q_b
+            } else { &self.normed_b };
+            ctx.record_gemm(&mut enc, &self.model.lm_head, src, &self.logits_b, n_embd, 1, 0);
+            self.record_select(&mut enc, 1, sampling);
+            enc.copy_buffer_to_buffer(&self.argmax_out, 0, &self.argmax_read, 0, 4);
+        }
+        ctx.queue.submit([enc.finish()]);
+        ctx.device.poll(wgpu::Maintain::Wait);
+        let g0 = if is_last {
+            let slice = self.argmax_read.slice(..4);
+            slice.map_async(wgpu::MapMode::Read, |_| {});
+            ctx.device.poll(wgpu::Maintain::Wait);
+            let v = bytemuck::cast_slice::<u8, u32>(&slice.get_mapped_range())[0];
+            self.argmax_read.unmap();
+            Some(v)
+        } else { None };
+        (end, g0)
     }
 
     /// Prefill `prompt` positions `[start_pos .. len)` into `slot`, assuming the
@@ -3115,49 +3169,13 @@ impl<'a> BatchedDecoder<'a> {
     /// cache blocks). The first generated token is greedy (`samp = None`) or drawn
     /// from softmax(logits/temp) with a single `(temp, seed)`.
     pub fn prefill_slot_from(&self, prompt: &[u32], slot: u32, start_pos: usize, samp: Option<(f32, u32)>) -> u32 {
-        let ctx = &self.model.ctx;
-        let p = prompt.len();
-        assert!(p >= 1, "prefill needs a non-empty prompt");
-        assert!(p <= self.max_seq, "prompt len {p} exceeds max_seq {}", self.max_seq);
-        assert!(start_pos < p, "start_pos {start_pos} must be < prompt len {p}");
-        let (n_embd, eps) = (self.model.n_embd, self.model.eps);
-        let (tarr, sarr): ([f32; 1], [u32; 1]);
-        let sampling = match samp { Some((t, s)) => { (tarr, sarr) = ([t], [s]); Some((&tarr[..], &sarr[..])) } None => None };
+        assert!(!prompt.is_empty() && prompt.len() <= self.max_seq && start_pos < prompt.len());
         let mut first_tok = 0u32;
         let mut start = start_pos;
-        while start < p {
-            let end = (start + self.row_cap).min(p);
-            let m = end - start;
-            let toks = &prompt[start..end];
-            let positions: Vec<u32> = (start..end).map(|x| x as u32).collect();
-            let slots = vec![slot; m];
-            self.write_inputs(toks, &positions, &slots);
-            let phys = self.prepare_paging(m, &positions, &slots);
-            let mut enc = ctx.device.create_command_encoder(&Default::default());
-            self.record_layers(&mut enc, m, &phys);
-            let is_last = end == p;
-            if is_last {
-                // Only the final prompt token's logits matter (the first output).
-                ctx.record_bnorm(&mut enc, &self.x_b, &self.model.final_norm_w, &self.normed_b, n_embd, eps, m);
-                // Pull the last row to the front so lm_head runs a single row.
-                let src = if m > 1 {
-                    enc.copy_buffer_to_buffer(&self.normed_b, ((m - 1) * n_embd * 4) as u64, &self.q_b, 0, (n_embd * 4) as u64);
-                    &self.q_b
-                } else { &self.normed_b };
-                ctx.record_gemm(&mut enc, &self.model.lm_head, src, &self.logits_b, n_embd, 1, 0);
-                self.record_select(&mut enc, 1, sampling);
-                enc.copy_buffer_to_buffer(&self.argmax_out, 0, &self.argmax_read, 0, 4);
-            }
-            ctx.queue.submit([enc.finish()]);
-            ctx.device.poll(wgpu::Maintain::Wait);
-            if is_last {
-                let slice = self.argmax_read.slice(..4);
-                slice.map_async(wgpu::MapMode::Read, |_| {});
-                ctx.device.poll(wgpu::Maintain::Wait);
-                first_tok = bytemuck::cast_slice::<u8, u32>(&slice.get_mapped_range())[0];
-                self.argmax_read.unmap();
-            }
-            start = end;
+        while start < prompt.len() {
+            let (next, g) = self.prefill_chunk(prompt, slot, start, samp);
+            if let Some(g0) = g { first_tok = g0; }
+            start = next;
         }
         first_tok
     }
@@ -3258,6 +3276,13 @@ impl CbSeq {
 /// never preempting (KV at p depends only on tokens[0..=p]; same seed index).
 struct PreemptedSeq { id: u64, tokens: Vec<u32>, prompt_len: usize, max_tokens: usize, eos: u32, params: SamplingParams, base_seed: u32 }
 
+/// A sequence mid-prefill. Its prompt is prefilled one chunk per scheduler step
+/// (interleaved with decode of the active batch, so a long prompt doesn't stall
+/// in-flight requests). `prefill_pos` is the next position to prefill (starts at
+/// the prefix cache's reused length); `cached_blocks` = blocks reused, registered
+/// once prefill completes.
+struct PrefillingSeq { id: u64, slot: u32, prompt: Vec<u32>, prompt_len: usize, prefill_pos: usize, cached_blocks: usize, max_tokens: usize, eos: u32, params: SamplingParams, base_seed: u32 }
+
 /// Per-token sampling seed: decorrelate by generation index (the kernel further
 /// hashes (seed, token_id), so a cheap mix here is enough).
 fn step_seed(base: u32, gen_idx: u32) -> u32 { base.wrapping_add(gen_idx.wrapping_mul(0x9E3779B1)) }
@@ -3321,12 +3346,14 @@ pub struct ContinuousBatcher<'a> {
     active: Vec<CbSeq>,
     /// Sequences evicted under KV-pool pressure, awaiting reschedule (recompute).
     preempted: std::collections::VecDeque<PreemptedSeq>,
+    /// Sequences mid-prefill (one chunk advanced per step, interleaved with decode).
+    prefilling: std::collections::VecDeque<PrefillingSeq>,
     preemptions: u64,
 }
 
 impl<'a> ContinuousBatcher<'a> {
     pub fn new(model: &'a GpuModel, m_max: usize, max_seq: usize) -> Self {
-        Self { dec: model.batched_decoder(m_max, max_seq), free: (0..m_max as u32).rev().collect(), active: Vec::new(), preempted: Default::default(), preemptions: 0 }
+        Self { dec: model.batched_decoder(m_max, max_seq), free: (0..m_max as u32).rev().collect(), active: Vec::new(), preempted: Default::default(), prefilling: Default::default(), preemptions: 0 }
     }
 
     /// Continuous batcher over a paged KV pool of `n_blocks` blocks shared by all
@@ -3335,10 +3362,12 @@ impl<'a> ContinuousBatcher<'a> {
     /// could not. Admission is optimistic; if a running sequence can't grow, a
     /// victim is preempted (its KV freed) and recomputed later.
     pub fn with_pool(model: &'a GpuModel, m_max: usize, max_seq: usize, n_blocks: usize) -> Self {
-        Self { dec: model.batched_decoder_paged(m_max, max_seq, n_blocks), free: (0..m_max as u32).rev().collect(), active: Vec::new(), preempted: Default::default(), preemptions: 0 }
+        Self { dec: model.batched_decoder_paged(m_max, max_seq, n_blocks), free: (0..m_max as u32).rev().collect(), active: Vec::new(), preempted: Default::default(), prefilling: Default::default(), preemptions: 0 }
     }
     pub fn has_free(&self) -> bool { !self.free.is_empty() }
     pub fn active_len(&self) -> usize { self.active.len() }
+    /// Sequences currently mid-prefill (chunked).
+    pub fn prefilling_len(&self) -> usize { self.prefilling.len() }
     /// Sequences currently preempted (evicted, awaiting recompute).
     pub fn preempted_len(&self) -> usize { self.preempted.len() }
     /// Total preemptions since construction (observability).
@@ -3387,10 +3416,25 @@ impl<'a> ContinuousBatcher<'a> {
         Some((g, done))
     }
 
-    /// One decode step over all active sequences. Returns (id, new_token, done)
-    /// for each — including tokens from any sequence resumed this step. Evicts
-    /// finished sequences (frees slot + KV blocks); under pool pressure, preempts
-    /// (evicts + queues for recompute) victims so running sequences can grow.
+    /// Enqueue a sequence for CHUNKED prefill: assign a slot, reuse any cached
+    /// prefix, then prefill one chunk per `step()` (interleaved with decode of the
+    /// active batch, so a long prompt doesn't stall in-flight requests) until the
+    /// prompt completes and it joins the decode batch. The first token is emitted
+    /// by a later `step()`, not returned here. Returns false if no slot is free or
+    /// the pool can't fit the prompt.
+    pub fn enqueue_params(&mut self, id: u64, prompt: Vec<u32>, max_tokens: usize, eos: u32, params: SamplingParams, seed: u32) -> bool {
+        if prompt.is_empty() || prompt.len() > self.dec.max_seq_len() { return false; }
+        if self.free.is_empty() || !self.dec.can_fit(prompt.len()) { return false; }
+        let slot = self.free.pop().unwrap();
+        let prompt_len = prompt.len();
+        let (cached_len, cached_blocks) = self.dec.prefill_prefix_reuse(&prompt, slot);
+        self.prefilling.push_back(PrefillingSeq { id, slot, prompt, prompt_len, prefill_pos: cached_len, cached_blocks, max_tokens, eos, params, base_seed: seed });
+        true
+    }
+
+    /// One scheduler step: decode the active batch, advance one chunk of the front
+    /// prefilling sequence, and resume any preempted sequences that now fit.
+    /// Returns (id, new_token, done) for every token produced this step.
     pub fn step(&mut self) -> Vec<(u64, u32, bool)> {
         let mut out = Vec::new();
         if !self.active.is_empty() {
@@ -3423,8 +3467,39 @@ impl<'a> ContinuousBatcher<'a> {
                 !done
             });
         }
+        self.advance_prefill(&mut out); // one prefill chunk, interleaved with decode
         self.reschedule(&mut out); // resume preempted sequences that now fit
         out
+    }
+
+    /// Preempt the most-recently-admitted active sequence (LIFO), queuing it for
+    /// recompute. Returns false if there are no active sequences.
+    fn preempt_last_active(&mut self) -> bool {
+        let Some(victim) = self.active.pop() else { return false };
+        self.dec.free_slot(victim.slot);
+        self.free.push(victim.slot);
+        self.preemptions += 1;
+        self.preempted.push_back(PreemptedSeq {
+            id: victim.id, tokens: victim.tokens, prompt_len: victim.prompt_len,
+            max_tokens: victim.max_tokens, eos: victim.eos, params: victim.params, base_seed: victim.base_seed,
+        });
+        true
+    }
+
+    /// Preempt the most-recently-enqueued *prefilling* sequence (not the front).
+    /// It has produced no tokens, so it re-prefills its prompt from scratch on
+    /// reschedule. Returns false if there is at most the front prefilling sequence.
+    fn preempt_last_prefill(&mut self) -> bool {
+        if self.prefilling.len() < 2 { return false; }
+        let pf = self.prefilling.pop_back().unwrap();
+        self.dec.free_slot(pf.slot);
+        self.free.push(pf.slot);
+        self.preemptions += 1;
+        self.preempted.push_back(PreemptedSeq {
+            id: pf.id, tokens: pf.prompt, prompt_len: pf.prompt_len,
+            max_tokens: pf.max_tokens, eos: pf.eos, params: pf.params, base_seed: pf.base_seed,
+        });
+        true
     }
 
     /// Preempt (LIFO) active sequences until the pool can supply the blocks every
@@ -3435,14 +3510,40 @@ impl<'a> ContinuousBatcher<'a> {
             active.iter().map(|s| b.blocks_short(s.slot, s.tokens.len())).sum()
         };
         while self.active.len() > 1 && self.dec.free_blocks() < needed(&self.dec, &self.active) {
-            let victim = self.active.pop().unwrap(); // most recently admitted
-            self.dec.free_slot(victim.slot);
-            self.free.push(victim.slot);
-            self.preemptions += 1;
-            self.preempted.push_back(PreemptedSeq {
-                id: victim.id, tokens: victim.tokens, prompt_len: victim.prompt_len,
-                max_tokens: victim.max_tokens, eos: victim.eos, params: victim.params, base_seed: victim.base_seed,
-            });
+            self.preempt_last_active();
+        }
+    }
+
+    /// Advance the front prefilling sequence by one chunk (prefill-priority: makes
+    /// room by preempting active — then, if still short, other prefilling — so the
+    /// front always progresses). On completion, registers its blocks and the
+    /// sequence joins the decode batch, emitting its first token into `out`.
+    fn advance_prefill(&mut self, out: &mut Vec<(u64, u32, bool)>) {
+        if self.prefilling.is_empty() { return; }
+        let (slot, start, chunk_end, temp, base_seed) = {
+            let pf = &self.prefilling[0];
+            let end = (pf.prefill_pos + self.dec.prefill_chunk_size()).min(pf.prompt_len);
+            (pf.slot, pf.prefill_pos, end, pf.params.temp, pf.base_seed)
+        };
+        // Make the chunk's blocks fit (preempt active first, then other prefills).
+        while self.dec.blocks_short(slot, chunk_end) > self.dec.free_blocks() {
+            if !self.preempt_last_active() && !self.preempt_last_prefill() { return; } // can't fit yet; wait
+        }
+        let samp = if temp > 0.0 { Some((temp, step_seed(base_seed, 0))) } else { None };
+        let (next, g0) = self.dec.prefill_chunk(&self.prefilling[0].prompt, slot, start, samp);
+        self.prefilling[0].prefill_pos = next;
+        let Some(g) = g0 else { return }; // chunk done but prompt not complete
+        let pf = self.prefilling.pop_front().unwrap();
+        self.dec.prefill_register(&pf.prompt, pf.slot, pf.cached_blocks);
+        let done = pf.max_tokens <= 1 || g == pf.eos;
+        out.push((pf.id, g, done));
+        if done {
+            self.dec.free_slot(pf.slot);
+            self.free.push(pf.slot);
+        } else {
+            let mut tokens = pf.prompt;
+            tokens.push(g);
+            self.active.push(CbSeq { id: pf.id, slot: pf.slot, tokens, prompt_len: pf.prompt_len, max_tokens: pf.max_tokens, eos: pf.eos, params: pf.params, base_seed: pf.base_seed });
         }
     }
 
@@ -3547,9 +3648,9 @@ impl GpuBatchServer {
             let mut chans: std::collections::HashMap<u64, tokio::sync::mpsc::UnboundedSender<Option<u32>>> = Default::default();
             let mut reload: Option<(String, std::sync::mpsc::Sender<bool>)> = None;
             'serve: loop {
-                // Idle (no active AND no preempted work) → block for the next message.
-                let idle = cb.active_len() == 0 && cb.preempted_len() == 0;
-                if idle {
+                // Idle (nothing active, prefilling, or preempted) → block for a message.
+                let busy = cb.active_len() + cb.prefilling_len() + cb.preempted_len() > 0;
+                if !busy {
                     match rx.recv() {
                         Ok(CbMsg::Gen(req)) => Self::admit_req(&mut cb, &mut chans, &mut next_id, req),
                         Ok(CbMsg::Swap { path, ack }) => { reload = Some((path, ack)); break 'serve; }
@@ -3562,10 +3663,10 @@ impl GpuBatchServer {
                         Ok(CbMsg::Gen(req)) => Self::admit_req(&mut cb, &mut chans, &mut next_id, req),
                         Ok(CbMsg::Swap { path, ack }) => { reload = Some((path, ack)); break 'serve; }
                         Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => { if cb.active_len() == 0 && cb.preempted_len() == 0 { return; } break; }
+                        Err(TryRecvError::Disconnected) => { if cb.active_len() + cb.prefilling_len() + cb.preempted_len() == 0 { return; } break; }
                     }
                 }
-                if cb.active_len() == 0 && cb.preempted_len() == 0 { continue; }
+                if cb.active_len() + cb.prefilling_len() + cb.preempted_len() == 0 { continue; }
                 // One decode step over the whole in-flight batch; stream + retire.
                 for (id, tok, done) in cb.step() {
                     if let Some(ch) = chans.get(&id) { let _ = ch.send(Some(tok)); }
@@ -3590,12 +3691,11 @@ impl GpuBatchServer {
         req: GenReq,
     ) {
         let id = *next_id; *next_id += 1;
-        match cb.admit_params(id, &req.prompt, req.max_tokens, req.eos, req.params, req.seed) {
-            Some((g0, done)) => {
-                let _ = req.tok_tx.send(Some(g0));
-                if done { let _ = req.tok_tx.send(None); } else { chans.insert(id, req.tok_tx); }
-            }
-            None => { let _ = req.tok_tx.send(None); } // no slot (shouldn't happen; has_free checked)
+        // Chunked prefill: enqueue; the first token is emitted by a later step().
+        if cb.enqueue_params(id, req.prompt, req.max_tokens, req.eos, req.params, req.seed) {
+            chans.insert(id, req.tok_tx);
+        } else {
+            let _ = req.tok_tx.send(None); // rejected (no slot / pool too small)
         }
     }
 }
@@ -4961,6 +5061,51 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         assert!(cb.preemption_count() > 0, "test did not actually trigger preemption (pool too large?)");
         eprintln!("preemption: {} preemptions over {} steps; both sequences bit-identical to no-preemption ✓", cb.preemption_count(), steps);
+    }
+
+    /// Chunked prefill: a long prompt prefills one chunk per step (interleaved
+    /// with decode), so a short sequence keeps decoding DURING the long prefill —
+    /// and both outputs are bit-identical to synchronous prefill.
+    /// `cargo test --release --features gpu --lib gpu_chunked_prefill -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gpu_chunked_prefill() {
+        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() { eprintln!("model not found; skipping"); return; }
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU ({e}); skipping"); return; } };
+        let model = GpuModel::load(path, ctx).expect("load");
+        let (max_seq, k, eos) = (512usize, 16usize, u32::MAX);
+        let short = vec![128000u32, 791, 6864, 315, 9822, 374];
+        let mut long = vec![128000u32];
+        for i in 0..300u32 { long.push(1000 + (i % 64)); } // 301 tokens → 3 prefill chunks
+
+        // References: each alone via synchronous admit.
+        let run_alone = |prompt: &[u32]| -> Vec<u32> {
+            let mut cb = ContinuousBatcher::new(&model, 1, max_seq);
+            let mut t = vec![cb.admit(0, prompt, k, eos).unwrap().0];
+            while cb.active_len() > 0 { for (_, x, _) in cb.step() { t.push(x); } }
+            t
+        };
+        let ref_short = run_alone(&short);
+        let ref_long = run_alone(&long);
+
+        // Interleaved: short admitted (decodes immediately), long enqueued (chunked).
+        let mut cb = ContinuousBatcher::new(&model, 2, max_seq);
+        let mut got: std::collections::HashMap<u64, Vec<u32>> = Default::default();
+        got.entry(0).or_default().push(cb.admit(0, &short, k, eos).unwrap().0);
+        assert!(cb.enqueue_params(1, long.clone(), k, eos, SamplingParams::greedy(), 0));
+        let (mut step_i, mut long_first_step, mut short_progress) = (0, 0, 0);
+        while cb.active_len() + cb.prefilling_len() + cb.preempted_len() > 0 {
+            step_i += 1;
+            for (id, tok, _) in cb.step() {
+                got.entry(id).or_default().push(tok);
+                if id == 1 && long_first_step == 0 { long_first_step = step_i; short_progress = got[&0].len(); }
+            }
+        }
+        assert_eq!(got[&0], ref_short, "short sequence diverged under chunked prefill");
+        assert_eq!(got[&1], ref_long, "long sequence diverged under chunked prefill");
+        assert!(long_first_step >= 2, "long prompt should span multiple prefill chunks (got {long_first_step})");
+        eprintln!("chunked prefill: long ({} tok) prefilled over {} steps; short decoded {} tokens DURING that prefill; both outputs bit-identical ✓", long.len(), long_first_step, short_progress);
     }
 
     #[test]
