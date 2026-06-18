@@ -826,6 +826,12 @@ struct CbRequest {
     /// Sampling temperature (0 / omitted = greedy).
     #[serde(default)]
     temperature: Option<f32>,
+    /// Top-k cap (0 / omitted = off). Capped at the GPU candidate pool (64).
+    #[serde(default)]
+    top_k: Option<u32>,
+    /// Top-p (nucleus) threshold (omitted / ≥1 = off).
+    #[serde(default)]
+    top_p: Option<f32>,
     /// Optional RNG seed for reproducible sampling.
     #[serde(default)]
     seed: Option<u32>,
@@ -855,10 +861,14 @@ async fn cb_completions(
         };
         let eos = s.tokenizer.read().unwrap().eos_token_id().unwrap_or(128001);
         let stop_eot = 128009u32; // Llama 3.2 <|eot_id|> — the chat-turn stop token
-        let temp = req.temperature.unwrap_or(0.0);
+        let params = crate::backend::gpu::SamplingParams {
+            temp: req.temperature.unwrap_or(0.0),
+            top_k: req.top_k.unwrap_or(0),
+            top_p: req.top_p.unwrap_or(1.0),
+        };
         let seed = req.seed.unwrap_or(0);
         // Use eot as the server's stop so the KV slot frees on the chat stop.
-        let mut tok_rx = match server.submit(tokens, req.max_tokens, stop_eot, temp, seed) {
+        let mut tok_rx = match server.submit(tokens, req.max_tokens, stop_eot, params, seed) {
             Ok(r) => r,
             Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "server unavailable"}))).into_response(),
         };

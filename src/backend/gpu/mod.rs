@@ -63,6 +63,8 @@ pub struct GpuContext {
     bargmax_pipeline: wgpu::ComputePipeline,
     /// Batched temperature sampling (Gumbel-max argmax over perturbed logits).
     bsample_pipeline: wgpu::ComputePipeline,
+    /// Batched top-K extraction (for CPU-side top-k/top-p sampling).
+    btopk_pipeline: wgpu::ComputePipeline,
 }
 
 /// A dense f32 weight matrix resident on the GPU (row-major).
@@ -152,6 +154,7 @@ impl GpuContext {
         let bdsdpa_paged_pipeline = Self::make_pipeline(&device, "bdsdpa-paged", BDSDPA_PAGED_WGSL);
         let bargmax_pipeline = Self::make_pipeline(&device, "bargmax", BARGMAX_WGSL);
         let bsample_pipeline = Self::make_pipeline(&device, "bsample", BSAMPLE_WGSL);
+        let btopk_pipeline = Self::make_pipeline(&device, "btopk", BTOPK_WGSL);
 
         Ok(Self {
             device,
@@ -178,6 +181,7 @@ impl GpuContext {
             bdsdpa_paged_pipeline,
             bargmax_pipeline,
             bsample_pipeline,
+            btopk_pipeline,
         })
     }
 
@@ -295,6 +299,19 @@ impl GpuContext {
             entries: &[bge(0, logits), bge(1, out_idx), bge(2, temp), bge(3, seed), bge(4, &pbuf)] });
         let mut p = enc.begin_compute_pass(&Default::default());
         p.set_pipeline(&self.bsample_pipeline); p.set_bind_group(0, &bg, &[]);
+        p.dispatch_workgroups(m as u32, 1, 1);
+    }
+    /// Batched top-K: one workgroup per stream writes its `k` largest
+    /// (value, index) pairs (descending) to `vals`/`idxs` (`m*k` each).
+    fn record_btopk(&self, enc: &mut wgpu::CommandEncoder, logits: &wgpu::Buffer, vals: &wgpu::Buffer, idxs: &wgpu::Buffer, vocab: usize, m: usize, k: usize) {
+        use wgpu::util::DeviceExt;
+        let pbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::cast_slice(&[vocab as u32, m as u32, k as u32, 0u32]), usage: wgpu::BufferUsages::UNIFORM });
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.btopk_pipeline.get_bind_group_layout(0),
+            entries: &[bge(0, logits), bge(1, vals), bge(2, idxs), bge(3, &pbuf)] });
+        let mut p = enc.begin_compute_pass(&Default::default());
+        p.set_pipeline(&self.btopk_pipeline); p.set_bind_group(0, &bg, &[]);
         p.dispatch_workgroups(m as u32, 1, 1);
     }
 
@@ -1329,6 +1346,61 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         stride = stride / 2u;
     }
     if (t == 0u) { out_idx[s] = imax[0]; }
+}
+"#;
+
+/// Batched top-K extraction: one workgroup per stream writes that stream's K
+/// largest logits (value + index) in descending order to `vals[s*K..]` /
+/// `idxs[s*K..]`. Found by K rounds of "largest (value,index) strictly below the
+/// previous winner" (lexicographic: value desc, index asc → deterministic ties).
+/// Only M*K pairs are read back (vs M*vocab), so the CPU can apply
+/// top-k/top-p/temperature flexibly without the full-logit cliff. `K` is the
+/// dispatch's `p.k` (≤ KMAX).
+const BTOPK_WGSL: &str = r#"
+struct BT { vocab: u32, m_streams: u32, k: u32, pad: u32 };
+@group(0) @binding(0) var<storage, read>       logits: array<f32>;
+@group(0) @binding(1) var<storage, read_write> vals:   array<f32>;
+@group(0) @binding(2) var<storage, read_write> idxs:   array<u32>;
+@group(0) @binding(3) var<uniform>             p:      BT;
+var<workgroup> wv: array<f32, 256>;
+var<workgroup> wi: array<u32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let s = wid.x; let t = lid.x;
+    if (s >= p.m_streams) { return; }
+    let base = s * p.vocab;
+    // prev = the previous round's winner (value, index); seed above any logit.
+    var prev_v: f32 = 3.0e38; var prev_i: u32 = 0xffffffffu;
+    for (var r: u32 = 0u; r < p.k; r = r + 1u) {
+        // Each thread's best candidate strictly below `prev` in (val desc, idx asc).
+        var bv: f32 = -3.0e38; var bi: u32 = 0xffffffffu;
+        var c = t;
+        loop {
+            if (c >= p.vocab) { break; }
+            let v = logits[base + c];
+            // below prev?  v < prev_v  OR  (v == prev_v AND c > prev_i)
+            let below = (v < prev_v) || (v == prev_v && c > prev_i);
+            // better than current best?  v > bv  OR  (v == bv AND c < bi)
+            let better = (v > bv) || (v == bv && c < bi);
+            if (below && better) { bv = v; bi = c; }
+            c = c + 256u;
+        }
+        wv[t] = bv; wi[t] = bi;
+        workgroupBarrier();
+        var stride = 128u;
+        loop {
+            if (stride == 0u) { break; }
+            if (t < stride) {
+                let av = wv[t]; let ai = wi[t]; let bv2 = wv[t + stride]; let bi2 = wi[t + stride];
+                if ((bv2 > av) || (bv2 == av && bi2 < ai)) { wv[t] = bv2; wi[t] = bi2; }
+            }
+            workgroupBarrier();
+            stride = stride / 2u;
+        }
+        if (t == 0u) { vals[s * p.k + r] = wv[0]; idxs[s * p.k + r] = wi[0]; }
+        prev_v = wv[0]; prev_i = wi[0];
+        workgroupBarrier();
+    }
 }
 "#;
 
@@ -2674,6 +2746,11 @@ pub const PREFILL_CHUNK: usize = 128;
 /// trades a little block-table indirection for fine-grained allocation.
 pub const DEFAULT_BLOCK_SIZE: usize = 16;
 
+/// Candidate pool size for top-k/top-p sampling: the GPU extracts each stream's
+/// top-`TOPK_K` logits and the CPU samples within them. Caps top_k and the
+/// top_p nucleus at 64 (covers normal distributions; flatter ones truncate).
+pub const TOPK_K: usize = 64;
+
 pub struct BatchedDecoder<'a> {
     model: &'a GpuModel,
     m_max: usize,
@@ -2689,6 +2766,8 @@ pub struct BatchedDecoder<'a> {
     pos_buf: wgpu::Buffer, slots_buf: wgpu::Buffer, argmax_out: wgpu::Buffer, argmax_read: wgpu::Buffer,
     // Per-stream sampling params (temperature ≤0 = greedy; seed advances per step).
     temp_buf: wgpu::Buffer, seed_buf: wgpu::Buffer,
+    // Top-K candidates (m_max × TOPK_K) for CPU-side top-k/top-p sampling.
+    topk_vals: wgpu::Buffer, topk_idxs: wgpu::Buffer,
     // Paged KV: a shared pool of physical blocks (n_blocks × block_size positions
     // each) per layer, plus a per-slot block table mapping logical → physical
     // blocks. Decouples a sequence's KV from a contiguous max_seq reservation.
@@ -2795,7 +2874,8 @@ impl<'a> BatchedDecoder<'a> {
             k_b: asrc(row_cap * kv_dim), v_b: asrc(row_cap * kv_dim), attn_b: a(row_cap * attn_dim),
             gate_b: a(row_cap * n_inter), up_b: a(row_cap * n_inter), h_b: a(row_cap * n_inter),
             cos_b: a(row_cap * half), sin_b: a(row_cap * half), logits_b: a(m_max * vocab),
-            pos_buf: a(row_cap), slots_buf: a(row_cap), temp_buf: a(m_max), seed_buf: a(m_max), argmax_out: asrc(m_max),
+            pos_buf: a(row_cap), slots_buf: a(row_cap), temp_buf: a(m_max), seed_buf: a(m_max),
+            topk_vals: asrc(m_max * TOPK_K), topk_idxs: asrc(m_max * TOPK_K), argmax_out: asrc(m_max),
             argmax_read: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("bd-argmax-read"), size: (m_max * 4) as u64,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
@@ -2886,19 +2966,27 @@ impl<'a> BatchedDecoder<'a> {
         self.step_core(tokens, positions, slots, Some((temps, seeds)))
     }
 
-    fn step_core(&self, tokens: &[u32], positions: &[u32], slots: &[u32], sampling: Option<(&[f32], &[u32])>) -> Vec<u32> {
+    /// Decode `m` rows through the full forward into `logits_b[m, vocab]`,
+    /// returning the encoder (selection pass + submit done by the caller). Shared
+    /// by the argmax/Gumbel path and the top-K path.
+    fn forward_logits(&self, tokens: &[u32], positions: &[u32], slots: &[u32]) -> wgpu::CommandEncoder {
         let ctx = &self.model.ctx;
         let m = tokens.len();
-        assert!(m <= self.m_max && m == positions.len() && m == slots.len() && m >= 1);
         let (n_embd, eps) = (self.model.n_embd, self.model.eps);
-
         self.write_inputs(tokens, positions, slots);
         let phys = self.prepare_paging(m, positions, slots);
         let mut enc = ctx.device.create_command_encoder(&Default::default());
         self.record_layers(&mut enc, m, &phys);
-        // Decode: every row predicts a next token → lm_head + (argmax | sample) over all m.
         ctx.record_bnorm(&mut enc, &self.x_b, &self.model.final_norm_w, &self.normed_b, n_embd, eps, m);
         ctx.record_gemm(&mut enc, &self.model.lm_head, &self.normed_b, &self.logits_b, n_embd, m, 0);
+        enc
+    }
+
+    fn step_core(&self, tokens: &[u32], positions: &[u32], slots: &[u32], sampling: Option<(&[f32], &[u32])>) -> Vec<u32> {
+        let ctx = &self.model.ctx;
+        let m = tokens.len();
+        assert!(m <= self.m_max && m == positions.len() && m == slots.len() && m >= 1);
+        let mut enc = self.forward_logits(tokens, positions, slots);
         self.record_select(&mut enc, m, sampling);
         enc.copy_buffer_to_buffer(&self.argmax_out, 0, &self.argmax_read, 0, (m * 4) as u64);
         ctx.queue.submit([enc.finish()]);
@@ -2909,6 +2997,26 @@ impl<'a> BatchedDecoder<'a> {
         let out = bytemuck::cast_slice::<u8, u32>(&slice.get_mapped_range()).to_vec();
         self.argmax_read.unmap();
         out
+    }
+
+    /// Decode step with top-k / top-p sampling: the GPU extracts each stream's
+    /// top-`TOPK_K` logits, the CPU applies `params[s]` (temperature, top-k,
+    /// top-p) and samples with `seeds[s]`. `params`/`seeds` are per stream.
+    pub fn step_slotted_topk(&self, tokens: &[u32], positions: &[u32], slots: &[u32], params: &[SamplingParams], seeds: &[u32]) -> Vec<u32> {
+        let ctx = &self.model.ctx;
+        let m = tokens.len();
+        assert!(m <= self.m_max && m == positions.len() && m == slots.len() && params.len() == m && seeds.len() == m && m >= 1);
+        let k = TOPK_K;
+        let mut enc = self.forward_logits(tokens, positions, slots);
+        ctx.record_btopk(&mut enc, &self.logits_b, &self.topk_vals, &self.topk_idxs, self.model.vocab, m, k);
+        ctx.queue.submit([enc.finish()]);
+        ctx.device.poll(wgpu::Maintain::Wait);
+        let vals = ctx.read_buffer(&self.topk_vals, m * k);
+        let idxs: Vec<u32> = ctx.read_buffer(&self.topk_idxs, m * k).iter().map(|f| f.to_bits()).collect();
+        (0..m).map(|s| {
+            let o = s * k;
+            sample_topk(&vals[o..o + k], &idxs[o..o + k], params[s], seeds[s])
+        }).collect()
     }
 
     /// Record the final per-stream token selection over `logits_b[m, vocab]`:
@@ -3127,11 +3235,58 @@ impl<'a> BatchedDecoder<'a> {
     }
 }
 
-struct CbSeq { id: u64, slot: u32, pos: u32, next: u32, n_gen: usize, max_tokens: usize, eos: u32, temp: f32, base_seed: u32 }
+struct CbSeq { id: u64, slot: u32, pos: u32, next: u32, n_gen: usize, max_tokens: usize, eos: u32, params: SamplingParams, base_seed: u32 }
 
 /// Per-token sampling seed: decorrelate by generation index (the kernel further
 /// hashes (seed, token_id), so a cheap mix here is enough).
 fn step_seed(base: u32, gen_idx: u32) -> u32 { base.wrapping_add(gen_idx.wrapping_mul(0x9E3779B1)) }
+
+/// Per-request sampling knobs. `temp ≤ 0` = greedy; `top_k = 0` = no top-k cap;
+/// `top_p ≥ 1` (or 0) = no nucleus cap. top-k/top-p sample within the GPU's
+/// `TOPK_K` candidate pool, so effective top_k is capped at `TOPK_K`.
+#[derive(Clone, Copy)]
+pub struct SamplingParams { pub temp: f32, pub top_k: u32, pub top_p: f32 }
+impl SamplingParams {
+    pub fn greedy() -> Self { Self { temp: 0.0, top_k: 0, top_p: 1.0 } }
+    pub fn temperature(temp: f32) -> Self { Self { temp, top_k: 0, top_p: 1.0 } }
+    /// Whether this needs the top-K candidate path (vs greedy / full-dist temp).
+    fn needs_topk(&self) -> bool { self.top_k > 0 || (self.top_p > 0.0 && self.top_p < 1.0) }
+}
+
+/// Deterministic uniform in (0,1) from a seed (splitmix64).
+fn rng01(seed: u32) -> f32 {
+    let mut z = (seed as u64).wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(0x9E3779B97F4A7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^= z >> 31;
+    ((z >> 40) as f32 + 0.5) / 16777216.0
+}
+
+/// Sample a token from a stream's descending top-K `(vals, idxs)` under
+/// `params`, seeded by `seed`. Applies temperature, top-k, then top-p (nucleus),
+/// renormalizes, and draws by inverse-CDF. Greedy (`temp ≤ 0`) returns the top-1.
+fn sample_topk(vals: &[f32], idxs: &[u32], params: SamplingParams, seed: u32) -> u32 {
+    // Drop kernel sentinels (fewer than K distinct logits — never for real vocab).
+    let n = vals.iter().take_while(|&&v| v > -3.0e37).count().min(idxs.len());
+    if n == 0 { return idxs[0]; }
+    if params.temp <= 0.0 { return idxs[0]; } // greedy
+    let kk = if params.top_k == 0 { n } else { (params.top_k as usize).min(n) };
+    let maxv = vals[0]; // descending → max is first
+    let mut probs: Vec<f32> = (0..kk).map(|i| ((vals[i] - maxv) / params.temp).exp()).collect();
+    let z: f32 = probs.iter().sum();
+    for p in probs.iter_mut() { *p /= z; }
+    // Nucleus: smallest prefix whose cumulative prob ≥ top_p.
+    let mut cut = kk;
+    if params.top_p > 0.0 && params.top_p < 1.0 {
+        let mut cum = 0.0;
+        for (i, &p) in probs.iter().enumerate() { cum += p; if cum >= params.top_p { cut = i + 1; break; } }
+    }
+    let zc: f32 = probs[..cut].iter().sum();
+    let mut acc = 0.0;
+    let target = rng01(seed) * zc;
+    for i in 0..cut { acc += probs[i]; if acc >= target { return idxs[i]; } }
+    idxs[cut - 1]
+}
 
 /// Continuous (in-flight) batching scheduler over a `BatchedDecoder`. Sequences
 /// are admitted at any time — their prompt is prefilled into a free KV slot —
@@ -3174,22 +3329,28 @@ impl<'a> ContinuousBatcher<'a> {
         self.admit_sampled(id, prompt, max_tokens, eos, 0.0, 0)
     }
 
-    /// Admit with sampling: each token is drawn from softmax(logits/`temp`)
-    /// (`temp ≤ 0` = greedy), seeded by `seed` (reproducible per request).
+    /// Admit with temperature sampling (`temp ≤ 0` = greedy), seeded by `seed`.
     pub fn admit_sampled(&mut self, id: u64, prompt: &[u32], max_tokens: usize, eos: u32, temp: f32, seed: u32) -> Option<(u32, bool)> {
+        self.admit_params(id, prompt, max_tokens, eos, SamplingParams::temperature(temp), seed)
+    }
+
+    /// Admit with full sampling params (temperature, top-k, top-p), seeded by
+    /// `seed` (reproducible per request). Note: the first (prefill) token uses
+    /// temperature only; top-k/top-p apply from the first decode token on.
+    pub fn admit_params(&mut self, id: u64, prompt: &[u32], max_tokens: usize, eos: u32, params: SamplingParams, seed: u32) -> Option<(u32, bool)> {
         // Conservative admission: ensure room for the whole generation up front
         // (lazy block alloc + no preemption → don't admit what can't finish).
         if !self.dec.can_fit(prompt.len() + max_tokens) { return None; }
         let slot = self.free.pop()?;
-        // First token = generation index 0.
-        let samp = if temp > 0.0 { Some((temp, step_seed(seed, 0))) } else { None };
+        // First token = generation index 0 (temperature only).
+        let samp = if params.temp > 0.0 { Some((params.temp, step_seed(seed, 0))) } else { None };
         let (g, _cached_len) = self.dec.prefill_slot_cached(prompt, slot, samp); // reuse shared-prefix KV; prefill the rest
         let done = max_tokens <= 1 || g == eos;
         if done {
             self.dec.free_slot(slot);
             self.free.push(slot);
         } else {
-            self.active.push(CbSeq { id, slot, pos: prompt.len() as u32, next: g, n_gen: 1, max_tokens, eos, temp, base_seed: seed });
+            self.active.push(CbSeq { id, slot, pos: prompt.len() as u32, next: g, n_gen: 1, max_tokens, eos, params, base_seed: seed });
         }
         Some((g, done))
     }
@@ -3202,10 +3363,19 @@ impl<'a> ContinuousBatcher<'a> {
         let toks: Vec<u32> = self.active.iter().map(|s| s.next).collect();
         let pos: Vec<u32> = self.active.iter().map(|s| s.pos).collect();
         let slots: Vec<u32> = self.active.iter().map(|s| s.slot).collect();
-        let temps: Vec<f32> = self.active.iter().map(|s| s.temp).collect();
         // Seed by generation index (n_gen = index of the token about to be drawn).
         let seeds: Vec<u32> = self.active.iter().map(|s| step_seed(s.base_seed, s.n_gen as u32)).collect();
-        let nexts = self.dec.step_slotted_sample(&toks, &pos, &slots, &temps, &seeds);
+        // Route to the cheapest path that satisfies every active stream:
+        // top-k/top-p (CPU sample over GPU top-K) > temperature (Gumbel) > greedy.
+        let nexts = if self.active.iter().any(|s| s.params.needs_topk()) {
+            let params: Vec<SamplingParams> = self.active.iter().map(|s| s.params).collect();
+            self.dec.step_slotted_topk(&toks, &pos, &slots, &params, &seeds)
+        } else if self.active.iter().any(|s| s.params.temp > 0.0) {
+            let temps: Vec<f32> = self.active.iter().map(|s| s.params.temp).collect();
+            self.dec.step_slotted_sample(&toks, &pos, &slots, &temps, &seeds)
+        } else {
+            self.dec.step_slotted(&toks, &pos, &slots)
+        };
         let mut out = Vec::with_capacity(nexts.len());
         for (i, &nt) in nexts.iter().enumerate() {
             let s = &mut self.active[i];
@@ -3228,8 +3398,8 @@ pub struct GenReq {
     pub prompt: Vec<u32>,
     pub max_tokens: usize,
     pub eos: u32,
-    /// Sampling temperature (≤ 0 = greedy) and per-request RNG seed (reproducible).
-    pub temp: f32,
+    /// Sampling knobs and per-request RNG seed (reproducible).
+    pub params: SamplingParams,
     pub seed: u32,
     /// The server pushes `Some(token)` per produced token, then `None` at
     /// completion. Use a tokio unbounded channel so an async HTTP handler can
@@ -3266,11 +3436,11 @@ impl GpuBatchServer {
 
     /// Submit a request. Returns a receiver yielding `Some(token)` per decode
     /// step then `None` at completion, or `Err` if the serving thread is gone.
-    /// `temp ≤ 0` = greedy; `seed` makes sampling reproducible per request.
-    pub fn submit(&self, prompt: Vec<u32>, max_tokens: usize, eos: u32, temp: f32, seed: u32)
+    /// `params.temp ≤ 0` = greedy; `seed` makes sampling reproducible per request.
+    pub fn submit(&self, prompt: Vec<u32>, max_tokens: usize, eos: u32, params: SamplingParams, seed: u32)
         -> Result<tokio::sync::mpsc::UnboundedReceiver<Option<u32>>, ()> {
         let (tok_tx, tok_rx) = tokio::sync::mpsc::unbounded_channel();
-        self.tx.send(GenReq { prompt, max_tokens, eos, temp, seed, tok_tx }).map_err(|_| ())?;
+        self.tx.send(GenReq { prompt, max_tokens, eos, params, seed, tok_tx }).map_err(|_| ())?;
         Ok(tok_rx)
     }
 
@@ -3311,7 +3481,7 @@ impl GpuBatchServer {
         req: GenReq,
     ) {
         let id = *next_id; *next_id += 1;
-        match cb.admit_sampled(id, &req.prompt, req.max_tokens, req.eos, req.temp, req.seed) {
+        match cb.admit_params(id, &req.prompt, req.max_tokens, req.eos, req.params, req.seed) {
             Some((g0, done)) => {
                 let _ = req.tok_tx.send(Some(g0));
                 if done { let _ = req.tok_tx.send(None); } else { chans.insert(id, req.tok_tx); }
@@ -4389,7 +4559,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         // Spawn the server (moves the model onto its thread) and submit all reqs.
         let server = GpuBatchServer::spawn(model, prompts.len(), max_seq);
-        let rxs: Vec<_> = prompts.iter().map(|p| server.submit(p.clone(), k, eos, 0.0, 0).expect("submit")).collect();
+        let rxs: Vec<_> = prompts.iter().map(|p| server.submit(p.clone(), k, eos, SamplingParams::greedy(), 0).expect("submit")).collect();
         let mut got: Vec<Vec<u32>> = Vec::new();
         for mut rx in rxs {
             let mut toks = Vec::new();
@@ -4565,6 +4735,75 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         eprintln!("sample seed=7 : {s_c:?}");
         eprintln!("temp=0 ≡ greedy (seed-independent) ✓, temp>0 reproducible per seed ✓");
         eprintln!("sampling diverges from greedy: {} ; seed42≠seed7: {}", s_a != greedy, s_a != s_c);
+    }
+
+    /// Validate the GPU top-K kernel against a CPU sort (same tie-break: value
+    /// descending, index ascending) on synthetic logits — no model needed.
+    #[test]
+    fn gpu_btopk_kernel() {
+        use wgpu::util::DeviceExt;
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU ({e}); skipping"); return; } };
+        let (m, vocab, k) = (3usize, 5000usize, TOPK_K);
+        // Deterministic pseudo-random logits, with a few exact ties to exercise the
+        // index tie-break.
+        let mut logits = vec![0f32; m * vocab];
+        let mut st = 0x2545F4914F6CDD1Du64;
+        for v in logits.iter_mut() {
+            st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+            *v = ((st >> 40) as f32 / 16777216.0) - 0.5;
+        }
+        for s in 0..m { logits[s * vocab + 100] = 0.4999; logits[s * vocab + 4000] = 0.4999; } // tie
+        let lbuf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::cast_slice(&logits), usage: wgpu::BufferUsages::STORAGE });
+        let vbuf = ctx.alloc_activation(m * k, true);
+        let ibuf = ctx.alloc_activation(m * k, true);
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        ctx.record_btopk(&mut enc, &lbuf, &vbuf, &ibuf, vocab, m, k);
+        ctx.queue.submit([enc.finish()]);
+        ctx.device.poll(wgpu::Maintain::Wait);
+        let gpu_idx: Vec<u32> = ctx.read_buffer(&ibuf, m * k).iter().map(|f| f.to_bits()).collect();
+
+        for s in 0..m {
+            let mut order: Vec<usize> = (0..vocab).collect();
+            order.sort_by(|&a, &b| {
+                logits[s * vocab + b].partial_cmp(&logits[s * vocab + a]).unwrap().then(a.cmp(&b))
+            });
+            let cpu: Vec<u32> = order[..k].iter().map(|&i| i as u32).collect();
+            assert_eq!(&gpu_idx[s * k..(s + 1) * k], &cpu[..], "stream {s} top-{k} indices mismatch");
+        }
+        eprintln!("GPU top-{k} matches CPU sort for {m} streams (incl. tie-break) ✓");
+    }
+
+    /// Top-k/top-p sampling end-to-end through the batcher: the top-K path with
+    /// temp=0 must be bit-identical to greedy (validates routing + CPU sampler's
+    /// greedy branch), sampling is reproducible per seed, and temp>0 diverges.
+    /// `cargo test --release --features gpu --lib gpu_topkp -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gpu_topkp() {
+        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() { eprintln!("model not found; skipping"); return; }
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU ({e}); skipping"); return; } };
+        let model = GpuModel::load(path, ctx).expect("load");
+        let prompt = vec![128000u32, 791, 6864, 315, 9822, 374];
+        let (k, eos, max_seq) = (14usize, u32::MAX, 256usize);
+        let run = |params: SamplingParams, seed: u32| -> Vec<u32> {
+            let mut cb = ContinuousBatcher::new(&model, 1, max_seq);
+            let mut t = vec![cb.admit_params(0, &prompt, k, eos, params, seed).unwrap().0];
+            while cb.active_len() > 0 { for (_, x, _) in cb.step() { t.push(x); } }
+            t
+        };
+        let greedy = run(SamplingParams::greedy(), 0);
+        // top-K path (top_k+top_p set) with temp=0 → argmax everywhere → greedy.
+        let topk_greedy = run(SamplingParams { temp: 0.0, top_k: 5, top_p: 0.9 }, 999);
+        let a = run(SamplingParams { temp: 0.9, top_k: 40, top_p: 0.92 }, 7);
+        let b = run(SamplingParams { temp: 0.9, top_k: 40, top_p: 0.92 }, 7);
+
+        assert_eq!(topk_greedy, greedy, "top-K path with temp=0 must equal greedy");
+        assert_eq!(a, b, "same (params, seed) must reproduce");
+        eprintln!("greedy            : {greedy:?}");
+        eprintln!("top_k=40,top_p=.92: {a:?}  (reproducible: {})", a == b);
+        eprintln!("top-K path temp=0 ≡ greedy ✓, top-k/top-p reproducible ✓, diverges from greedy: {}", a != greedy);
     }
 
     #[test]
