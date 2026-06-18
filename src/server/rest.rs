@@ -117,6 +117,13 @@ pub struct AppState {
     /// GpuModel has a single resident KV cache. Reloaded on model swap.
     #[cfg(feature = "gpu")]
     pub gpu: Arc<Mutex<Option<crate::backend::gpu::GpuModel>>>,
+    /// Optional GPU continuous-batching server (cargo feature `gpu`, enabled at
+    /// startup via `ZLLM_CB=1`). Owns its own GpuModel on a dedicated thread and
+    /// decodes all in-flight `/v1/cb/completions` requests together (vLLM-style
+    /// in-flight batching) — high aggregate throughput under concurrency.
+    /// Greedy (argmax) decode only; does not hot-swap with the model selector.
+    #[cfg(feature = "gpu")]
+    pub cb: Option<Arc<crate::backend::gpu::GpuBatchServer>>,
     /// Optional resident raw-Vulkan (ash) decode engine (cargo feature
     /// `vulkan`, enabled via `ZLLM_VK=1`). Same fast-lane contract as `gpu`
     /// but uses the VkModel (validated bit-exact vs candle). Prompts ≤ 128
@@ -155,6 +162,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/models/download", post(download_model))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(text_completions))
+        .route("/v1/cb/completions", post(cb_completions))
         // Goal CRUD
         .route("/v1/goal/state", get(get_state))
         .route("/v1/goal/set", post(set_goal))
@@ -806,6 +814,86 @@ async fn text_completions(
         }
     }))
     .into_response()
+}
+
+#[derive(Deserialize)]
+struct CbRequest {
+    prompt: String,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+    #[serde(default)]
+    stream: bool,
+}
+
+/// Continuous-batching completion (`/v1/cb/completions`). Routes to the
+/// `GpuBatchServer` (started with `ZLLM_CB=1`): the prompt is admitted into a
+/// free KV slot and decoded together with every other in-flight request —
+/// vLLM-style in-flight batching, high aggregate throughput under concurrency.
+/// Greedy (argmax) decode. Streams SSE text chunks when `stream`, else returns
+/// the full text. 503 when the server is not enabled / built.
+async fn cb_completions(
+    State(s): State<AppState>,
+    Json(req): Json<CbRequest>,
+) -> axum::response::Response {
+    #[cfg(feature = "gpu")]
+    {
+        let server = match &s.cb {
+            Some(srv) => srv.clone(),
+            None => return (StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "continuous-batching server not enabled (start with ZLLM_CB=1)"}))).into_response(),
+        };
+        let tokens = match s.tokenizer.read().unwrap().encode(&req.prompt) {
+            Ok(t) => t,
+            Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("tokenize: {e}")}))).into_response(),
+        };
+        let eos = s.tokenizer.read().unwrap().eos_token_id().unwrap_or(128001);
+        let stop_eot = 128009u32; // Llama 3.2 <|eot_id|> — the chat-turn stop token
+        // Use eot as the server's stop so the KV slot frees on the chat stop.
+        let mut tok_rx = match server.submit(tokens, req.max_tokens, stop_eot) {
+            Ok(r) => r,
+            Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "server unavailable"}))).into_response(),
+        };
+        let tok = s.tokenizer.clone();
+        let model_id = s.current_model.read().unwrap().clone();
+
+        if req.stream {
+            use futures::channel::mpsc;
+            let id = format!("cmpl-{}", Uuid::new_v4());
+            let (tx, rx) = mpsc::unbounded::<Result<Event, Infallible>>();
+            tokio::spawn(async move {
+                let now = unix_secs();
+                while let Some(item) = tok_rx.recv().await {
+                    let t = match item { Some(t) => t, None => break }; // None = done sentinel
+                    if t == eos || t == stop_eot { break; }
+                    let text = tok.read().unwrap().decode(&[t]).unwrap_or_default();
+                    let chunk = json!({"id": id, "object": "text_completion.chunk", "created": now,
+                        "model": model_id, "choices": [{"text": text, "index": 0, "finish_reason": null}]});
+                    if tx.unbounded_send(Ok(Event::default().data(chunk.to_string()))).is_err() { break; }
+                }
+                let _ = tx.unbounded_send(Ok(Event::default().data("[DONE]")));
+            });
+            Sse::new(rx).into_response()
+        } else {
+            let mut out_ids: Vec<u32> = Vec::new();
+            while let Some(item) = tok_rx.recv().await {
+                let t = match item { Some(t) => t, None => break };
+                if t == eos || t == stop_eot { break; }
+                out_ids.push(t);
+            }
+            let text = tok.read().unwrap().decode(&out_ids).unwrap_or_default();
+            Json(json!({
+                "id": format!("cmpl-{}", Uuid::new_v4()),
+                "object": "text_completion", "created": unix_secs(), "model": model_id,
+                "choices": [{"index": 0, "text": text, "finish_reason": "stop"}],
+                "usage": {"completion_tokens": out_ids.len()}
+            })).into_response()
+        }
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = (&s, &req);
+        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "built without the gpu feature"}))).into_response()
+    }
 }
 
 // --- Generation ---

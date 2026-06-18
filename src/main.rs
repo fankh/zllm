@@ -297,6 +297,35 @@ async fn main() -> anyhow::Result<()> {
                 Arc::new(Mutex::new(loaded))
             };
 
+            // GPU continuous-batching server — enabled via ZLLM_CB=1. Loads its
+            // OWN GpuModel onto a dedicated serving thread and batches all
+            // in-flight /v1/cb/completions requests together (vLLM-style). Slots
+            // / max context configurable via ZLLM_CB_SLOTS (default 16) and
+            // ZLLM_CB_SEQ (default 2048). Independent of the ZLLM_GPU fast-lane.
+            #[cfg(feature = "gpu")]
+            let cb_server: Option<Arc<backend::gpu::GpuBatchServer>> = {
+                if model_exists && std::env::var("ZLLM_CB").is_ok() {
+                    let slots = std::env::var("ZLLM_CB_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(16usize);
+                    let max_seq = std::env::var("ZLLM_CB_SEQ").ok().and_then(|v| v.parse().ok()).unwrap_or(2048usize);
+                    let t = std::time::Instant::now();
+                    match backend::gpu::GpuContext::new().and_then(|ctx| {
+                        backend::gpu::GpuModel::load(model_path.to_str().unwrap_or(""), ctx)
+                    }) {
+                        Ok(gm) => {
+                            let srv = backend::gpu::GpuBatchServer::spawn(gm, slots, max_seq);
+                            tracing::info!(
+                                "GPU continuous-batching server up in {} ms — {} slots x {} ctx (ZLLM_CB=1)",
+                                t.elapsed().as_millis(), slots, max_seq
+                            );
+                            Some(Arc::new(srv))
+                        }
+                        Err(e) => { tracing::warn!("CB server load failed ({e}); /v1/cb disabled"); None }
+                    }
+                } else {
+                    None
+                }
+            };
+
             // Raw-Vulkan (ash) decode engine — enabled via ZLLM_VK=1. Validated
             // bit-exact vs candle; beats CPU/wgpu on decode. Reloaded on swap.
             #[cfg(feature = "vulkan")]
@@ -341,6 +370,8 @@ async fn main() -> anyhow::Result<()> {
                 early_exit_threshold_bits: Arc::new(std::sync::atomic::AtomicU32::new(0.30_f32.to_bits())),
                 #[cfg(feature = "gpu")]
                 gpu: gpu_engine,
+                #[cfg(feature = "gpu")]
+                cb: cb_server,
                 #[cfg(feature = "vulkan")]
                 vk: vk_engine,
             };

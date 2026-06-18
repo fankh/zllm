@@ -2647,18 +2647,27 @@ impl<'a> ContinuousBatcher<'a> {
 
     /// Admit a sequence: prefill its prompt into a free KV slot (sequential for
     /// now — batched-prefill-into-slot is a follow-up) and join the decode
-    /// batch. Returns the first generated token, or None if no slot is free.
-    pub fn admit(&mut self, id: u64, prompt: &[u32], max_tokens: usize, eos: u32) -> Option<u32> {
+    /// batch. Returns (first_token, done) — `done` is true if that one token
+    /// already completes the request (EOS or max_tokens<=1), in which case the
+    /// slot is returned immediately and the sequence does not join the batch.
+    /// Returns None only if no slot is free.
+    pub fn admit(&mut self, id: u64, prompt: &[u32], max_tokens: usize, eos: u32) -> Option<(u32, bool)> {
         let slot = self.free.pop()?;
         let mut g = 0u32;
         for (i, &tk) in prompt.iter().enumerate() { g = self.dec.step_slotted(&[tk], &[i as u32], &[slot])[0]; }
-        self.active.push(CbSeq { id, slot, pos: prompt.len() as u32, next: g, n_gen: 1, max_tokens, eos });
-        Some(g)
+        let done = max_tokens <= 1 || g == eos;
+        if done {
+            self.free.push(slot);
+        } else {
+            self.active.push(CbSeq { id, slot, pos: prompt.len() as u32, next: g, n_gen: 1, max_tokens, eos });
+        }
+        Some((g, done))
     }
 
-    /// One decode step over all active sequences. Returns (id, new_token) for
-    /// each, and evicts (frees the slot of) any sequence that hit EOS/max_tokens.
-    pub fn step(&mut self) -> Vec<(u64, u32)> {
+    /// One decode step over all active sequences. Returns (id, new_token, done)
+    /// for each — `done` = this token finished the sequence — and evicts (frees
+    /// the slot of) any finished sequence.
+    pub fn step(&mut self) -> Vec<(u64, u32, bool)> {
         if self.active.is_empty() { return Vec::new(); }
         let toks: Vec<u32> = self.active.iter().map(|s| s.next).collect();
         let pos: Vec<u32> = self.active.iter().map(|s| s.pos).collect();
@@ -2668,7 +2677,8 @@ impl<'a> ContinuousBatcher<'a> {
         for (i, &nt) in nexts.iter().enumerate() {
             let s = &mut self.active[i];
             s.pos += 1; s.next = nt; s.n_gen += 1;
-            out.push((s.id, nt));
+            let done = nt == s.eos || s.n_gen >= s.max_tokens;
+            out.push((s.id, nt, done));
         }
         let free = &mut self.free;
         self.active.retain(|s| {
@@ -2677,6 +2687,100 @@ impl<'a> ContinuousBatcher<'a> {
             !done
         });
         out
+    }
+}
+
+/// A generation request submitted to a [`GpuBatchServer`].
+pub struct GenReq {
+    pub prompt: Vec<u32>,
+    pub max_tokens: usize,
+    pub eos: u32,
+    /// The server pushes `Some(token)` per produced token, then `None` at
+    /// completion. Use a tokio unbounded channel so an async HTTP handler can
+    /// stream from the receiver while the (sync) serving thread sends.
+    pub tok_tx: tokio::sync::mpsc::UnboundedSender<Option<u32>>,
+}
+
+/// A GPU continuous-batching serving loop on its own OS thread. It OWNS the
+/// `GpuModel` (and the `ContinuousBatcher` that borrows it), so there is no
+/// borrow-across-`Arc<Mutex>` problem: handlers communicate only by channel.
+/// `submit()` enqueues a prompt + a token channel; the loop admits it into a
+/// free KV slot and decodes it together with every other in-flight request,
+/// streaming tokens back and freeing the slot on completion.
+pub struct GpuBatchServer {
+    tx: std::sync::mpsc::Sender<GenReq>,
+    m_max: usize,
+}
+
+impl GpuBatchServer {
+    /// Spawn the serving thread. `model` is MOVED onto it (wgpu device/queue are
+    /// Send). `m_max` = max concurrent sequences (KV slots), `max_seq` = max
+    /// context length per slot.
+    pub fn spawn(model: GpuModel, m_max: usize, max_seq: usize) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<GenReq>();
+        std::thread::Builder::new()
+            .name("gpu-batcher".into())
+            .spawn(move || Self::serve(model, rx, m_max, max_seq))
+            .expect("spawn gpu-batcher thread");
+        Self { tx, m_max }
+    }
+
+    /// Max concurrent sequences the server can hold in flight.
+    pub fn capacity(&self) -> usize { self.m_max }
+
+    /// Submit a request. Returns a receiver yielding `Some(token)` per decode
+    /// step then `None` at completion, or `Err` if the serving thread is gone.
+    pub fn submit(&self, prompt: Vec<u32>, max_tokens: usize, eos: u32)
+        -> Result<tokio::sync::mpsc::UnboundedReceiver<Option<u32>>, ()> {
+        let (tok_tx, tok_rx) = tokio::sync::mpsc::unbounded_channel();
+        self.tx.send(GenReq { prompt, max_tokens, eos, tok_tx }).map_err(|_| ())?;
+        Ok(tok_rx)
+    }
+
+    fn serve(model: GpuModel, rx: std::sync::mpsc::Receiver<GenReq>, m_max: usize, max_seq: usize) {
+        use std::sync::mpsc::TryRecvError;
+        let mut cb = ContinuousBatcher::new(&model, m_max, max_seq);
+        let mut chans: std::collections::HashMap<u64, tokio::sync::mpsc::UnboundedSender<Option<u32>>> = Default::default();
+        let mut next_id: u64 = 0;
+        loop {
+            // Idle → block for the next request instead of spinning the GPU.
+            if cb.active_len() == 0 {
+                match rx.recv() {
+                    Ok(req) => Self::admit_req(&mut cb, &mut chans, &mut next_id, req),
+                    Err(_) => return, // every sender dropped → shut down
+                }
+            }
+            // Fill free slots with any waiting requests (non-blocking).
+            while cb.has_free() {
+                match rx.try_recv() {
+                    Ok(req) => Self::admit_req(&mut cb, &mut chans, &mut next_id, req),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => { if cb.active_len() == 0 { return; } break; }
+                }
+            }
+            if cb.active_len() == 0 { continue; }
+            // One decode step over the whole in-flight batch; stream + retire.
+            for (id, tok, done) in cb.step() {
+                if let Some(ch) = chans.get(&id) { let _ = ch.send(Some(tok)); }
+                if done { if let Some(ch) = chans.remove(&id) { let _ = ch.send(None); } }
+            }
+        }
+    }
+
+    fn admit_req(
+        cb: &mut ContinuousBatcher,
+        chans: &mut std::collections::HashMap<u64, tokio::sync::mpsc::UnboundedSender<Option<u32>>>,
+        next_id: &mut u64,
+        req: GenReq,
+    ) {
+        let id = *next_id; *next_id += 1;
+        match cb.admit(id, &req.prompt, req.max_tokens, req.eos) {
+            Some((g0, done)) => {
+                let _ = req.tok_tx.send(Some(g0));
+                if done { let _ = req.tok_tx.send(None); } else { chans.insert(id, req.tok_tx); }
+            }
+            None => { let _ = req.tok_tx.send(None); } // no slot (shouldn't happen; has_free checked)
+        }
     }
 }
 
@@ -3695,16 +3799,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let mut refs: Vec<Vec<u32>> = Vec::new();
         for p in &prompts {
             let mut cb = ContinuousBatcher::new(&model, 1, max_seq);
-            let mut toks = vec![cb.admit(0, p, k, eos).unwrap()];
-            while cb.active_len() > 0 { for (_id, t) in cb.step() { toks.push(t); } }
+            let mut toks = vec![cb.admit(0, p, k, eos).unwrap().0];
+            while cb.active_len() > 0 { for (_id, t, _done) in cb.step() { toks.push(t); } }
             refs.push(toks);
         }
         // Batched: all sequences in one batcher.
         let mut cb = ContinuousBatcher::new(&model, prompts.len(), max_seq);
         let mut got: std::collections::HashMap<u64, Vec<u32>> = Default::default();
-        for (i, p) in prompts.iter().enumerate() { let g = cb.admit(i as u64, p, k, eos).unwrap(); got.entry(i as u64).or_default().push(g); }
+        for (i, p) in prompts.iter().enumerate() { let g = cb.admit(i as u64, p, k, eos).unwrap().0; got.entry(i as u64).or_default().push(g); }
         let t0 = Instant::now();
-        while cb.active_len() > 0 { for (id, t) in cb.step() { got.get_mut(&id).unwrap().push(t); } }
+        while cb.active_len() > 0 { for (id, t, _done) in cb.step() { got.get_mut(&id).unwrap().push(t); } }
         let dt = t0.elapsed().as_secs_f64();
         let total: usize = got.values().map(|v| v.len() - 1).sum(); // exclude admit token; count decode steps
         let mut all_match = true;
@@ -3715,6 +3819,52 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         eprintln!("continuous batch: {} seqs x {k} tok, decode {total} tok in {dt:.2}s => {:.0} tok/s aggregate", prompts.len(), total as f64 / dt);
         assert!(all_match, "batched sequences diverged from single-stream");
         eprintln!("all {} sequences match single-stream decode", prompts.len());
+    }
+
+    /// End-to-end GpuBatchServer: spawn the serving thread, submit several
+    /// requests, drain each token channel, and assert every streamed result is
+    /// identical to a single-stream reference — proving the channel/thread/admit
+    /// machinery preserves per-sequence correctness under concurrency.
+    /// `cargo test --release --features gpu --lib gpu_batch_server -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gpu_batch_server() {
+        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() { eprintln!("model not found; skipping"); return; }
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU ({e}); skipping"); return; } };
+        let model = GpuModel::load(path, ctx).expect("load");
+        let prompts: Vec<Vec<u32>> = vec![
+            vec![128000, 791, 6864, 315, 9822, 374],
+            vec![128000, 15724, 374, 264, 1296],
+            vec![128000, 9906, 1917, 11],
+            vec![128000, 791, 4205, 315, 2324, 374],
+        ];
+        let (k, eos, max_seq) = (12usize, u32::MAX, 256usize);
+
+        // Single-stream reference for each prompt (borrows model; done before move).
+        let mut refs: Vec<Vec<u32>> = Vec::new();
+        for p in &prompts {
+            let mut cb = ContinuousBatcher::new(&model, 1, max_seq);
+            let mut toks = vec![cb.admit(0, p, k, eos).unwrap().0];
+            while cb.active_len() > 0 { for (_, t, _) in cb.step() { toks.push(t); } }
+            refs.push(toks);
+        }
+
+        // Spawn the server (moves the model onto its thread) and submit all reqs.
+        let server = GpuBatchServer::spawn(model, prompts.len(), max_seq);
+        let rxs: Vec<_> = prompts.iter().map(|p| server.submit(p.clone(), k, eos).expect("submit")).collect();
+        let mut got: Vec<Vec<u32>> = Vec::new();
+        for mut rx in rxs {
+            let mut toks = Vec::new();
+            while let Some(item) = rx.blocking_recv() {
+                match item { Some(t) => toks.push(t), None => break } // None = done sentinel
+            }
+            got.push(toks);
+        }
+        for (i, r) in refs.iter().enumerate() {
+            assert_eq!(&got[i], r, "server seq {i} diverged from single-stream");
+        }
+        eprintln!("GpuBatchServer: {} concurrent requests, all match single-stream ✓", prompts.len());
     }
 
     #[test]
