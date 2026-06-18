@@ -676,6 +676,9 @@ struct ChatRequest {
     top_p: Option<f32>,
     #[serde(default)]
     top_k: Option<usize>,
+    /// Optional RNG seed for reproducible sampling (continuous-batching lane).
+    #[serde(default)]
+    seed: Option<u32>,
     /// Optional logit-constraint string. v0.5 supports `"ban:<id>,<id>,…"`;
     /// see `engine::logit_fsm::LogitFSM` for the full list of modes.
     /// Non-OpenAI-standard but cheap to add and useful for the
@@ -730,6 +733,36 @@ async fn chat_completions(
     let max_tokens = req.max_tokens;
     let sampler_cfg = sampler_from_request(&s.engine, req.temperature, req.top_p, req.top_k);
     let fsm = req.grammar.as_deref().map(LogitFSM::new);
+
+    // Continuous-batching fast lane (ZLLM_CB=1): route eligible chat requests
+    // through the shared in-flight batcher (vLLM-style) instead of the candle
+    // pool / single-stream GPU fast lanes. Eligible = inspection off and none of
+    // the candle-only features (grammar / spec-decode / PLD / early-exit) are on,
+    // since the CB engine doesn't implement those. Greedy or temp/top-k/top-p.
+    #[cfg(feature = "gpu")]
+    if let Some(server) = cb_chat_server(&s, fsm.is_none()) {
+        let prompt_tokens = tokens.len();
+        let temp = sampler_cfg.temperature;
+        let params = if temp <= 0.0 {
+            crate::backend::gpu::SamplingParams::greedy()
+        } else {
+            crate::backend::gpu::SamplingParams { temp, top_k: sampler_cfg.top_k as u32, top_p: sampler_cfg.top_p }
+        };
+        let seed = req.seed.unwrap_or(0);
+        let eos = s.tokenizer.read().unwrap().eos_token_id().unwrap_or(128001);
+        let stop_eot = 128009u32;
+        match server.submit(tokens, max_tokens, stop_eot, params, seed) {
+            Ok(rx) => {
+                return if req.stream {
+                    Sse::new(cb_chat_stream(rx, eos, stop_eot, s.clone(), id, model_id)).into_response()
+                } else {
+                    cb_chat_blocking(rx, eos, stop_eot, &s, id, model_id, prompt_tokens).await
+                };
+            }
+            Err(_) => return (StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "continuous-batching server unavailable"}))).into_response(),
+        }
+    }
 
     if req.stream {
         let stream = chat_stream(s.clone(), tokens, max_tokens, sampler_cfg, fsm, id.clone(), model_id);
@@ -913,6 +946,73 @@ async fn cb_completions(
         let _ = (&s, &req);
         (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "built without the gpu feature"}))).into_response()
     }
+}
+
+/// Eligibility gate for routing a chat request through the continuous-batching
+/// server: present (ZLLM_CB=1), inspection off, no grammar, and none of the
+/// candle-only decode features (PLD / spec-decode / early-exit) enabled.
+#[cfg(feature = "gpu")]
+fn cb_chat_server(s: &AppState, no_fsm: bool) -> Option<Arc<crate::backend::gpu::GpuBatchServer>> {
+    let server = s.cb.clone()?;
+    let on = |a: &std::sync::atomic::AtomicBool| a.load(Ordering::Relaxed);
+    if on(&s.inspection_enabled) || !no_fsm || on(&s.pld_enabled)
+        || on(&s.spec_decode_enabled) || on(&s.early_exit_enabled) {
+        return None;
+    }
+    Some(server)
+}
+
+/// Stream a continuous-batching chat completion as OpenAI `chat.completion.chunk`
+/// SSE events: a role chunk, one content chunk per decoded token (stopping at
+/// eos/eot without emitting it), then a finish chunk and `[DONE]`.
+#[cfg(feature = "gpu")]
+fn cb_chat_stream(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<Option<u32>>,
+    eos: u32, stop: u32, s: AppState, id: String, model_id: String,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    use futures::channel::mpsc;
+    let (tx, out_rx) = mpsc::unbounded::<Result<Event, Infallible>>();
+    let now = unix_secs();
+    tokio::spawn(async move {
+        let role = json!({"id": id, "object": "chat.completion.chunk", "created": now, "model": model_id,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]});
+        let _ = tx.unbounded_send(Ok(Event::default().data(role.to_string())));
+        while let Some(item) = rx.recv().await {
+            let t = match item { Some(t) => t, None => break };
+            if t == eos || t == stop { break; }
+            let text = s.tokenizer.read().unwrap().decode(&[t]).unwrap_or_default();
+            let chunk = json!({"id": id, "object": "chat.completion.chunk", "created": now, "model": model_id,
+                "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]});
+            if tx.unbounded_send(Ok(Event::default().data(chunk.to_string()))).is_err() { break; }
+        }
+        let fin = json!({"id": id, "object": "chat.completion.chunk", "created": now, "model": model_id,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]});
+        let _ = tx.unbounded_send(Ok(Event::default().data(fin.to_string())));
+        let _ = tx.unbounded_send(Ok(Event::default().data("[DONE]")));
+    });
+    out_rx
+}
+
+/// Collect a continuous-batching chat completion and return the full
+/// `chat.completion` JSON (non-streaming).
+#[cfg(feature = "gpu")]
+async fn cb_chat_blocking(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<Option<u32>>,
+    eos: u32, stop: u32, s: &AppState, id: String, model_id: String, prompt_tokens: usize,
+) -> axum::response::Response {
+    let mut ids: Vec<u32> = Vec::new();
+    while let Some(item) = rx.recv().await {
+        let t = match item { Some(t) => t, None => break };
+        if t == eos || t == stop { break; }
+        ids.push(t);
+    }
+    let text = s.tokenizer.read().unwrap().decode(&ids).unwrap_or_default();
+    let completion = ids.len();
+    Json(json!({
+        "id": id, "object": "chat.completion", "created": unix_secs(), "model": model_id,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion, "total_tokens": prompt_tokens + completion}
+    })).into_response()
 }
 
 // --- Generation ---
