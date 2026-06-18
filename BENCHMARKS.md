@@ -152,6 +152,36 @@ Key Phase-2 levers (all bit-exact):
   matvec producer, fuse QKV) + the Q6 kernel to 208 — not more matvec tuning. Prefill is also still
   sequential (~175 tok/s vs llama 5708); the coopmat GEMM is built but not wired into `VkModel`.
 
+## 5. Continuous-batching serving (in-flight batching + paged KV)
+
+Section 3 measured *raw* batched decode (M streams in one forward). This section is the **serving
+architecture** built on top of it — the machinery that turns that batched kernel into a real
+vLLM-style server: arrivals join the running batch, prompts prefill in bulk, and KV is paged. All on
+the wgpu (`--features gpu`) path, enabled at startup with `ZLLM_CB=1`, exposed at
+`POST /v1/cb/completions` (SSE stream or JSON, greedy argmax). **Every layer validated bit-identical
+to single-stream decode.**
+
+| capability | what it does | result |
+|---|---|---|
+| **Slot indirection** | KV keyed by cache *slot*, not batch position → a sequence keeps its KV across admit/evict (no compaction copies) | batched decode unchanged (still 327 tok/s @ M=32) |
+| **ContinuousBatcher** | admit / decode-step / evict; arrivals join the in-flight batch, finishers free their slot | 8 concurrent over HTTP: **77.5 tok/s aggregate = 5.6×** single-stream (≈60-tok prompts) |
+| **Batched prefill-into-slot** | prefill a whole prompt in one coopmat pass per 128 tokens (staggered positions → the decode SDPA *is* causal prefill), not one forward per token | **30× faster** (201-tok prompt: 470 ms vs 14.3 s), bit-identical; kills admission head-of-line blocking |
+| **Paged KV (PagedAttention)** | KV is a shared pool of 16-position blocks + per-slot block table; pool sized to *actual* use, not m_max × max_seq | **4× less KV memory** (8 seqs in a 64-block pool vs 256 contiguous), bit-identical, blocks recycled on evict |
+
+Notes / honest scope:
+- This raises **aggregate throughput under concurrency** (the right serving metric) — it doesn't change
+  single-stream latency or the llama gap (separate axis). The underlying batched decode still scales
+  ~6.4× from M=1→32, so aggregate climbs with batch size.
+- **Default pool is full** (every slot can reach max_seq → contiguous-equivalent, never starves);
+  `with_pool(m_max, max_seq, n_blocks)` opts into overcommit. **No preemption yet** — admission is
+  conservative (gates on `can_fit(prompt + max_tokens)`).
+- The CB server loads its **own** model copy on a dedicated thread (handlers talk to it only by
+  channel — no borrow-across-`Arc<Mutex>`), independent of the `ZLLM_GPU`/`ZLLM_VK` fast lanes, and
+  does **not** hot-swap with the model selector.
+- On this 96 GB unified box memory isn't the binding constraint (the occupancy wall caps useful
+  concurrency first); paging's near-term value here is the mechanism + the future prefix/KV-reuse
+  unlock, not fitting more sequences.
+
 ## zllm GPU kernel tuning (this engine's own progression)
 
 Bit-exact throughout. Prefill GEMM at M=256: **2842 → 520 ms (5.5×)**; TTFT (M=12): **481 → 48 ms (10×)**.
@@ -174,6 +204,13 @@ llama-batched-bench -m ...gguf -ngl 99 -npp 32 -ntg 64 -npl 1,2,4,8,16,32 -c 819
 cargo test --release --features gpu --lib gpu_full_forward_vs_candle_and_bench -- --ignored --nocapture
 cargo test --release --features gpu --lib gpu_prefill_vs_candle_and_bench       -- --ignored --nocapture
 cargo test --release --features gpu --lib gpu_batched_decode_throughput         -- --ignored --nocapture
+
+# zllm continuous-batching serving (--features gpu): in-flight batching + batched prefill + paged KV
+cargo test --release --features gpu --lib gpu_continuous_batch  -- --ignored --nocapture  # admit/decode/evict bit-identical to single-stream
+cargo test --release --features gpu --lib gpu_batch_server      -- --ignored --nocapture  # GpuBatchServer thread/channel, concurrent correctness
+cargo test --release --features gpu --lib gpu_prefill_slot      -- --ignored --nocapture  # batched prefill 30x vs sequential, bit-identical
+cargo test --release --features gpu --lib gpu_paged_overcommit  -- --ignored --nocapture  # paged KV: 4x less mem, recycled, bit-identical
+# Server: build --features gpu, run with ZLLM_CB=1 (ZLLM_CB_SLOTS / ZLLM_CB_SEQ), POST /v1/cb/completions {prompt, max_tokens, stream}
 
 # zllm Phase 2 (raw-Vulkan coopmat) — --features vulkan
 cargo test --release --features vulkan --lib vk_coopmat_q4k_gemm_throughput -- --ignored --nocapture  # prefill GEMM

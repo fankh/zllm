@@ -88,6 +88,13 @@ The remaining work is **closing the real-weight gap to the kernel ceiling**: wor
 (keep scales i8 to cut bandwidth ~25%), batched prefill via the coopmat GEMM (sequential prefill caps
 the fast-lane at 128 tokens today), and record-once + uniform-update to cut per-token CPU overhead.
 
+**Serving track (separate axis, wgpu `--features gpu` path — see BENCHMARKS.md §5).** Beyond
+single-stream latency, zllm now has a vLLM-style serving path: continuous (in-flight) batching +
+batched prefill-into-slot (30× vs sequential) + paged KV (PagedAttention, 4× less KV memory),
+exposed at `POST /v1/cb/completions` with `ZLLM_CB=1`. Validated bit-identical to single-stream;
+**5.6× aggregate throughput at 8 concurrent**. This raises throughput-under-concurrency (the right
+serving metric), orthogonal to the single-stream decode/prefill kernel work above.
+
 ---
 
 ## Key technical findings (the basis for everything below)
