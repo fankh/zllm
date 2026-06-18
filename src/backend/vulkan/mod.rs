@@ -1051,10 +1051,14 @@ impl VkModel {
         };
         let gxof = |n: usize| (n as u32).min(65535);
         let mv = |m: Mv, n: usize| disp(if m.q6 { self.p_q6k } else { self.p_mv }, m.set, gxof(n), (n as u32).div_ceil(gxof(n)));
-        let skip_extra = std::env::var("VK_NOEXTRA").is_ok(); // diag: skip kvwrite+residual (incorrect)
+        let mvonly = std::env::var("VK_MVONLY").is_ok();      // diag: matvecs only (skip all small ops)
+        let skip_extra = mvonly || std::env::var("VK_NOEXTRA").is_ok(); // diag: skip kvwrite+residual
+        let skip_norm = mvonly || std::env::var("VK_NONORM").is_ok();   // diag: skip rmsnorms
+        let skip_attn = mvonly;                               // diag: skip rope+sdpa
         for l in &self.layers {
-            disp(self.p_rms, l.attn_norm, 1, 1); bar();                               // attn norm
+            if !skip_norm { disp(self.p_rms, l.attn_norm, 1, 1); bar(); }              // attn norm
             mv(l.wq, n_embd); mv(l.wk, kv_dim); mv(l.wv, kv_dim); bar();               // QKV
+            if !skip_attn {
             disp(self.p_rope, self.s_rope_q, ((n_head * half) as u32).div_ceil(64), 1);
             disp(self.p_rope, self.s_rope_k, ((n_kv * half) as u32).div_ceil(64), 1); bar(); // RoPE q,k
             if !skip_extra { disp(self.p_kvw, l.kvw_k, (kv_dim as u32).div_ceil(64), 1);
@@ -1066,16 +1070,17 @@ impl VkModel {
             } else {
                 disp(self.p_sdpa, l.sdpa, n_head as u32, 1); bar();
             }
+            }
             mv(l.wo, n_embd); bar();                                                   // O proj
             if !skip_extra { disp(self.p_add, l.radd_a, (n_embd as u32).div_ceil(64), 1); bar(); } // x += attn out
-            disp(self.p_rms, l.ffn_norm, 1, 1); bar();                                 // ffn norm
+            if !skip_norm { disp(self.p_rms, l.ffn_norm, 1, 1); bar(); }               // ffn norm
             mv(l.w1, n_inter); mv(l.w3, n_inter); bar();                               // gate, up
-            disp(self.p_silu, l.silu, (n_inter as u32).div_ceil(64), 1); bar();        // silu·mul
+            if !skip_attn { disp(self.p_silu, l.silu, (n_inter as u32).div_ceil(64), 1); bar(); } // silu·mul
             mv(l.w2, n_embd); bar();                                                   // down proj
             if !skip_extra { disp(self.p_add, l.radd_f, (n_embd as u32).div_ceil(64), 1); bar(); } // x += ffn out
         }
         if lm {
-            disp(self.p_rms, self.s_final_norm, 1, 1); bar();                          // final norm
+            if !skip_norm { disp(self.p_rms, self.s_final_norm, 1, 1); bar(); }        // final norm
             disp(self.p_q6k, self.s_lm, gxof(self.vocab), (self.vocab as u32).div_ceil(gxof(self.vocab))); // LM head
             if argmax { bar(); disp(self.p_argmax, self.s_argmax, 1, 1); }              // GPU argmax (4-byte readback)
         }
