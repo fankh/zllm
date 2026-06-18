@@ -1051,13 +1051,14 @@ impl VkModel {
         };
         let gxof = |n: usize| (n as u32).min(65535);
         let mv = |m: Mv, n: usize| disp(if m.q6 { self.p_q6k } else { self.p_mv }, m.set, gxof(n), (n as u32).div_ceil(gxof(n)));
+        let skip_extra = std::env::var("VK_NOEXTRA").is_ok(); // diag: skip kvwrite+residual (incorrect)
         for l in &self.layers {
             disp(self.p_rms, l.attn_norm, 1, 1); bar();                               // attn norm
             mv(l.wq, n_embd); mv(l.wk, kv_dim); mv(l.wv, kv_dim); bar();               // QKV
             disp(self.p_rope, self.s_rope_q, ((n_head * half) as u32).div_ceil(64), 1);
             disp(self.p_rope, self.s_rope_k, ((n_kv * half) as u32).div_ceil(64), 1); bar(); // RoPE q,k
-            disp(self.p_kvw, l.kvw_k, (kv_dim as u32).div_ceil(64), 1);
-            disp(self.p_kvw, l.kvw_v, (kv_dim as u32).div_ceil(64), 1); bar();         // append K,V to cache
+            if !skip_extra { disp(self.p_kvw, l.kvw_k, (kv_dim as u32).div_ceil(64), 1);
+            disp(self.p_kvw, l.kvw_v, (kv_dim as u32).div_ceil(64), 1); bar(); }       // append K,V to cache
             if seq_len as usize > SDPA_FLASH_BLOCK {
                 let nblk = (seq_len as usize).div_ceil(SDPA_FLASH_BLOCK) as u32;
                 disp(self.p_fp, l.fp, n_head as u32, nblk); bar();
@@ -1066,12 +1067,12 @@ impl VkModel {
                 disp(self.p_sdpa, l.sdpa, n_head as u32, 1); bar();
             }
             mv(l.wo, n_embd); bar();                                                   // O proj
-            disp(self.p_add, l.radd_a, (n_embd as u32).div_ceil(64), 1); bar();        // x += attn out
+            if !skip_extra { disp(self.p_add, l.radd_a, (n_embd as u32).div_ceil(64), 1); bar(); } // x += attn out
             disp(self.p_rms, l.ffn_norm, 1, 1); bar();                                 // ffn norm
             mv(l.w1, n_inter); mv(l.w3, n_inter); bar();                               // gate, up
             disp(self.p_silu, l.silu, (n_inter as u32).div_ceil(64), 1); bar();        // silu·mul
             mv(l.w2, n_embd); bar();                                                   // down proj
-            disp(self.p_add, l.radd_f, (n_embd as u32).div_ceil(64), 1); bar();        // x += ffn out
+            if !skip_extra { disp(self.p_add, l.radd_f, (n_embd as u32).div_ceil(64), 1); bar(); } // x += ffn out
         }
         if lm {
             disp(self.p_rms, self.s_final_norm, 1, 1); bar();                          // final norm
@@ -1421,14 +1422,15 @@ mod tests {
         let prompt: Vec<u32> = vec![128000]; // BOS
         let n_gen = 24usize;
         let _ = &argmax;
+        let n_time = 128usize; // match llama-bench tg128 (avg ctx ~64) for a fair rate
         let mut next = 0u32;
         for (i, &tk) in prompt.iter().enumerate() { next = model.forward_argmax(tk, i); }
         let mut vk_gen = vec![next];
         let mut pos = prompt.len();
         let t0 = Instant::now();
-        for _ in 1..n_gen { next = model.forward_argmax(next, pos); vk_gen.push(next); pos += 1; }
+        for _ in 1..n_time { next = model.forward_argmax(next, pos); vk_gen.push(next); pos += 1; }
         let dt = t0.elapsed();
-        eprintln!("VkModel decode: {:.1} tok/s ({} tokens)", (n_gen - 1) as f64 / dt.as_secs_f64(), n_gen - 1);
+        eprintln!("VkModel decode: {:.1} tok/s over {} tokens (avg ctx ~{})", (n_time - 1) as f64 / dt.as_secs_f64(), n_time - 1, n_time / 2);
         eprintln!("VkModel gen: {vk_gen:?}");
 
         use crate::backend::candle::backend::CandleCpuBackend;

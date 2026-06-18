@@ -37,13 +37,15 @@ void main() {
         uint qh_w = qh[qh_base + wih];
         uint xbase = blk_local * 256u + hf * 128u;
         uint l0 = wih * 4u;
+        // l/16 is constant across a 4-byte word (l0 is a multiple of 4), so the
+        // four sub-block scales are the same for all 4 bytes — extract once.
+        uint is = scoff + (l0 / 16u);
+        float s1 = float(bitfieldExtract(int(scl[sc_base + (is) / 4u]),      int((is) % 4u) * 8, 8));
+        float s2 = float(bitfieldExtract(int(scl[sc_base + (is + 2u) / 4u]), int((is + 2u) % 4u) * 8, 8));
+        float s3 = float(bitfieldExtract(int(scl[sc_base + (is + 4u) / 4u]), int((is + 4u) % 4u) * 8, 8));
+        float s4 = float(bitfieldExtract(int(scl[sc_base + (is + 6u) / 4u]), int((is + 6u) % 4u) * 8, 8));
         for (uint b = 0u; b < 4u; b++) {
             uint l = l0 + b;
-            uint is = scoff + (l / 16u);
-            int s1 = bitfieldExtract(int(scl[sc_base + (is) / 4u]),        int((is) % 4u) * 8, 8);
-            int s2 = bitfieldExtract(int(scl[sc_base + (is + 2u) / 4u]),   int((is + 2u) % 4u) * 8, 8);
-            int s3 = bitfieldExtract(int(scl[sc_base + (is + 4u) / 4u]),   int((is + 4u) % 4u) * 8, 8);
-            int s4 = bitfieldExtract(int(scl[sc_base + (is + 6u) / 4u]),   int((is + 6u) % 4u) * 8, 8);
             uint qla = (ql_a >> (b * 8u)) & 0xffu;
             uint qlb = (ql_b >> (b * 8u)) & 0xffu;
             uint qhb = (qh_w >> (b * 8u)) & 0xffu;
@@ -51,10 +53,10 @@ void main() {
             int q2 = int((qlb & 0xfu) | (((qhb >> 2u) & 3u) << 4u)) - 32;
             int q3 = int((qla >> 4u) | (((qhb >> 4u) & 3u) << 4u)) - 32;
             int q4 = int((qlb >> 4u) | (((qhb >> 6u) & 3u) << 4u)) - 32;
-            acc += d * (float(s1 * q1) * x[xbase + l]
-                      + float(s2 * q2) * x[xbase + l + 32u]
-                      + float(s3 * q3) * x[xbase + l + 64u]
-                      + float(s4 * q4) * x[xbase + l + 96u]);
+            acc += d * (s1 * float(q1) * x[xbase + l]
+                      + s2 * float(q2) * x[xbase + l + 32u]
+                      + s3 * float(q3) * x[xbase + l + 64u]
+                      + s4 * float(q4) * x[xbase + l + 96u]);
         }
         w += 64u;
     }
