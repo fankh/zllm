@@ -245,6 +245,27 @@ impl VkContext {
         (pipeline, layout, set_layout, module)
     }
 
+    /// Like make_pipeline_raw but forces requiredSubgroupSize=32 + full
+    /// subgroups — required by the cooperative-matrix GEMM kernels (wave32).
+    unsafe fn make_pipeline_coopmat(&self, spv: &[u8], n_storage: u32) -> (vk::Pipeline, vk::PipelineLayout, vk::DescriptorSetLayout, vk::ShaderModule) {
+        let words = ash::util::read_spv(&mut std::io::Cursor::new(spv)).unwrap();
+        let module = self.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None).unwrap();
+        let mut bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..n_storage)
+            .map(|b| vk::DescriptorSetLayoutBinding::default().binding(b).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE))
+            .collect();
+        bindings.push(vk::DescriptorSetLayoutBinding::default().binding(n_storage).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE));
+        let set_layout = self.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).unwrap();
+        let layout = self.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(std::slice::from_ref(&set_layout)), None).unwrap();
+        let entry = std::ffi::CString::new("main").unwrap();
+        let mut req_sg = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(32);
+        let stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE).module(module).name(&entry)
+            .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS).push_next(&mut req_sg);
+        let pipeline = self.device.create_compute_pipelines(vk::PipelineCache::null(),
+            &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout)], None).unwrap()[0];
+        (pipeline, layout, set_layout, module)
+    }
+
     /// Spike: compute C[16,16] = A[16,16] * B[16,16] on the GPU via a single
     /// cooperative-matrix multiply (fp16 in, fp32 accumulate). `a`/`b` are
     /// row-major length-256 f32; returns the 256 f32 of C.
