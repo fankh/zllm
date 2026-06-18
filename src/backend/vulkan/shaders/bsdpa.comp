@@ -1,0 +1,29 @@
+#version 450 core
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly  buffer Q_  { float q[];    };
+layout(binding = 1) readonly  buffer KC_ { float kc[];   };
+layout(binding = 2) readonly  buffer VC_ { float vc[];   };
+layout(binding = 3) writeonly buffer O_  { float outp[]; };
+layout(binding = 4) uniform   P_ { uint n_head; uint n_kv; uint hd; uint m_rows; } p;
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.m_rows * p.n_head) { return; }
+    uint m = idx / p.n_head; uint h = idx % p.n_head;
+    uint hd = p.hd; uint kvh = h / (p.n_head / p.n_kv);
+    float scale = 1.0 / sqrt(float(hd));
+    uint seq_len = m + 1u; // prefill: query at pos m attends 0..=m
+    uint qb = m * (p.n_head * hd) + h * hd;
+    float av[128]; for (uint d = 0u; d < hd; d++) { av[d] = 0.0; }
+    float mx = -1e30; float l = 0.0;
+    for (uint t = 0u; t < seq_len; t++) {
+        uint kb = (t * p.n_kv + kvh) * hd;
+        float s = 0.0; for (uint d = 0u; d < hd; d++) { s += q[qb + d] * kc[kb + d]; }
+        s *= scale;
+        float mn = max(mx, s); float corr = exp(mx - mn); float pe = exp(s - mn);
+        l = l * corr + pe;
+        for (uint d = 0u; d < hd; d++) { av[d] = av[d] * corr + pe * vc[kb + d]; }
+        mx = mn;
+    }
+    float inv = 1.0 / l;
+    for (uint d = 0u; d < hd; d++) { outp[qb + d] = av[d] * inv; }
+}

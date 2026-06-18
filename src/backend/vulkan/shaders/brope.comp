@@ -1,0 +1,15 @@
+#version 450 core
+layout(local_size_x = 64) in;
+layout(binding = 0) buffer X_ { float x[]; };
+layout(binding = 1) readonly buffer C_ { float cosb[]; };
+layout(binding = 2) readonly buffer S_ { float sinb[]; };
+layout(binding = 3) uniform P_ { uint n_head; uint head_dim; uint m_rows; uint pad; } p;
+void main() {
+    uint hf = p.head_dim / 2u; uint per = p.n_head * hf; uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.m_rows * per) { return; }
+    uint m = idx / per; uint r = idx % per; uint h = r / hf; uint j = r % hf;
+    float c = cosb[m * hf + j]; float s = sinb[m * hf + j];
+    uint base = m * (p.n_head * p.head_dim) + h * p.head_dim + 2u * j;
+    float a = x[base]; float b = x[base + 1u];
+    x[base] = a * c - b * s; x[base + 1u] = a * s + b * c;
+}

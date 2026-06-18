@@ -1,0 +1,15 @@
+#version 450 core
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly  buffer X_ { float x[];   };
+layout(binding = 1) readonly  buffer W_ { float wgt[]; };
+layout(binding = 2) writeonly buffer Y_ { float y[];   };
+layout(binding = 3) uniform   P_ { uint n; uint eps; uint p0; uint p1; } p;
+shared float partial[256];
+void main() {
+    uint m = gl_WorkGroupID.x; uint t = gl_LocalInvocationID.x; uint base = m * p.n;
+    float s = 0.0; for (uint i = t; i < p.n; i += 256u) { float v = x[base + i]; s += v * v; }
+    partial[t] = s; barrier();
+    for (uint st = 128u; st > 0u; st >>= 1u) { if (t < st) { partial[t] += partial[t + st]; } barrier(); }
+    float inv = 1.0 / sqrt(partial[0] / float(p.n) + uintBitsToFloat(p.eps));
+    for (uint i = t; i < p.n; i += 256u) { y[base + i] = x[base + i] * inv * wgt[i]; }
+}

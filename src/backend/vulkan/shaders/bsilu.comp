@@ -1,0 +1,12 @@
+#version 450 core
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly  buffer G_ { float gu[]; };
+layout(binding = 1) writeonly buffer H_ { float h[];  };
+layout(binding = 2) uniform   P_ { uint n_inter; uint m_rows; uint p0; uint p1; } p;
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.m_rows * p.n_inter) { return; }
+    uint m = idx / p.n_inter; uint i = idx % p.n_inter;
+    float g = gu[m * 2u * p.n_inter + i]; float u = gu[m * 2u * p.n_inter + p.n_inter + i];
+    h[idx] = (g / (1.0 + exp(-g))) * u;
+}
