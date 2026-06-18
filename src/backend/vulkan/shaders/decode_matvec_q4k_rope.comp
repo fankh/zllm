@@ -1,0 +1,51 @@
+// Q4_K decode matvec with RoPE fused into the output (for wq/wk). One workgroup
+// per ROPE PAIR p: computes the dots for rows 2p and 2p+1, then rotates them by
+// cos/sin[p % half] and writes both — folding the separate RoPE dispatch + its
+// barrier away. Each thread accumulates a partial for BOTH rows over its
+// sub-blocks (normed read once, shared between the two rows). Word-loaded Q4_K.
+#version 450 core
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly  buffer W_  { uint  w[];    };  // Q4_K [n_rows, K]
+layout(binding = 1) readonly  buffer X_  { float x[];    };  // normed [K]
+layout(binding = 2) readonly  buffer C_  { float cosb[]; };  // [half]
+layout(binding = 3) readonly  buffer S_  { float sinb[]; };  // [half]
+layout(binding = 4) writeonly buffer O_  { float outp[]; };  // [n_rows]
+layout(binding = 5) uniform   P_ { uint n_rows; uint k; uint nb; uint gx; uint hf; uint p0; uint p1; uint p2; } p;
+shared float pa[64]; shared float pb[64];
+
+float row_dot(uint row, uint t) {
+    uint total_sub = p.nb * 8u; float acc = 0.0; uint g = t;
+    while (g < total_sub) {
+        uint b = g / 8u; uint sub = g % 8u; uint blk = (row * p.nb + b) * 36u;
+        vec2 dd = unpackHalf2x16(w[blk]); float d = dd.x; float dmin = dd.y;
+        uint u0 = w[blk + 1u]; uint u1 = w[blk + 2u]; uint u2 = w[blk + 3u];
+        uint u3 = ((u2 >> 4u) & 0x0f0f0f0fu) | (((u1 >> 6u) & 0x03030303u) << 4u);
+        uint uaux = u1 & 0x3f3f3f3fu; u1 = (u2 & 0x0f0f0f0fu) | (((u0 >> 6u) & 0x03030303u) << 4u); u2 = uaux; u0 = u0 & 0x3f3f3f3fu;
+        float sc; float mn;
+        if (sub < 4u) { sc = float((u0 >> (sub * 8u)) & 0xffu); mn = float((u2 >> (sub * 8u)) & 0xffu); }
+        else          { sc = float((u1 >> ((sub - 4u) * 8u)) & 0xffu); mn = float((u3 >> ((sub - 4u) * 8u)) & 0xffu); }
+        bool hi = (sub & 1u) == 1u; uint qs0 = blk + 4u + (sub / 2u) * 8u; uint xb = b * 256u + sub * 32u;
+        float dot = 0.0; float xsum = 0.0;
+        for (uint ww = 0u; ww < 8u; ww++) { uint word = w[qs0 + ww];
+            for (uint bs = 0u; bs < 4u; bs++) { uint byte = (word >> (bs * 8u)) & 0xffu; uint qv = hi ? (byte >> 4u) : (byte & 0x0fu);
+                float xv = x[xb + ww * 4u + bs]; dot += float(qv) * xv; xsum += xv; } }
+        acc += d * sc * dot - dmin * mn * xsum;
+        g += 64u;
+    }
+    return acc;
+}
+
+void main() {
+    uint pair = gl_WorkGroupID.x + gl_WorkGroupID.y * p.gx;
+    uint t = gl_LocalInvocationID.x;
+    if (pair >= p.n_rows / 2u) { pa[t] = 0.0; return; }
+    uint ra = 2u * pair; uint rb = ra + 1u;
+    pa[t] = row_dot(ra, t); pb[t] = row_dot(rb, t);
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) { if (t < s) { pa[t] += pa[t + s]; pb[t] += pb[t + s]; } barrier(); }
+    if (t == 0u) {
+        uint j = pair % p.hf; float c = cosb[j]; float sn = sinb[j];
+        float a = pa[0]; float b = pb[0];
+        outp[ra] = a * c - b * sn; outp[rb] = a * sn + b * c;
+    }
+}

@@ -16,6 +16,7 @@ const COOPMAT_GEMM_SPV: &[u8] = include_bytes!("shaders/coopmat_gemm.spv");
 const COOPMAT_Q4K_GEMM_SPV: &[u8] = include_bytes!("shaders/coopmat_q4k_gemm.spv");
 const DECODE_MATVEC_Q4K_SPV: &[u8] = include_bytes!("shaders/decode_matvec_q4k.spv");
 const DECODE_MATVEC_DOWN_Q4K_SPV: &[u8] = include_bytes!("shaders/decode_matvec_down_q4k.spv");
+const DECODE_MATVEC_Q4K_ROPE_SPV: &[u8] = include_bytes!("shaders/decode_matvec_q4k_rope.spv");
 const RMSNORM_SPV: &[u8] = include_bytes!("shaders/rmsnorm.spv");
 const ROPE_SPV: &[u8] = include_bytes!("shaders/rope.spv");
 const SDPA_DECODE_SPV: &[u8] = include_bytes!("shaders/sdpa_decode.spv");
@@ -749,6 +750,11 @@ unsafe fn vk_uni(ctx: &VkContext, bufs: &mut Vec<(ash::vk::Buffer, ash::vk::Devi
     std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, p, 16);
     bufs.push((b, m)); (b, p)
 }
+unsafe fn vk_uni8(ctx: &VkContext, bufs: &mut Vec<(ash::vk::Buffer, ash::vk::DeviceMemory)>, d: [u32; 8]) -> ash::vk::Buffer {
+    let (b, m, p) = ctx.uma_buffer(32).unwrap();
+    std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, p, 32);
+    bufs.push((b, m)); b
+}
 // Repack a raw Q6_K tensor (210-byte blocks) into aligned SoA buffers: ql
 // (128 B/blk), qh (64 B), scales (16 i8/blk, sign-extracted in-shader), d (f32).
 // Scales stay i8 (not expanded to f32) so the matvec stays bandwidth-bound.
@@ -840,6 +846,7 @@ unsafe fn vk_mk_mv(ctx: &VkContext, pool: ash::vk::DescriptorPool, mv_sl: ash::v
 #[derive(Clone)]
 struct VkLayerOps {
     attn_norm: ash::vk::DescriptorSet, wq: Mv, wk: Mv, wv: Mv,
+    wq_rope: ash::vk::DescriptorSet, wk_rope: ash::vk::DescriptorSet, // QKV+rope fused (q/k)
     kvw_k: ash::vk::DescriptorSet, kvw_v: ash::vk::DescriptorSet, sdpa: ash::vk::DescriptorSet,
     fp: ash::vk::DescriptorSet, fc: ash::vk::DescriptorSet, wo: Mv, radd_a: ash::vk::DescriptorSet,
     ffn_norm: ash::vk::DescriptorSet, w13: Mv, w2: Mv, radd_f: ash::vk::DescriptorSet,
@@ -869,7 +876,7 @@ pub struct VkModel {
     p_sdpa: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_fp: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     p_fc: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_silu: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     p_add: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_q6k: (ash::vk::Pipeline, ash::vk::PipelineLayout),
-    p_argmax: (ash::vk::Pipeline, ash::vk::PipelineLayout),
+    p_argmax: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_mvrope: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     // owned resources for cleanup
     bufs: Vec<(ash::vk::Buffer, ash::vk::DeviceMemory)>,
     pipes: Vec<(ash::vk::Pipeline, ash::vk::PipelineLayout, ash::vk::DescriptorSetLayout, ash::vk::ShaderModule)>,
@@ -1030,6 +1037,7 @@ impl VkModel {
         let (add_p, add_l, add_sl) = mkpipe(RESIDUAL_ADD_SPV, 2);
         let (q6k_p, q6k_l, q6k_sl) = mkpipe(DECODE_MATVEC_Q6K_SPV, 6);
         let (argmax_p, argmax_l, argmax_sl) = mkpipe(ARGMAX_SPV, 2);
+        let (mvr_p, mvr_l, mvr_sl) = mkpipe(DECODE_MATVEC_Q4K_ROPE_SPV, 5); // fused QKV+rope (q/k)
 
         // Descriptor pool + sets.
         let desc_pool = dv.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets((n_layers * 20 + 16) as u32).pool_sizes(&[
@@ -1077,9 +1085,15 @@ impl VkModel {
             let wo = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.wo, attn, o_buf, n_embd);
             let w13 = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.w13, normed, gu, n_inter * 2);
             let w2 = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.w2, hbuf, ffn_buf, n_embd);
+            let wqb = match &r.wq { VkWeight::Q4 { buf, .. } => *buf, _ => panic!("wq not Q4") };
+            let wkb = match &r.wk { VkWeight::Q4 { buf, .. } => *buf, _ => panic!("wk not Q4") };
+            let u_wqr = vk_uni8(&ctx, &mut bufs, [n_embd as u32, n_embd as u32, (n_embd / 256) as u32, gxof(n_embd / 2), half as u32, 0, 0, 0]);
+            let u_wkr = vk_uni8(&ctx, &mut bufs, [kv_dim as u32, n_embd as u32, (n_embd / 256) as u32, gxof(kv_dim / 2), half as u32, 0, 0, 0]);
+            let wq_rope = mkset(mvr_sl, &[wqb, normed, cos_buf, sin_buf, q], u_wqr);
+            let wk_rope = mkset(mvr_sl, &[wkb, normed, cos_buf, sin_buf, k_buf], u_wkr);
             layers.push(VkLayerOps {
                 attn_norm: mkset(rms_sl, &[x_buf, r.an, normed], u_norm),
-                wq, wk, wv,
+                wq, wk, wv, wq_rope, wk_rope,
                 kvw_k: mkset(kvw_sl, &[r.kc, k_buf], u_base),
                 kvw_v: mkset(kvw_sl, &[r.vc, v_buf], u_base),
                 sdpa: mkset(sdpa_sl, &[q, r.kc, r.vc, attn], u_seq),
@@ -1150,7 +1164,7 @@ impl VkModel {
             layers, s_rope_q, s_rope_k, s_silu, s_final_norm, s_lm, s_argmax, argmax_ptr,
             p_rms: (rms_p, rms_l), p_mv: (mv_p, mv_l), p_rope: (rope_p, rope_l), p_kvw: (kvw_p, kvw_l),
             p_sdpa: (sdpa_p, sdpa_l), p_fp: (fp_p, fp_l), p_fc: (fc_p, fc_l), p_silu: (silu_p, silu_l),
-            p_add: (add_p, add_l), p_q6k: (q6k_p, q6k_l), p_argmax: (argmax_p, argmax_l),
+            p_add: (add_p, add_l), p_q6k: (q6k_p, q6k_l), p_argmax: (argmax_p, argmax_l), p_mvrope: (mvr_p, mvr_l),
             last_rec: std::cell::Cell::new(-1),
             bufs, pipes, desc_pool, cmd_pool, cmd, fence, prefill, ctx,
         })
@@ -1326,10 +1340,12 @@ impl VkModel {
         let skip_attn = mvonly;                               // diag: skip rope+sdpa
         for l in &self.layers {
             if !skip_norm { disp(self.p_rms, l.attn_norm, 1, 1); bar(); }              // attn norm
-            mv(l.wq, n_embd); mv(l.wk, kv_dim); mv(l.wv, kv_dim); bar();               // QKV
+            // QKV with RoPE fused into the wq/wk output (q/k come out rotated);
+            // wv normal (V isn't roped). Removes the separate RoPE dispatch + barrier.
+            disp(self.p_mvrope, l.wq_rope, gxof(n_embd / 2), ((n_embd / 2) as u32).div_ceil(gxof(n_embd / 2)));
+            disp(self.p_mvrope, l.wk_rope, gxof(kv_dim / 2), ((kv_dim / 2) as u32).div_ceil(gxof(kv_dim / 2)));
+            mv(l.wv, kv_dim); bar();                                                   // QKV + rope(q,k)
             if !skip_attn {
-            disp(self.p_rope, self.s_rope_q, ((n_head * half) as u32).div_ceil(64), 1);
-            disp(self.p_rope, self.s_rope_k, ((n_kv * half) as u32).div_ceil(64), 1); bar(); // RoPE q,k
             if !skip_extra { disp(self.p_kvw, l.kvw_k, (kv_dim as u32).div_ceil(64), 1);
             disp(self.p_kvw, l.kvw_v, (kv_dim as u32).div_ceil(64), 1); bar(); }       // append K,V to cache
             if seq_len as usize > SDPA_FLASH_BLOCK {
