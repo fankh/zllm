@@ -158,7 +158,7 @@ Section 3 measured *raw* batched decode (M streams in one forward). This section
 architecture** built on top of it — the machinery that turns that batched kernel into a real
 vLLM-style server: arrivals join the running batch, prompts prefill in bulk, and KV is paged. All on
 the wgpu (`--features gpu`) path, enabled at startup with `ZLLM_CB=1`, exposed at
-`POST /v1/cb/completions` (SSE stream or JSON, greedy argmax). **Every layer validated bit-identical
+`POST /v1/cb/completions` (SSE stream or JSON, greedy **or temperature sampling**). **Every layer validated bit-identical
 to single-stream decode.**
 
 | capability | what it does | result |
@@ -168,6 +168,7 @@ to single-stream decode.**
 | **Batched prefill-into-slot** | prefill a whole prompt in one coopmat pass per 128 tokens (staggered positions → the decode SDPA *is* causal prefill), not one forward per token | **30× faster** (201-tok prompt: 470 ms vs 14.3 s), bit-identical; kills admission head-of-line blocking |
 | **Paged KV (PagedAttention)** | KV is a shared pool of 16-position blocks + per-slot block table; pool sized to *actual* use, not m_max × max_seq | **4× less KV memory** (8 seqs in a 64-block pool vs 256 contiguous), bit-identical, blocks recycled on evict |
 | **Prefix KV-cache reuse** | refcounted blocks + prefix→block hash map; a new prompt sharing a leading prefix (e.g. a system prompt) reuses those KV blocks and prefills only the suffix | a request sharing a 40-tok prefix **reuses 2 blocks (skips that prefill)**, output bit-identical to cold |
+| **Temperature sampling** | per-stream `temperature`+`seed` via the Gumbel-max trick (sampling = argmax of `logit/temp + gumbel`), so it reuses the per-stream argmax reduction — no full-logit readback | temp=0 ≡ greedy (seed-independent), temp>0 reproducible per seed; coherent varied output |
 
 Notes / honest scope:
 - This raises **aggregate throughput under concurrency** (the right serving metric) — it doesn't change
@@ -212,6 +213,7 @@ cargo test --release --features gpu --lib gpu_batch_server      -- --ignored --n
 cargo test --release --features gpu --lib gpu_prefill_slot      -- --ignored --nocapture  # batched prefill 30x vs sequential, bit-identical
 cargo test --release --features gpu --lib gpu_paged_overcommit  -- --ignored --nocapture  # paged KV: 4x less mem, recycled, bit-identical
 cargo test --release --features gpu --lib gpu_prefix_cache      -- --ignored --nocapture  # cross-request prefix reuse, bit-identical to cold
+cargo test --release --features gpu --lib gpu_sampling          -- --ignored --nocapture  # temp=0 ≡ greedy, temp>0 reproducible per seed
 # Server: build --features gpu, run with ZLLM_CB=1 (ZLLM_CB_SLOTS / ZLLM_CB_SEQ), POST /v1/cb/completions {prompt, max_tokens, stream}
 
 # zllm Phase 2 (raw-Vulkan coopmat) — --features vulkan
