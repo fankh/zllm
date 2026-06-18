@@ -236,13 +236,13 @@ impl GpuContext {
     }
     /// Batched DECODE SDPA: each of `m` streams attends its own KV cache.
     #[allow(clippy::too_many_arguments)]
-    fn record_bdsdpa(&self, enc: &mut wgpu::CommandEncoder, q: &wgpu::Buffer, kc: &wgpu::Buffer, vc: &wgpu::Buffer, out: &wgpu::Buffer, posb: &wgpu::Buffer, n_head: usize, n_kv_head: usize, head_dim: usize, m: usize, max_seq: usize) {
+    fn record_bdsdpa(&self, enc: &mut wgpu::CommandEncoder, q: &wgpu::Buffer, kc: &wgpu::Buffer, vc: &wgpu::Buffer, out: &wgpu::Buffer, posb: &wgpu::Buffer, slots: &wgpu::Buffer, n_head: usize, n_kv_head: usize, head_dim: usize, m: usize, max_seq: usize) {
         use wgpu::util::DeviceExt;
         let pbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None, contents: bytemuck::cast_slice(&[n_head as u32, n_kv_head as u32, head_dim as u32, m as u32, max_seq as u32, 0u32, 0u32, 0u32]), usage: wgpu::BufferUsages::UNIFORM });
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None, layout: &self.bdsdpa_pipeline.get_bind_group_layout(0),
-            entries: &[bge(0, q), bge(1, kc), bge(2, vc), bge(3, out), bge(4, posb), bge(5, &pbuf)] });
+            entries: &[bge(0, q), bge(1, kc), bge(2, vc), bge(3, out), bge(4, posb), bge(5, slots), bge(6, &pbuf)] });
         let mut p = enc.begin_compute_pass(&Default::default());
         p.set_pipeline(&self.bdsdpa_pipeline); p.set_bind_group(0, &bg, &[]);
         p.dispatch_workgroups(((m * n_head) as u32).div_ceil(64), 1, 1);
@@ -1123,7 +1123,8 @@ struct BP { n_head: u32, n_kv_head: u32, head_dim: u32, m_streams: u32, max_seq:
 @group(0) @binding(2) var<storage, read>       vc:   array<f32>;
 @group(0) @binding(3) var<storage, read_write> outp: array<f32>;
 @group(0) @binding(4) var<storage, read>       posb: array<u32>;
-@group(0) @binding(5) var<uniform>             p:    BP;
+@group(0) @binding(5) var<storage, read>       slots: array<u32>;  // cache slot for each batch position
+@group(0) @binding(6) var<uniform>             p:    BP;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
@@ -1134,7 +1135,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let scale = 1.0 / sqrt(f32(hd));
     let seq_len = posb[s] + 1u;
     let q_base = s * (p.n_head * hd) + h * hd;
-    let stream_kv = s * p.max_seq * p.n_kv_head * hd;   // base of stream s's cache
+    let stream_kv = slots[s] * p.max_seq * p.n_kv_head * hd;   // base of this seq's cache slot
     var av: array<f32, 128>;
     for (var d: u32 = 0u; d < hd; d = d + 1u) { av[d] = 0.0; }
     var mx: f32 = -1e30; var l: f32 = 0.0;
@@ -2516,7 +2517,7 @@ pub struct BatchedDecoder<'a> {
     k_b: wgpu::Buffer, v_b: wgpu::Buffer, attn_b: wgpu::Buffer,
     gate_b: wgpu::Buffer, up_b: wgpu::Buffer, h_b: wgpu::Buffer,
     cos_b: wgpu::Buffer, sin_b: wgpu::Buffer, logits_b: wgpu::Buffer,
-    pos_buf: wgpu::Buffer, argmax_out: wgpu::Buffer, argmax_read: wgpu::Buffer,
+    pos_buf: wgpu::Buffer, slots_buf: wgpu::Buffer, argmax_out: wgpu::Buffer, argmax_read: wgpu::Buffer,
     k_caches: Vec<wgpu::Buffer>, v_caches: Vec<wgpu::Buffer>,
 }
 
@@ -2538,7 +2539,7 @@ impl<'a> BatchedDecoder<'a> {
             k_b: asrc(m_max * kv_dim), v_b: asrc(m_max * kv_dim), attn_b: a(m_max * attn_dim),
             gate_b: a(m_max * n_inter), up_b: a(m_max * n_inter), h_b: a(m_max * n_inter),
             cos_b: a(m_max * half), sin_b: a(m_max * half), logits_b: a(m_max * vocab),
-            pos_buf: a(m_max), argmax_out: asrc(m_max),
+            pos_buf: a(m_max), slots_buf: a(m_max), argmax_out: asrc(m_max),
             argmax_read: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("bd-argmax-read"), size: (m_max * 4) as u64,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
@@ -2546,13 +2547,21 @@ impl<'a> BatchedDecoder<'a> {
         }
     }
 
-    /// One batched step: stream s decodes `tokens[s]` at `positions[s]` —
-    /// writes its K/V to its cache there, attends 0..=positions[s] — and
-    /// returns the greedy next token per stream. Caller advances positions.
+    /// One batched step over the active streams 0..m (cache slots 0..m).
     pub fn step(&self, tokens: &[u32], positions: &[u32]) -> Vec<u32> {
+        let slots: Vec<u32> = (0..tokens.len() as u32).collect();
+        self.step_slotted(tokens, positions, &slots)
+    }
+
+    /// One batched step: batch position i decodes `tokens[i]` at `positions[i]`
+    /// using KV cache **slot** `slots[i]` — writes its K/V to slot[i]'s cache at
+    /// positions[i], attends 0..=positions[i] — and returns the greedy next
+    /// token per batch position. Decoupling slot from batch position lets a
+    /// sequence keep its KV across admission/eviction (continuous batching).
+    pub fn step_slotted(&self, tokens: &[u32], positions: &[u32], slots: &[u32]) -> Vec<u32> {
         let ctx = &self.model.ctx;
         let m = tokens.len();
-        assert!(m <= self.m_max && m == positions.len() && m >= 1);
+        assert!(m <= self.m_max && m == positions.len() && m == slots.len() && m >= 1);
         let (n_embd, n_head, n_kv_head, head_dim, n_inter, vocab, eps) = (
             self.model.n_embd, self.model.n_head, self.model.n_kv_head,
             self.model.head_dim, self.model.n_inter, self.model.vocab, self.model.eps);
@@ -2575,6 +2584,7 @@ impl<'a> BatchedDecoder<'a> {
         ctx.queue.write_buffer(&self.cos_b, 0, bytemuck::cast_slice(&cos_host));
         ctx.queue.write_buffer(&self.sin_b, 0, bytemuck::cast_slice(&sin_host));
         ctx.queue.write_buffer(&self.pos_buf, 0, bytemuck::cast_slice(positions));
+        ctx.queue.write_buffer(&self.slots_buf, 0, bytemuck::cast_slice(slots));
 
         let mut enc = ctx.device.create_command_encoder(&Default::default());
         for (li, layer) in self.model.layers.iter().enumerate() {
@@ -2584,14 +2594,14 @@ impl<'a> BatchedDecoder<'a> {
             ctx.record_gemm(&mut enc, &layer.wv, &self.normed_b, &self.v_b, n_embd, m, 0);
             ctx.record_brope(&mut enc, &self.q_b, &self.cos_b, &self.sin_b, n_head, head_dim, m);
             ctx.record_brope(&mut enc, &self.k_b, &self.cos_b, &self.sin_b, n_kv_head, head_dim, m);
-            // scatter each stream's new K/V into its own cache at its position
+            // scatter each batch position's new K/V into its cache SLOT at its position
             for s in 0..m {
-                let dst = ((s * self.max_seq + positions[s] as usize) * kv_dim * 4) as u64;
+                let dst = ((slots[s] as usize * self.max_seq + positions[s] as usize) * kv_dim * 4) as u64;
                 let src = (s * kv_dim * 4) as u64;
                 enc.copy_buffer_to_buffer(&self.k_b, src, &self.k_caches[li], dst, (kv_dim * 4) as u64);
                 enc.copy_buffer_to_buffer(&self.v_b, src, &self.v_caches[li], dst, (kv_dim * 4) as u64);
             }
-            ctx.record_bdsdpa(&mut enc, &self.q_b, &self.k_caches[li], &self.v_caches[li], &self.attn_b, &self.pos_buf, n_head, n_kv_head, head_dim, m, self.max_seq);
+            ctx.record_bdsdpa(&mut enc, &self.q_b, &self.k_caches[li], &self.v_caches[li], &self.attn_b, &self.pos_buf, &self.slots_buf, n_head, n_kv_head, head_dim, m, self.max_seq);
             ctx.record_gemm(&mut enc, &layer.wo, &self.attn_b, &self.x_b, attn_dim, m, 1);
             ctx.record_bnorm(&mut enc, &self.x_b, &layer.ffn_norm_w, &self.normed_b, n_embd, eps, m);
             ctx.record_gemm(&mut enc, &layer.w1, &self.normed_b, &self.gate_b, n_embd, m, 0);
@@ -2610,6 +2620,62 @@ impl<'a> BatchedDecoder<'a> {
         ctx.device.poll(wgpu::Maintain::Wait);
         let out = bytemuck::cast_slice::<u8, u32>(&slice.get_mapped_range()).to_vec();
         self.argmax_read.unmap();
+        out
+    }
+}
+
+struct CbSeq { id: u64, slot: u32, pos: u32, next: u32, n_gen: usize, max_tokens: usize, eos: u32 }
+
+/// Continuous (in-flight) batching scheduler over a `BatchedDecoder`. Sequences
+/// are admitted at any time — their prompt is prefilled into a free KV slot —
+/// and then all active sequences are decoded together each step regardless of
+/// arrival time; finished sequences free their slot for new arrivals. This is
+/// the single-device equivalent of datacenter in-flight batching: the GPU runs
+/// a full batch instead of one request at a time.
+pub struct ContinuousBatcher<'a> {
+    dec: BatchedDecoder<'a>,
+    free: Vec<u32>,
+    active: Vec<CbSeq>,
+}
+
+impl<'a> ContinuousBatcher<'a> {
+    pub fn new(model: &'a GpuModel, m_max: usize, max_seq: usize) -> Self {
+        Self { dec: model.batched_decoder(m_max, max_seq), free: (0..m_max as u32).rev().collect(), active: Vec::new() }
+    }
+    pub fn has_free(&self) -> bool { !self.free.is_empty() }
+    pub fn active_len(&self) -> usize { self.active.len() }
+
+    /// Admit a sequence: prefill its prompt into a free KV slot (sequential for
+    /// now — batched-prefill-into-slot is a follow-up) and join the decode
+    /// batch. Returns the first generated token, or None if no slot is free.
+    pub fn admit(&mut self, id: u64, prompt: &[u32], max_tokens: usize, eos: u32) -> Option<u32> {
+        let slot = self.free.pop()?;
+        let mut g = 0u32;
+        for (i, &tk) in prompt.iter().enumerate() { g = self.dec.step_slotted(&[tk], &[i as u32], &[slot])[0]; }
+        self.active.push(CbSeq { id, slot, pos: prompt.len() as u32, next: g, n_gen: 1, max_tokens, eos });
+        Some(g)
+    }
+
+    /// One decode step over all active sequences. Returns (id, new_token) for
+    /// each, and evicts (frees the slot of) any sequence that hit EOS/max_tokens.
+    pub fn step(&mut self) -> Vec<(u64, u32)> {
+        if self.active.is_empty() { return Vec::new(); }
+        let toks: Vec<u32> = self.active.iter().map(|s| s.next).collect();
+        let pos: Vec<u32> = self.active.iter().map(|s| s.pos).collect();
+        let slots: Vec<u32> = self.active.iter().map(|s| s.slot).collect();
+        let nexts = self.dec.step_slotted(&toks, &pos, &slots);
+        let mut out = Vec::with_capacity(nexts.len());
+        for (i, &nt) in nexts.iter().enumerate() {
+            let s = &mut self.active[i];
+            s.pos += 1; s.next = nt; s.n_gen += 1;
+            out.push((s.id, nt));
+        }
+        let free = &mut self.free;
+        self.active.retain(|s| {
+            let done = s.next == s.eos || s.n_gen >= s.max_tokens;
+            if done { free.push(s.slot); }
+            !done
+        });
         out
     }
 }
@@ -3602,6 +3668,55 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// then measures aggregate tok/s vs concurrency — the compute-bound
     /// amortization that single-stream (bandwidth-bound) decode can't reach.
     /// `cargo test --release --features gpu --lib gpu_batched_decode -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    /// Continuous-batching correctness + aggregate throughput: run N sequences
+    /// each alone (reference), then all together through one ContinuousBatcher,
+    /// and assert every sequence's greedy output is identical (the batch must not
+    /// couple sequences) + report aggregate tok/s.
+    /// `cargo test --release --features gpu --lib gpu_continuous_batch -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gpu_continuous_batch() {
+        use std::time::Instant;
+        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() { eprintln!("model not found; skipping"); return; }
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU ({e}); skipping"); return; } };
+        let model = GpuModel::load(path, ctx).expect("load");
+        let prompts: Vec<Vec<u32>> = vec![
+            vec![128000, 791, 6864, 315, 9822, 374],
+            vec![128000, 15724, 374, 264, 1296],
+            vec![128000, 9906, 1917, 11],
+            vec![128000, 791, 4205, 315, 2324, 374],
+        ];
+        let (k, eos, max_seq) = (10usize, u32::MAX, 256usize); // eos disabled → all run exactly k tokens
+
+        // Reference: each sequence alone through its own batcher (m=1).
+        let mut refs: Vec<Vec<u32>> = Vec::new();
+        for p in &prompts {
+            let mut cb = ContinuousBatcher::new(&model, 1, max_seq);
+            let mut toks = vec![cb.admit(0, p, k, eos).unwrap()];
+            while cb.active_len() > 0 { for (_id, t) in cb.step() { toks.push(t); } }
+            refs.push(toks);
+        }
+        // Batched: all sequences in one batcher.
+        let mut cb = ContinuousBatcher::new(&model, prompts.len(), max_seq);
+        let mut got: std::collections::HashMap<u64, Vec<u32>> = Default::default();
+        for (i, p) in prompts.iter().enumerate() { let g = cb.admit(i as u64, p, k, eos).unwrap(); got.entry(i as u64).or_default().push(g); }
+        let t0 = Instant::now();
+        while cb.active_len() > 0 { for (id, t) in cb.step() { got.get_mut(&id).unwrap().push(t); } }
+        let dt = t0.elapsed().as_secs_f64();
+        let total: usize = got.values().map(|v| v.len() - 1).sum(); // exclude admit token; count decode steps
+        let mut all_match = true;
+        for (i, r) in refs.iter().enumerate() {
+            let g = &got[&(i as u64)];
+            if g != r { all_match = false; eprintln!("seq {i} MISMATCH:\n  batch={g:?}\n  ref  ={r:?}"); }
+        }
+        eprintln!("continuous batch: {} seqs x {k} tok, decode {total} tok in {dt:.2}s => {:.0} tok/s aggregate", prompts.len(), total as f64 / dt);
+        assert!(all_match, "batched sequences diverged from single-stream");
+        eprintln!("all {} sequences match single-stream decode", prompts.len());
+    }
+
     #[test]
     #[ignore]
     fn gpu_batched_decode_throughput() {
