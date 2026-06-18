@@ -172,6 +172,7 @@ sampling. **Every layer validated bit-identical to single-stream decode.**
 | **Prefix KV-cache reuse** | refcounted blocks + prefix→block hash map; a new prompt sharing a leading prefix (e.g. a system prompt) reuses those KV blocks and prefills only the suffix | a request sharing a 40-tok prefix **reuses 2 blocks (skips that prefill)**, output bit-identical to cold |
 | **Sampling (temp / top-k / top-p)** | temperature via Gumbel-max (argmax of `logit/temp + gumbel`, no readback); top-k/top-p via a GPU top-K(64) kernel + CPU nucleus sample (reads back M×64, not M×vocab); per-stream `temperature`/`top_k`/`top_p`/`seed` | temp=0 ≡ greedy; reproducible per seed; GPU top-64 bit-matches a CPU sort; coherent varied output |
 | **Preemption (recompute)** | optimistic admission; when a running sequence can't grow, evict (free KV of) a LIFO victim and recompute it later (re-prefill prompt++produced, prefix cache reuses the prompt) — makes paged-KV overcommit *safe* | a sequence preempted mid-generation resumes **bit-identical** to never being preempted |
+| **Chunked prefill** | a long prompt prefills one chunk (128 tok) per scheduler step, interleaved with the decode of the active batch (prefill-priority), instead of one synchronous multi-chunk admission | a 301-tok prompt prefills over 3 steps while a short seq decodes 4 tokens **during** it; output bit-identical — no long-prompt HOL blocking |
 
 Notes / honest scope:
 - This raises **aggregate throughput under concurrency** (the right serving metric) — it doesn't change
@@ -220,6 +221,7 @@ cargo test --release --features gpu --lib gpu_sampling          -- --ignored --n
 cargo test --release --features gpu --lib gpu_btopk_kernel      --            --nocapture  # GPU top-64 == CPU sort (no model needed)
 cargo test --release --features gpu --lib gpu_topkp             -- --ignored --nocapture  # top-k/top-p: temp=0 ≡ greedy, reproducible
 cargo test --release --features gpu --lib gpu_preemption        -- --ignored --nocapture  # preemption bit-identical to no-preemption
+cargo test --release --features gpu --lib gpu_chunked_prefill   -- --ignored --nocapture  # long prefill interleaves w/ decode, bit-identical
 # Server: build --features gpu, run with ZLLM_CB=1 (ZLLM_CB_SLOTS / ZLLM_CB_SEQ), POST /v1/cb/completions {prompt, max_tokens, stream}
 
 # zllm Phase 2 (raw-Vulkan coopmat) — --features vulkan
