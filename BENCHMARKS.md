@@ -157,9 +157,11 @@ Key Phase-2 levers (all bit-exact):
 Section 3 measured *raw* batched decode (M streams in one forward). This section is the **serving
 architecture** built on top of it — the machinery that turns that batched kernel into a real
 vLLM-style server: arrivals join the running batch, prompts prefill in bulk, and KV is paged. All on
-the wgpu (`--features gpu`) path, enabled at startup with `ZLLM_CB=1`, exposed at
-`POST /v1/cb/completions` (SSE stream or JSON, greedy **or temperature sampling**). **Every layer validated bit-identical
-to single-stream decode.**
+the wgpu (`--features gpu`) path, enabled at startup with `ZLLM_CB=1`. When on, **eligible
+`/v1/chat/completions` requests route through it automatically** (it becomes the default chat backend —
+inspection-off, no grammar/spec-decode/PLD/early-exit; those fall through to the candle path), and it
+is also exposed directly at `POST /v1/cb/completions`. SSE stream or JSON; greedy or temp/top-k/top-p
+sampling. **Every layer validated bit-identical to single-stream decode.**
 
 | capability | what it does | result |
 |---|---|---|
