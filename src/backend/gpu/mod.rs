@@ -61,6 +61,8 @@ pub struct GpuContext {
     /// key positions are gathered through a per-slot block table (PagedAttention).
     bdsdpa_paged_pipeline: wgpu::ComputePipeline,
     bargmax_pipeline: wgpu::ComputePipeline,
+    /// Batched temperature sampling (Gumbel-max argmax over perturbed logits).
+    bsample_pipeline: wgpu::ComputePipeline,
 }
 
 /// A dense f32 weight matrix resident on the GPU (row-major).
@@ -149,6 +151,7 @@ impl GpuContext {
         let bdsdpa_pipeline = Self::make_pipeline(&device, "bdsdpa", BDSDPA_WGSL);
         let bdsdpa_paged_pipeline = Self::make_pipeline(&device, "bdsdpa-paged", BDSDPA_PAGED_WGSL);
         let bargmax_pipeline = Self::make_pipeline(&device, "bargmax", BARGMAX_WGSL);
+        let bsample_pipeline = Self::make_pipeline(&device, "bsample", BSAMPLE_WGSL);
 
         Ok(Self {
             device,
@@ -174,6 +177,7 @@ impl GpuContext {
             bdsdpa_pipeline,
             bdsdpa_paged_pipeline,
             bargmax_pipeline,
+            bsample_pipeline,
         })
     }
 
@@ -277,6 +281,20 @@ impl GpuContext {
             entries: &[bge(0, logits), bge(1, out_idx), bge(2, &pbuf)] });
         let mut p = enc.begin_compute_pass(&Default::default());
         p.set_pipeline(&self.bargmax_pipeline); p.set_bind_group(0, &bg, &[]);
+        p.dispatch_workgroups(m as u32, 1, 1);
+    }
+    /// Batched temperature sampling: one workgroup per stream draws from
+    /// softmax(logits[s]/temp[s]) via Gumbel-max → `out_idx[s]`. `temp[s] ≤ 0`
+    /// is greedy. `seed[s]` should advance each step for fresh draws.
+    fn record_bsample(&self, enc: &mut wgpu::CommandEncoder, logits: &wgpu::Buffer, out_idx: &wgpu::Buffer, temp: &wgpu::Buffer, seed: &wgpu::Buffer, vocab: usize, m: usize) {
+        use wgpu::util::DeviceExt;
+        let pbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::cast_slice(&[vocab as u32, m as u32]), usage: wgpu::BufferUsages::UNIFORM });
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.bsample_pipeline.get_bind_group_layout(0),
+            entries: &[bge(0, logits), bge(1, out_idx), bge(2, temp), bge(3, seed), bge(4, &pbuf)] });
+        let mut p = enc.begin_compute_pass(&Default::default());
+        p.set_pipeline(&self.bsample_pipeline); p.set_bind_group(0, &bg, &[]);
         p.dispatch_workgroups(m as u32, 1, 1);
     }
 
@@ -1238,6 +1256,67 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     var bv: f32 = -1e30; var bi: u32 = 0u;
     var k = t;
     loop { if (k >= p.vocab) { break; } let v = logits[base + k]; if (v > bv) { bv = v; bi = k; } k = k + 256u; }
+    vmax[t] = bv; imax[t] = bi;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (t < stride) {
+            if (vmax[t + stride] > vmax[t]) { vmax[t] = vmax[t + stride]; imax[t] = imax[t + stride]; }
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if (t == 0u) { out_idx[s] = imax[0]; }
+}
+"#;
+
+/// Batched temperature sampling via the Gumbel-max trick: a categorical draw
+/// from softmax(logits/temp) equals argmax_i(logits[i]/temp + g_i) with
+/// g_i = -log(-log(u_i)), u_i ~ Uniform(0,1). So this is BARGMAX over a perturbed
+/// score — same workgroup-per-stream reduction, no full-logit readback. Per
+/// stream: `temp[s]` (≤0 → greedy, no noise) and `seed[s]` (advance each step).
+const BSAMPLE_WGSL: &str = r#"
+struct BS { vocab: u32, m_streams: u32 };
+@group(0) @binding(0) var<storage, read>       logits:  array<f32>;
+@group(0) @binding(1) var<storage, read_write> out_idx: array<u32>;
+@group(0) @binding(2) var<storage, read>       temp:    array<f32>;
+@group(0) @binding(3) var<storage, read>       seed:    array<u32>;
+@group(0) @binding(4) var<uniform>             p:       BS;
+var<workgroup> vmax: array<f32, 256>;
+var<workgroup> imax: array<u32, 256>;
+fn hash_u32(x: u32) -> u32 {
+    var h = x;
+    h = h ^ (h >> 16u); h = h * 0x7feb352du;
+    h = h ^ (h >> 15u); h = h * 0x846ca68bu;
+    h = h ^ (h >> 16u);
+    return h;
+}
+fn rand01(s: u32, i: u32) -> f32 {
+    let r = hash_u32(s ^ hash_u32(i));
+    return (f32(r >> 8u) + 0.5) / 16777216.0;   // strictly in (0,1)
+}
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let s = wid.x; let t = lid.x;
+    if (s >= p.m_streams) { return; }
+    let base = s * p.vocab;
+    let temp_s = temp[s];
+    let greedy = temp_s <= 0.0;
+    let inv_t = select(1.0 / temp_s, 1.0, greedy);
+    let sd = seed[s];
+    var bv: f32 = -1e30; var bi: u32 = 0u;
+    var k = t;
+    loop {
+        if (k >= p.vocab) { break; }
+        var v = logits[base + k];
+        if (!greedy) {
+            let u = rand01(sd, k);
+            v = v * inv_t + (-log(-log(u)));     // logit/temp + Gumbel noise
+        }
+        if (v > bv) { bv = v; bi = k; }
+        k = k + 256u;
+    }
     vmax[t] = bv; imax[t] = bi;
     workgroupBarrier();
     var stride = 128u;
@@ -2608,6 +2687,8 @@ pub struct BatchedDecoder<'a> {
     gate_b: wgpu::Buffer, up_b: wgpu::Buffer, h_b: wgpu::Buffer,
     cos_b: wgpu::Buffer, sin_b: wgpu::Buffer, logits_b: wgpu::Buffer,
     pos_buf: wgpu::Buffer, slots_buf: wgpu::Buffer, argmax_out: wgpu::Buffer, argmax_read: wgpu::Buffer,
+    // Per-stream sampling params (temperature ≤0 = greedy; seed advances per step).
+    temp_buf: wgpu::Buffer, seed_buf: wgpu::Buffer,
     // Paged KV: a shared pool of physical blocks (n_blocks × block_size positions
     // each) per layer, plus a per-slot block table mapping logical → physical
     // blocks. Decouples a sequence's KV from a contiguous max_seq reservation.
@@ -2714,7 +2795,7 @@ impl<'a> BatchedDecoder<'a> {
             k_b: asrc(row_cap * kv_dim), v_b: asrc(row_cap * kv_dim), attn_b: a(row_cap * attn_dim),
             gate_b: a(row_cap * n_inter), up_b: a(row_cap * n_inter), h_b: a(row_cap * n_inter),
             cos_b: a(row_cap * half), sin_b: a(row_cap * half), logits_b: a(m_max * vocab),
-            pos_buf: a(row_cap), slots_buf: a(row_cap), argmax_out: asrc(m_max),
+            pos_buf: a(row_cap), slots_buf: a(row_cap), temp_buf: a(m_max), seed_buf: a(m_max), argmax_out: asrc(m_max),
             argmax_read: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("bd-argmax-read"), size: (m_max * 4) as u64,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
@@ -2794,19 +2875,31 @@ impl<'a> BatchedDecoder<'a> {
     /// token per batch position. Decoupling slot from batch position lets a
     /// sequence keep its KV across admission/eviction (continuous batching).
     pub fn step_slotted(&self, tokens: &[u32], positions: &[u32], slots: &[u32]) -> Vec<u32> {
+        self.step_core(tokens, positions, slots, None)
+    }
+
+    /// Like `step_slotted` but draws each next token from softmax(logits/temp[s])
+    /// with per-stream `temps`/`seeds` (temp ≤ 0 → greedy). Same forward; only the
+    /// final per-stream reduction changes (argmax → Gumbel-max sample).
+    pub fn step_slotted_sample(&self, tokens: &[u32], positions: &[u32], slots: &[u32], temps: &[f32], seeds: &[u32]) -> Vec<u32> {
+        assert!(temps.len() == tokens.len() && seeds.len() == tokens.len());
+        self.step_core(tokens, positions, slots, Some((temps, seeds)))
+    }
+
+    fn step_core(&self, tokens: &[u32], positions: &[u32], slots: &[u32], sampling: Option<(&[f32], &[u32])>) -> Vec<u32> {
         let ctx = &self.model.ctx;
         let m = tokens.len();
         assert!(m <= self.m_max && m == positions.len() && m == slots.len() && m >= 1);
-        let (n_embd, vocab, eps) = (self.model.n_embd, self.model.vocab, self.model.eps);
+        let (n_embd, eps) = (self.model.n_embd, self.model.eps);
 
         self.write_inputs(tokens, positions, slots);
         let phys = self.prepare_paging(m, positions, slots);
         let mut enc = ctx.device.create_command_encoder(&Default::default());
         self.record_layers(&mut enc, m, &phys);
-        // Decode: every row predicts a next token → lm_head + argmax over all m.
+        // Decode: every row predicts a next token → lm_head + (argmax | sample) over all m.
         ctx.record_bnorm(&mut enc, &self.x_b, &self.model.final_norm_w, &self.normed_b, n_embd, eps, m);
         ctx.record_gemm(&mut enc, &self.model.lm_head, &self.normed_b, &self.logits_b, n_embd, m, 0);
-        ctx.record_bargmax(&mut enc, &self.logits_b, &self.argmax_out, vocab, m);
+        self.record_select(&mut enc, m, sampling);
         enc.copy_buffer_to_buffer(&self.argmax_out, 0, &self.argmax_read, 0, (m * 4) as u64);
         ctx.queue.submit([enc.finish()]);
         ctx.device.poll(wgpu::Maintain::Wait);
@@ -2816,6 +2909,21 @@ impl<'a> BatchedDecoder<'a> {
         let out = bytemuck::cast_slice::<u8, u32>(&slice.get_mapped_range()).to_vec();
         self.argmax_read.unmap();
         out
+    }
+
+    /// Record the final per-stream token selection over `logits_b[m, vocab]`:
+    /// greedy argmax (None) or temperature sampling (Some((temps, seeds))).
+    fn record_select(&self, enc: &mut wgpu::CommandEncoder, m: usize, sampling: Option<(&[f32], &[u32])>) {
+        let ctx = &self.model.ctx;
+        let vocab = self.model.vocab;
+        match sampling {
+            None => ctx.record_bargmax(enc, &self.logits_b, &self.argmax_out, vocab, m),
+            Some((temps, seeds)) => {
+                ctx.queue.write_buffer(&self.temp_buf, 0, bytemuck::cast_slice(temps));
+                ctx.queue.write_buffer(&self.seed_buf, 0, bytemuck::cast_slice(seeds));
+                ctx.record_bsample(enc, &self.logits_b, &self.argmax_out, &self.temp_buf, &self.seed_buf, vocab, m);
+            }
+        }
     }
 
     /// Batched prefill of a whole prompt into one KV cache `slot`, in a single
@@ -2828,7 +2936,7 @@ impl<'a> BatchedDecoder<'a> {
     /// generated token (argmax at the last prompt position). Long prompts are
     /// chunked; chunk k attends all earlier chunks' K/V already resident in slot.
     pub fn prefill_slot(&self, prompt: &[u32], slot: u32) -> u32 {
-        self.prefill_slot_from(prompt, slot, 0)
+        self.prefill_slot_from(prompt, slot, 0, None)
     }
 
     /// Prefix-cached prefill: reuse already-resident KV blocks for the longest
@@ -2837,7 +2945,7 @@ impl<'a> BatchedDecoder<'a> {
     /// where `cached_len` positions were served from cache (0 = cold). The reused
     /// blocks' KV is bit-identical to recomputing them (KV at position p depends
     /// only on tokens[0..=p]), so output is unchanged — just less prefill compute.
-    pub fn prefill_slot_cached(&self, prompt: &[u32], slot: u32) -> (u32, usize) {
+    pub fn prefill_slot_cached(&self, prompt: &[u32], slot: u32, samp: Option<(f32, u32)>) -> (u32, usize) {
         let p = prompt.len();
         assert!(p >= 1 && p <= self.max_seq);
         let bsz = self.block_size;
@@ -2867,7 +2975,7 @@ impl<'a> BatchedDecoder<'a> {
         }
         let cached_len = cached_blocks * bsz;
         // 2. Prefill the suffix [cached_len .. p) (new blocks allocated on demand).
-        let first = self.prefill_slot_from(prompt, slot, cached_len);
+        let first = self.prefill_slot_from(prompt, slot, cached_len, samp);
         // 3. Register the newly-filled FULL blocks so later prompts can reuse them.
         {
             let mut bs = self.blocks.borrow_mut();
@@ -2890,14 +2998,17 @@ impl<'a> BatchedDecoder<'a> {
 
     /// Prefill `prompt` positions `[start_pos .. len)` into `slot`, assuming the
     /// prefix `[0 .. start_pos)` is already resident in the slot's KV (via reused
-    /// cache blocks). Returns the greedy first generated token.
-    pub fn prefill_slot_from(&self, prompt: &[u32], slot: u32, start_pos: usize) -> u32 {
+    /// cache blocks). The first generated token is greedy (`samp = None`) or drawn
+    /// from softmax(logits/temp) with a single `(temp, seed)`.
+    pub fn prefill_slot_from(&self, prompt: &[u32], slot: u32, start_pos: usize, samp: Option<(f32, u32)>) -> u32 {
         let ctx = &self.model.ctx;
         let p = prompt.len();
         assert!(p >= 1, "prefill needs a non-empty prompt");
         assert!(p <= self.max_seq, "prompt len {p} exceeds max_seq {}", self.max_seq);
         assert!(start_pos < p, "start_pos {start_pos} must be < prompt len {p}");
-        let (n_embd, vocab, eps) = (self.model.n_embd, self.model.vocab, self.model.eps);
+        let (n_embd, eps) = (self.model.n_embd, self.model.eps);
+        let (tarr, sarr): ([f32; 1], [u32; 1]);
+        let sampling = match samp { Some((t, s)) => { (tarr, sarr) = ([t], [s]); Some((&tarr[..], &sarr[..])) } None => None };
         let mut first_tok = 0u32;
         let mut start = start_pos;
         while start < p {
@@ -2920,7 +3031,7 @@ impl<'a> BatchedDecoder<'a> {
                     &self.q_b
                 } else { &self.normed_b };
                 ctx.record_gemm(&mut enc, &self.model.lm_head, src, &self.logits_b, n_embd, 1, 0);
-                ctx.record_bargmax(&mut enc, &self.logits_b, &self.argmax_out, vocab, 1);
+                self.record_select(&mut enc, 1, sampling);
                 enc.copy_buffer_to_buffer(&self.argmax_out, 0, &self.argmax_read, 0, 4);
             }
             ctx.queue.submit([enc.finish()]);
@@ -3016,7 +3127,11 @@ impl<'a> BatchedDecoder<'a> {
     }
 }
 
-struct CbSeq { id: u64, slot: u32, pos: u32, next: u32, n_gen: usize, max_tokens: usize, eos: u32 }
+struct CbSeq { id: u64, slot: u32, pos: u32, next: u32, n_gen: usize, max_tokens: usize, eos: u32, temp: f32, base_seed: u32 }
+
+/// Per-token sampling seed: decorrelate by generation index (the kernel further
+/// hashes (seed, token_id), so a cheap mix here is enough).
+fn step_seed(base: u32, gen_idx: u32) -> u32 { base.wrapping_add(gen_idx.wrapping_mul(0x9E3779B1)) }
 
 /// Continuous (in-flight) batching scheduler over a `BatchedDecoder`. Sequences
 /// are admitted at any time — their prompt is prefilled into a free KV slot —
@@ -3056,17 +3171,25 @@ impl<'a> ContinuousBatcher<'a> {
     /// free OR the KV pool can't fit prompt+max_tokens (caller should retry later;
     /// with the default full pool this never trips).
     pub fn admit(&mut self, id: u64, prompt: &[u32], max_tokens: usize, eos: u32) -> Option<(u32, bool)> {
+        self.admit_sampled(id, prompt, max_tokens, eos, 0.0, 0)
+    }
+
+    /// Admit with sampling: each token is drawn from softmax(logits/`temp`)
+    /// (`temp ≤ 0` = greedy), seeded by `seed` (reproducible per request).
+    pub fn admit_sampled(&mut self, id: u64, prompt: &[u32], max_tokens: usize, eos: u32, temp: f32, seed: u32) -> Option<(u32, bool)> {
         // Conservative admission: ensure room for the whole generation up front
         // (lazy block alloc + no preemption → don't admit what can't finish).
         if !self.dec.can_fit(prompt.len() + max_tokens) { return None; }
         let slot = self.free.pop()?;
-        let (g, _cached_len) = self.dec.prefill_slot_cached(prompt, slot); // reuse shared-prefix KV; prefill the rest
+        // First token = generation index 0.
+        let samp = if temp > 0.0 { Some((temp, step_seed(seed, 0))) } else { None };
+        let (g, _cached_len) = self.dec.prefill_slot_cached(prompt, slot, samp); // reuse shared-prefix KV; prefill the rest
         let done = max_tokens <= 1 || g == eos;
         if done {
             self.dec.free_slot(slot);
             self.free.push(slot);
         } else {
-            self.active.push(CbSeq { id, slot, pos: prompt.len() as u32, next: g, n_gen: 1, max_tokens, eos });
+            self.active.push(CbSeq { id, slot, pos: prompt.len() as u32, next: g, n_gen: 1, max_tokens, eos, temp, base_seed: seed });
         }
         Some((g, done))
     }
@@ -3079,7 +3202,10 @@ impl<'a> ContinuousBatcher<'a> {
         let toks: Vec<u32> = self.active.iter().map(|s| s.next).collect();
         let pos: Vec<u32> = self.active.iter().map(|s| s.pos).collect();
         let slots: Vec<u32> = self.active.iter().map(|s| s.slot).collect();
-        let nexts = self.dec.step_slotted(&toks, &pos, &slots);
+        let temps: Vec<f32> = self.active.iter().map(|s| s.temp).collect();
+        // Seed by generation index (n_gen = index of the token about to be drawn).
+        let seeds: Vec<u32> = self.active.iter().map(|s| step_seed(s.base_seed, s.n_gen as u32)).collect();
+        let nexts = self.dec.step_slotted_sample(&toks, &pos, &slots, &temps, &seeds);
         let mut out = Vec::with_capacity(nexts.len());
         for (i, &nt) in nexts.iter().enumerate() {
             let s = &mut self.active[i];
@@ -3102,6 +3228,9 @@ pub struct GenReq {
     pub prompt: Vec<u32>,
     pub max_tokens: usize,
     pub eos: u32,
+    /// Sampling temperature (≤ 0 = greedy) and per-request RNG seed (reproducible).
+    pub temp: f32,
+    pub seed: u32,
     /// The server pushes `Some(token)` per produced token, then `None` at
     /// completion. Use a tokio unbounded channel so an async HTTP handler can
     /// stream from the receiver while the (sync) serving thread sends.
@@ -3137,10 +3266,11 @@ impl GpuBatchServer {
 
     /// Submit a request. Returns a receiver yielding `Some(token)` per decode
     /// step then `None` at completion, or `Err` if the serving thread is gone.
-    pub fn submit(&self, prompt: Vec<u32>, max_tokens: usize, eos: u32)
+    /// `temp ≤ 0` = greedy; `seed` makes sampling reproducible per request.
+    pub fn submit(&self, prompt: Vec<u32>, max_tokens: usize, eos: u32, temp: f32, seed: u32)
         -> Result<tokio::sync::mpsc::UnboundedReceiver<Option<u32>>, ()> {
         let (tok_tx, tok_rx) = tokio::sync::mpsc::unbounded_channel();
-        self.tx.send(GenReq { prompt, max_tokens, eos, tok_tx }).map_err(|_| ())?;
+        self.tx.send(GenReq { prompt, max_tokens, eos, temp, seed, tok_tx }).map_err(|_| ())?;
         Ok(tok_rx)
     }
 
@@ -3181,7 +3311,7 @@ impl GpuBatchServer {
         req: GenReq,
     ) {
         let id = *next_id; *next_id += 1;
-        match cb.admit(id, &req.prompt, req.max_tokens, req.eos) {
+        match cb.admit_sampled(id, &req.prompt, req.max_tokens, req.eos, req.temp, req.seed) {
             Some((g0, done)) => {
                 let _ = req.tok_tx.send(Some(g0));
                 if done { let _ = req.tok_tx.send(None); } else { chans.insert(id, req.tok_tx); }
@@ -4259,7 +4389,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         // Spawn the server (moves the model onto its thread) and submit all reqs.
         let server = GpuBatchServer::spawn(model, prompts.len(), max_seq);
-        let rxs: Vec<_> = prompts.iter().map(|p| server.submit(p.clone(), k, eos).expect("submit")).collect();
+        let rxs: Vec<_> = prompts.iter().map(|p| server.submit(p.clone(), k, eos, 0.0, 0).expect("submit")).collect();
         let mut got: Vec<Vec<u32>> = Vec::new();
         for mut rx in rxs {
             let mut toks = Vec::new();
@@ -4401,6 +4531,40 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         assert!(reused >= 2, "expected B to reuse ≥2 shared-prefix blocks, got {reused}");
         assert_eq!(got_b, ref_b, "prefix-cached output diverged from cold computation");
         eprintln!("prefix-cached B is bit-identical to cold B ✓");
+    }
+
+    /// GPU temperature sampling (Gumbel-max): temp=0 must equal greedy and ignore
+    /// the seed; temp>0 must be reproducible for a fixed seed and vary by seed.
+    /// `cargo test --release --features gpu --lib gpu_sampling -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gpu_sampling() {
+        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() { eprintln!("model not found; skipping"); return; }
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU ({e}); skipping"); return; } };
+        let model = GpuModel::load(path, ctx).expect("load");
+        let prompt = vec![128000u32, 791, 6864, 315, 9822, 374]; // "The capital of France is"
+        let (k, eos, max_seq) = (14usize, u32::MAX, 256usize);
+        let run = |temp: f32, seed: u32| -> Vec<u32> {
+            let mut cb = ContinuousBatcher::new(&model, 1, max_seq);
+            let mut t = vec![cb.admit_sampled(0, &prompt, k, eos, temp, seed).unwrap().0];
+            while cb.active_len() > 0 { for (_, x, _) in cb.step() { t.push(x); } }
+            t
+        };
+
+        let greedy = run(0.0, 0);
+        let greedy_other_seed = run(0.0, 987654); // temp=0 must ignore the seed
+        let s_a = run(1.0, 42);
+        let s_b = run(1.0, 42); // same seed → reproducible
+        let s_c = run(1.0, 7);  // different seed
+
+        assert_eq!(greedy, greedy_other_seed, "temp=0 must be greedy regardless of seed");
+        assert_eq!(s_a, s_b, "same (temp, seed) must reproduce the same tokens");
+        eprintln!("greedy        : {greedy:?}");
+        eprintln!("sample seed=42: {s_a:?}  (reproducible: {})", s_a == s_b);
+        eprintln!("sample seed=7 : {s_c:?}");
+        eprintln!("temp=0 ≡ greedy (seed-independent) ✓, temp>0 reproducible per seed ✓");
+        eprintln!("sampling diverges from greedy: {} ; seed42≠seed7: {}", s_a != greedy, s_a != s_c);
     }
 
     #[test]

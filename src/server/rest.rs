@@ -823,14 +823,21 @@ struct CbRequest {
     max_tokens: usize,
     #[serde(default)]
     stream: bool,
+    /// Sampling temperature (0 / omitted = greedy).
+    #[serde(default)]
+    temperature: Option<f32>,
+    /// Optional RNG seed for reproducible sampling.
+    #[serde(default)]
+    seed: Option<u32>,
 }
 
 /// Continuous-batching completion (`/v1/cb/completions`). Routes to the
 /// `GpuBatchServer` (started with `ZLLM_CB=1`): the prompt is admitted into a
 /// free KV slot and decoded together with every other in-flight request —
 /// vLLM-style in-flight batching, high aggregate throughput under concurrency.
-/// Greedy (argmax) decode. Streams SSE text chunks when `stream`, else returns
-/// the full text. 503 when the server is not enabled / built.
+/// Temperature sampling (`temperature`>0) or greedy; `seed` for reproducibility.
+/// Streams SSE text chunks when `stream`, else returns the full text. 503 when
+/// the server is not enabled / built.
 async fn cb_completions(
     State(s): State<AppState>,
     Json(req): Json<CbRequest>,
@@ -848,8 +855,10 @@ async fn cb_completions(
         };
         let eos = s.tokenizer.read().unwrap().eos_token_id().unwrap_or(128001);
         let stop_eot = 128009u32; // Llama 3.2 <|eot_id|> — the chat-turn stop token
+        let temp = req.temperature.unwrap_or(0.0);
+        let seed = req.seed.unwrap_or(0);
         // Use eot as the server's stop so the KV slot frees on the chat stop.
-        let mut tok_rx = match server.submit(tokens, req.max_tokens, stop_eot) {
+        let mut tok_rx = match server.submit(tokens, req.max_tokens, stop_eot, temp, seed) {
             Ok(r) => r,
             Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "server unavailable"}))).into_response(),
         };
