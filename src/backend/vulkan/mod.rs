@@ -26,6 +26,12 @@ const SILU_MUL_SPV: &[u8] = include_bytes!("shaders/silu_mul.spv");
 const DECODE_MATVEC_Q6K_SPV: &[u8] = include_bytes!("shaders/decode_matvec_q6k.spv");
 #[cfg(test)]
 const DECODE_MATVEC_Q6K_V2_SPV: &[u8] = include_bytes!("shaders/decode_matvec_q6k_v2.spv");
+#[cfg(test)]
+const GRID_BARRIER_PROBE_SPV: &[u8] = include_bytes!("shaders/grid_barrier_probe.spv");
+#[cfg(test)]
+const DECODE_MATVEC_Q6K_PERSIST_SPV: &[u8] = include_bytes!("shaders/decode_matvec_q6k_persist.spv");
+#[cfg(test)]
+const Q6K_MEGAKERNEL_PROBE_SPV: &[u8] = include_bytes!("shaders/q6k_megakernel_probe.spv");
 const KV_WRITE_SPV: &[u8] = include_bytes!("shaders/kv_write.spv");
 const RESIDUAL_ADD_SPV: &[u8] = include_bytes!("shaders/residual_add.spv");
 const ARGMAX_SPV: &[u8] = include_bytes!("shaders/argmax.spv");
@@ -1520,6 +1526,36 @@ mod tests {
         unsafe { q6k_bandwidth_inner(&ctx); }
     }
 
+    /// MEGAKERNEL VIABILITY: persistent Q6_K matvec WITH grid barriers between
+    /// passes (one dispatch, G workgroups). Reports bandwidth + deadlock. If it
+    /// sustains ~210 GB/s at high G (above the in-forward 155), a megakernel can
+    /// beat llama; if it deadlocks or starves at low G, it can't.
+    /// `VK_GRID_G=320 cargo test --release --features vulkan --lib vk_megakernel_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_megakernel_probe() {
+        let ctx = match VkContext::new() {
+            Ok(c) => c,
+            Err(e) => { eprintln!("no Vulkan device ({e}); skipping"); return; }
+        };
+        unsafe { megakernel_probe_inner(&ctx); }
+    }
+
+    /// MEGAKERNEL FEASIBILITY: tests a grid-wide barrier (cross-workgroup sync
+    /// in one dispatch). `VK_GRID_G=N` sets the workgroup count. Reports whether
+    /// it deadlocks (G > resident capacity) and whether cross-wg memory is
+    /// visible after the barrier. A megakernel is only possible if this passes.
+    /// `VK_GRID_G=40 cargo test --release --features vulkan --lib vk_grid_barrier -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_grid_barrier() {
+        let ctx = match VkContext::new() {
+            Ok(c) => c,
+            Err(e) => { eprintln!("no Vulkan device ({e}); skipping"); return; }
+        };
+        unsafe { grid_barrier_inner(&ctx); }
+    }
+
     /// SDPA CORRECTNESS: runs the parallel decode-SDPA kernel on pseudo-random
     /// GQA q/K/V and compares to a CPU softmax-attention reference. Guards the
     /// workgroup-per-head rewrite (which gave the decode forward its lead).
@@ -1544,6 +1580,111 @@ unsafe fn sdpa_correctness_inner(ctx: &VkContext) {
 }
 
 #[cfg(test)]
+unsafe fn megakernel_probe_inner(ctx: &VkContext) {
+    use ash::vk;
+    use candle_core::{Device, Tensor};
+    use candle_core::quantized::{QTensor, GgmlDType};
+    let dev = &ctx.device;
+    let (n, nb) = (131072usize, 8usize);
+    let k = nb * 256;
+    let g: u32 = std::env::var("VK_GRID_G").ok().and_then(|s| s.parse().ok()).unwrap_or(320);
+    let passes: u32 = 20;
+    let mut wv = vec![0f32; n * k];
+    for i in 0..wv.len() { wv[i] = (((i as i64).wrapping_mul(2654435761) & 0xFFFF) as f32 / 32768.0 - 1.0) * 0.5; }
+    let qt = QTensor::quantize(&Tensor::from_vec(wv, (n, k), &Device::Cpu).unwrap(), GgmlDType::Q6K).unwrap();
+    let bytes = qt.data().unwrap();
+    let deq: Vec<f32> = qt.dequantize(&Device::Cpu).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+    let x: Vec<f32> = (0..k).map(|i| ((i % 23) as f32 - 11.0) * 0.03).collect();
+
+    let mut bufs: Vec<(vk::Buffer, vk::DeviceMemory)> = Vec::new();
+    let (ql, qh, scl, dd) = vk_up_q6k(ctx, &mut bufs, &bytes, n * nb);
+    let xb = vk_up_f32(ctx, &mut bufs, &x);
+    let (ob, ob_ptr) = vk_zeros(ctx, &mut bufs, n);
+    let (ct, _ctm, ct_ptr) = ctx.uma_buffer(8).unwrap(); std::ptr::write_bytes(ct_ptr, 0, 8);
+    let (u, _) = vk_uni(ctx, &mut bufs, [n as u32, nb as u32, g, passes]);
+
+    let (p, l, sl, m) = ctx.make_pipeline_raw(Q6K_MEGAKERNEL_PROBE_SPV, 7);
+    let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&[
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(7),
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(1),
+    ]), None).unwrap();
+    let set = vk_alloc_set(dev, pool, sl, &[ql, qh, scl, dd, xb, ob, ct], u);
+    let cmd_pool = dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family), None).unwrap();
+    let cmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).unwrap()[0];
+    dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+    dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p);
+    dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, l, 0, &[set], &[]);
+    dev.cmd_dispatch(cmd, g, 1, 1);
+    dev.end_command_buffer(cmd).unwrap();
+    let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+    let cmds = [cmd];
+    let t0 = std::time::Instant::now();
+    dev.queue_submit(ctx.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence).unwrap();
+    let wait = dev.wait_for_fences(&[fence], true, 5_000_000_000);
+    let ms = t0.elapsed().as_secs_f64() * 1e3;
+    match wait {
+        Err(vk::Result::TIMEOUT) => eprintln!("megakernel probe [G={g}]: DEADLOCK after 5s (G exceeds resident capacity for this kernel)"),
+        Err(e) => eprintln!("megakernel probe [G={g}]: wait error {e:?}"),
+        Ok(()) => {
+            let gbs = (n * nb * 212) as f64 * passes as f64 / (ms / 1e3) / 1e9;
+            let op = ob_ptr as *const f32;
+            let (mut ca, mut cb, mut cab) = (0f64, 0f64, 0f64);
+            for nn in 0..n { let mut acc = 0f64; for kk in 0..k { acc += (deq[nn*k+kk] as f64) * (x[kk] as f64); } let gg = *op.add(nn) as f64; ca += gg*gg; cb += acc*acc; cab += gg*acc; }
+            let cos = cab / (ca.sqrt() * cb.sqrt());
+            eprintln!("megakernel probe [G={g}]: {ms:.2} ms / {passes} passes => {gbs:.1} GB/s (vs normal 226, in-forward 155) | cos={cos:.6}");
+        }
+    }
+    let _ = (m, l, sl, p, pool, cmd_pool, fence, ct);
+}
+
+#[cfg(test)]
+unsafe fn grid_barrier_inner(ctx: &VkContext) {
+    use ash::vk;
+    let dev = &ctx.device;
+    let n: usize = 8192;
+    let g: u32 = std::env::var("VK_GRID_G").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
+    let per = (n as u32).div_ceil(g);
+    let (b_buf, _m1, _b_ptr) = ctx.uma_buffer((n * 4) as u64).unwrap();
+    let (c_buf, _m2, c_ptr) = ctx.uma_buffer(((1 + g as usize) * 4) as u64).unwrap();
+    std::ptr::write_bytes(c_ptr, 0, (1 + g as usize) * 4);
+    let (u_buf, _m3, u_ptr) = ctx.uma_buffer(16).unwrap();
+    std::ptr::copy_nonoverlapping([n as u32, g, per, 0u32].as_ptr() as *const u8, u_ptr, 16);
+
+    let (p, l, sl, m) = ctx.make_pipeline_raw(GRID_BARRIER_PROBE_SPV, 2);
+    let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&[
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(2),
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(1),
+    ]), None).unwrap();
+    let set = vk_alloc_set(dev, pool, sl, &[b_buf, c_buf], u_buf);
+    let cmd_pool = dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family), None).unwrap();
+    let cmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).unwrap()[0];
+    dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+    dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p);
+    dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, l, 0, &[set], &[]);
+    dev.cmd_dispatch(cmd, g, 1, 1);
+    dev.end_command_buffer(cmd).unwrap();
+    let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+    let cmds = [cmd];
+    let t0 = std::time::Instant::now();
+    dev.queue_submit(ctx.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence).unwrap();
+    let wait = dev.wait_for_fences(&[fence], true, 3_000_000_000); // 3s timeout → catches deadlock
+    let ms = t0.elapsed().as_secs_f64() * 1e3;
+    match wait {
+        Err(vk::Result::TIMEOUT) => eprintln!("grid barrier [G={g}]: DEADLOCK (G exceeds resident capacity) after 3s"),
+        Err(e) => eprintln!("grid barrier [G={g}]: wait error {e:?}"),
+        Ok(()) => {
+            let cp = c_ptr as *const u32;
+            let mut wrong = 0u32; let mut sample = 0u32;
+            for w in 0..g as usize { let v = *cp.add(1 + w); if w == 0 { sample = v; } if v != n as u32 { wrong += 1; } }
+            eprintln!("grid barrier [G={g}]: {ms:.3} ms, each wg's sum-of-all = {sample} (want {n}), wrong={wrong}/{g} => {}",
+                if wrong == 0 { "WORKS (cross-wg visible)" } else { "STALE (barrier broken)" });
+        }
+    }
+    let _ = (b_buf, c_buf, u_buf); // leak (test exits)
+    let _ = (p, l, sl, m, pool, cmd_pool, fence);
+}
+
+#[cfg(test)]
 unsafe fn q6k_bandwidth_inner(ctx: &VkContext) {
     use ash::vk;
     use candle_core::{Device, Tensor};
@@ -1552,10 +1693,13 @@ unsafe fn q6k_bandwidth_inner(ctx: &VkContext) {
     let (n, nb) = (131072usize, 8usize); // > MALL cache (~217 MB SoA) → real DRAM bandwidth
     let k = nb * 256;
     let variant = std::env::var("VK_Q6K_SPV").unwrap_or_default();
+    let persist_g: u32 = std::env::var("VK_GRID_G").ok().and_then(|s| s.parse().ok()).unwrap_or(160);
     let (spv, soa_bytes_per_block): (&[u8], usize) = match variant.as_str() {
         "v2" => (DECODE_MATVEC_Q6K_V2_SPV, 212),
+        "persist" => (DECODE_MATVEC_Q6K_PERSIST_SPV, 212),
         _ => (DECODE_MATVEC_Q6K_SPV, 212),
     };
+    let persist = variant == "persist";
 
     // Quantize a tensor to Q6_K → raw bytes → SoA.
     let mut wv = vec![0f32; n * k];
@@ -1569,7 +1713,7 @@ unsafe fn q6k_bandwidth_inner(ctx: &VkContext) {
     let (ql, qh, scl, dd) = vk_up_q6k(ctx, &mut bufs, &bytes, n * nb);
     let xb = vk_up_f32(ctx, &mut bufs, &x);
     let (ob, ob_ptr) = vk_zeros(ctx, &mut bufs, n);
-    let (u, _) = vk_uni(ctx, &mut bufs, [n as u32, nb as u32, (n as u32).min(65535), 0]);
+    let (u, _) = vk_uni(ctx, &mut bufs, [n as u32, nb as u32, if persist { persist_g } else { (n as u32).min(65535) }, 0]);
 
     let (p, l, sl, m) = ctx.make_pipeline_raw(spv, 6);
     let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&[
@@ -1580,7 +1724,7 @@ unsafe fn q6k_bandwidth_inner(ctx: &VkContext) {
 
     let cmd_pool = dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family), None).unwrap();
     let cmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).unwrap()[0];
-    let gx = (n as u32).min(65535); let gy = (n as u32).div_ceil(gx);
+    let (gx, gy) = if persist { (persist_g, 1u32) } else { ((n as u32).min(65535), (n as u32).div_ceil((n as u32).min(65535))) };
     let barr = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
     let cs = vk::PipelineStageFlags::COMPUTE_SHADER;
     let iters = 100u32;

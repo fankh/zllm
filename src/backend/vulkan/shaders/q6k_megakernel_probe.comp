@@ -1,0 +1,68 @@
+// Megakernel viability probe: persistent Q6_K matvec WITH grid barriers between
+// `passes` repetitions, all in ONE dispatch of G workgroups. Tests the make-or-
+// break: can a complex (matvec register pressure) kernel keep G workgroups
+// co-resident for the grid barrier AND sustain DRAM bandwidth? Sense-reversing
+// barrier (reusable). If it completes at high G with ~210 GB/s, a megakernel can
+// beat llama; if it deadlocks at the G the matvec needs, it can't.
+#version 450 core
+#extension GL_KHR_memory_scope_semantics : require
+#pragma use_vulkan_memory_model
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly  buffer QL_ { uint  ql[];   };
+layout(binding = 1) readonly  buffer QH_ { uint  qh[];   };
+layout(binding = 2) readonly  buffer SC_ { uint  scl[];  };
+layout(binding = 3) readonly  buffer DD_ { float dd[];   };
+layout(binding = 4) readonly  buffer X_  { float x[];    };
+layout(binding = 5) coherent  buffer O_  { float outp[]; };
+layout(binding = 6) coherent  buffer CT_ { uint  ctr[];  };  // [0]=arrive, [1]=sense
+layout(binding = 7) uniform   P_ { uint n_rows; uint nb; uint G; uint passes; } p;
+shared float partial[64];
+shared uint wg_sense;
+void gbar() {
+    barrier();
+    if (gl_LocalInvocationID.x == 0u) {
+        uint s = 1u - wg_sense; wg_sense = s;
+        uint a = atomicAdd(ctr[0], 1u, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease) + 1u;
+        if (a == p.G) {
+            atomicStore(ctr[0], 0u, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+            atomicStore(ctr[1], s, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+        } else {
+            while (atomicLoad(ctr[1], gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquire) != s) {}
+        }
+    }
+    barrier();
+}
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    if (t == 0u) { wg_sense = 0u; }
+    barrier();
+    for (uint pass = 0u; pass < p.passes; pass++) {
+        for (uint row = gl_WorkGroupID.x; row < p.n_rows; row += p.G) {
+            uint nwords = p.nb * 16u; float acc = 0.0; uint w = t;
+            while (w < nwords) {
+                uint bl = w / 16u; uint blk = row * p.nb + bl;
+                uint wb = w % 16u; uint hf = wb / 8u; uint wih = wb % 8u;
+                float d = dd[blk];
+                uint qlb_ = blk * 32u + hf * 16u; uint qhb_ = blk * 16u + hf * 8u; uint scb = blk * 4u; uint scoff = hf * 8u;
+                uint ql_a = ql[qlb_ + wih]; uint ql_b = ql[qlb_ + wih + 8u]; uint qh_w = qh[qhb_ + wih];
+                uint xbase = bl * 256u + hf * 128u; uint l0 = wih * 4u; uint is = scoff + (l0 / 16u);
+                float s1 = float(bitfieldExtract(int(scl[scb + (is) / 4u]), int((is) % 4u) * 8, 8));
+                float s2 = float(bitfieldExtract(int(scl[scb + (is + 2u) / 4u]), int((is + 2u) % 4u) * 8, 8));
+                float s3 = float(bitfieldExtract(int(scl[scb + (is + 4u) / 4u]), int((is + 4u) % 4u) * 8, 8));
+                float s4 = float(bitfieldExtract(int(scl[scb + (is + 6u) / 4u]), int((is + 6u) % 4u) * 8, 8));
+                for (uint b = 0u; b < 4u; b++) {
+                    uint l = l0 + b; uint qla = (ql_a >> (b*8u)) & 0xffu; uint qlb = (ql_b >> (b*8u)) & 0xffu; uint qhb = (qh_w >> (b*8u)) & 0xffu;
+                    int q1 = int((qla & 0xfu) | ((qhb & 3u) << 4u)) - 32; int q2 = int((qlb & 0xfu) | (((qhb >> 2u) & 3u) << 4u)) - 32;
+                    int q3 = int((qla >> 4u) | (((qhb >> 4u) & 3u) << 4u)) - 32; int q4 = int((qlb >> 4u) | (((qhb >> 6u) & 3u) << 4u)) - 32;
+                    acc += d * (s1*float(q1)*x[xbase+l] + s2*float(q2)*x[xbase+l+32u] + s3*float(q3)*x[xbase+l+64u] + s4*float(q4)*x[xbase+l+96u]);
+                }
+                w += 64u;
+            }
+            partial[t] = acc; barrier();
+            for (uint s = 32u; s > 0u; s >>= 1u) { if (t < s) { partial[t] += partial[t + s]; } barrier(); }
+            if (t == 0u) { outp[row] = partial[0]; }
+            barrier();
+        }
+        if (pass + 1u < p.passes) { gbar(); }
+    }
+}

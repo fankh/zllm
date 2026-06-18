@@ -1,0 +1,33 @@
+// Feasibility probe for a megakernel grid-wide barrier: launch exactly G
+// persistent workgroups. Phase 1: each wg writes its slice of b[]=1. Grid
+// barrier (device-scope atomic counter + spin + acquire/release). Phase 2:
+// each wg sums ALL of b[] and records it. If the grid barrier provides
+// cross-workgroup visibility, every wg sees all b==1 → sum==n. If the barrier
+// is broken (stale reads) OR deadlocks (G > resident capacity), this fails.
+#version 450 core
+#extension GL_KHR_memory_scope_semantics : require
+#pragma use_vulkan_memory_model
+layout(local_size_x = 64) in;
+layout(binding = 0) coherent buffer B_ { float b[];   };
+layout(binding = 1) coherent buffer C_ { uint  ctr[]; };  // [0]=arrive, [1+wg]=result
+layout(binding = 2) uniform P_ { uint n; uint G; uint per; uint pad; } p;
+void gbar(uint idx) {
+    controlBarrier(gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease);
+    if (gl_LocalInvocationID.x == 0u) {
+        atomicAdd(ctr[idx], 1u, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease);
+        while (atomicLoad(ctr[idx], gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquire) < p.G) {}
+    }
+    controlBarrier(gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease);
+}
+void main() {
+    uint wg = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint start = wg * p.per;
+    for (uint i = start + t; i < start + p.per && i < p.n; i += 64u) { b[i] = 1.0; }
+    gbar(0u);
+    if (t == 0u) {
+        float sum = 0.0;
+        for (uint i = 0u; i < p.n; i++) { sum += b[i]; }
+        ctr[1u + wg] = uint(sum + 0.5);
+    }
+}
