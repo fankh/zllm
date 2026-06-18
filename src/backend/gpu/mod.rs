@@ -2619,15 +2619,57 @@ pub struct BatchedDecoder<'a> {
     k_pool: Vec<wgpu::Buffer>, v_pool: Vec<wgpu::Buffer>,
 }
 
-/// Host-side bookkeeping for the paged KV pool.
+/// Host-side bookkeeping for the paged KV pool, including the cross-request
+/// prefix cache (blocks are reference-counted; a finished sequence's full prefix
+/// blocks stay registered for reuse and are reclaimed LRU-style only when the
+/// pool needs space).
 struct BlockState {
-    /// Free physical block indices (a stack).
+    /// Truly-free physical block indices (a stack).
     free: Vec<u32>,
     /// `slot_blocks[slot]` = physical blocks owned by that slot, in logical order.
     slot_blocks: Vec<Vec<u32>>,
     /// Flattened block table `[m_max * max_blocks_per_seq]` uploaded to the GPU:
     /// `table_host[slot*max_blocks_per_seq + logical] = physical block`.
     table_host: Vec<u32>,
+    /// Per physical block: number of sequences referencing it. 0 = reclaimable.
+    refcount: Vec<u32>,
+    /// Prefix hash → physical block holding that prefix's KV (full blocks only).
+    cache_map: std::collections::HashMap<u64, u32>,
+    /// Physical block → its registered prefix hash (to drop the map entry on reclaim).
+    block_hash: Vec<Option<u64>>,
+    /// Prefix-cache stats, in blocks (reused vs freshly prefilled).
+    hits: u64,
+    misses: u64,
+}
+
+impl BlockState {
+    /// Allocate one physical block: prefer a truly-free block; else reclaim an
+    /// unreferenced (refcount 0) cached block, dropping its prefix-cache entry.
+    /// Returns None only if every block is currently referenced.
+    fn alloc(&mut self) -> Option<u32> {
+        if let Some(b) = self.free.pop() {
+            self.refcount[b as usize] = 1;
+            return Some(b);
+        }
+        let reclaim = (0..self.refcount.len()).find(|&i| self.refcount[i] == 0 && self.block_hash[i].is_some());
+        if let Some(i) = reclaim {
+            if let Some(h) = self.block_hash[i].take() { self.cache_map.remove(&h); }
+            self.refcount[i] = 1;
+            return Some(i as u32);
+        }
+        None
+    }
+}
+
+/// Cumulative prefix hash: combine the previous block's hash with this block's
+/// tokens. Two prompts with an identical token prefix get identical per-block
+/// hashes (deterministic — DefaultHasher uses fixed keys).
+fn prefix_block_hash(prev: u64, toks: &[u32]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    prev.hash(&mut h);
+    toks.hash(&mut h);
+    h.finish()
 }
 
 impl<'a> BatchedDecoder<'a> {
@@ -2661,6 +2703,10 @@ impl<'a> BatchedDecoder<'a> {
             free: (0..n_blocks as u32).rev().collect(),
             slot_blocks: vec![Vec::new(); m_max],
             table_host: vec![0u32; m_max * max_blocks_per_seq],
+            refcount: vec![0u32; n_blocks],
+            cache_map: std::collections::HashMap::new(),
+            block_hash: vec![None; n_blocks],
+            hits: 0, misses: 0,
         };
         Self {
             model, m_max, max_seq, row_cap,
@@ -2680,33 +2726,49 @@ impl<'a> BatchedDecoder<'a> {
     }
 
     /// Ensure `slot` owns enough physical blocks to hold `n_positions` positions,
-    /// updating the host block table. Returns false if the pool is exhausted.
+    /// updating the host block table. Newly-allocated blocks come from the free
+    /// list or a reclaimed unreferenced cached block. Returns false if the pool
+    /// is exhausted (every block referenced).
     fn ensure_blocks(&self, slot: u32, n_positions: usize) -> bool {
         let need = n_positions.div_ceil(self.block_size);
         let mut bs = self.blocks.borrow_mut();
         let have = bs.slot_blocks[slot as usize].len();
         if need <= have { return true; }
-        if bs.free.len() < need - have { return false; }
         for lb in have..need {
-            let phys = bs.free.pop().unwrap();
+            let Some(phys) = bs.alloc() else { return false; };
             bs.slot_blocks[slot as usize].push(phys);
             bs.table_host[slot as usize * self.max_blocks_per_seq + lb] = phys;
         }
         true
     }
 
-    /// Return all of `slot`'s physical blocks to the free pool (called on evict).
+    /// Drop `slot`'s references to its blocks (called on evict). A block whose
+    /// refcount hits 0 and is NOT a registered prefix block returns to the free
+    /// list; registered (cached) blocks stay for cross-request reuse and are
+    /// reclaimed only under pool pressure (see `BlockState::alloc`).
     fn free_slot(&self, slot: u32) {
         let mut bs = self.blocks.borrow_mut();
-        let returned = std::mem::take(&mut bs.slot_blocks[slot as usize]);
-        bs.free.extend(returned);
+        let owned = std::mem::take(&mut bs.slot_blocks[slot as usize]);
+        for phys in owned {
+            let rc = &mut bs.refcount[phys as usize];
+            if *rc > 0 { *rc -= 1; }
+            if bs.refcount[phys as usize] == 0 && bs.block_hash[phys as usize].is_none() {
+                bs.free.push(phys);
+            }
+        }
     }
 
-    /// Free physical blocks available right now.
-    fn free_blocks(&self) -> usize { self.blocks.borrow().free.len() }
+    /// Blocks available for a fresh allocation right now (free + reclaimable cached).
+    fn free_blocks(&self) -> usize {
+        let bs = self.blocks.borrow();
+        bs.free.len() + bs.refcount.iter().zip(&bs.block_hash).filter(|(rc, h)| **rc == 0 && h.is_some()).count()
+    }
 
-    /// Whether the pool currently has enough free blocks for `n_positions`.
+    /// Whether the pool can currently fit `n_positions` of fresh KV.
     fn can_fit(&self, n_positions: usize) -> bool { self.free_blocks() >= n_positions.div_ceil(self.block_size) }
+
+    /// Prefix-cache stats since construction: (reused blocks, freshly-prefilled blocks).
+    fn cache_stats(&self) -> (u64, u64) { let bs = self.blocks.borrow(); (bs.hits, bs.misses) }
 
     /// Physical position (into the block pool, in units of kv_dim) of `pos` for `slot`.
     fn phys_pos(&self, slot: u32, pos: usize) -> usize {
@@ -2766,13 +2828,78 @@ impl<'a> BatchedDecoder<'a> {
     /// generated token (argmax at the last prompt position). Long prompts are
     /// chunked; chunk k attends all earlier chunks' K/V already resident in slot.
     pub fn prefill_slot(&self, prompt: &[u32], slot: u32) -> u32 {
+        self.prefill_slot_from(prompt, slot, 0)
+    }
+
+    /// Prefix-cached prefill: reuse already-resident KV blocks for the longest
+    /// shared full-block prefix of `prompt` (e.g. a system prompt repeated across
+    /// requests), and only prefill the suffix. Returns (first_token, cached_len)
+    /// where `cached_len` positions were served from cache (0 = cold). The reused
+    /// blocks' KV is bit-identical to recomputing them (KV at position p depends
+    /// only on tokens[0..=p]), so output is unchanged — just less prefill compute.
+    pub fn prefill_slot_cached(&self, prompt: &[u32], slot: u32) -> (u32, usize) {
+        let p = prompt.len();
+        assert!(p >= 1 && p <= self.max_seq);
+        let bsz = self.block_size;
+        // Never reuse the block holding the last position — we need its logits.
+        let max_reuse = (p - 1) / bsz;
+        // 1. Match the longest cached full-block prefix; reuse those blocks.
+        let mut cached_blocks = 0usize;
+        let mut hashes: Vec<u64> = Vec::with_capacity(max_reuse);
+        {
+            let mut bs = self.blocks.borrow_mut();
+            let mut prev_h = 0u64;
+            for lb in 0..max_reuse {
+                let h = prefix_block_hash(prev_h, &prompt[lb * bsz..(lb + 1) * bsz]);
+                hashes.push(h);
+                prev_h = h;
+                match bs.cache_map.get(&h).copied() {
+                    Some(phys) => {
+                        bs.refcount[phys as usize] += 1;
+                        bs.slot_blocks[slot as usize].push(phys);
+                        bs.table_host[slot as usize * self.max_blocks_per_seq + lb] = phys;
+                        cached_blocks += 1;
+                    }
+                    None => break,
+                }
+            }
+            bs.hits += cached_blocks as u64;
+        }
+        let cached_len = cached_blocks * bsz;
+        // 2. Prefill the suffix [cached_len .. p) (new blocks allocated on demand).
+        let first = self.prefill_slot_from(prompt, slot, cached_len);
+        // 3. Register the newly-filled FULL blocks so later prompts can reuse them.
+        {
+            let mut bs = self.blocks.borrow_mut();
+            let n_full = p / bsz;
+            let mut prev_h = if cached_blocks > 0 { hashes[cached_blocks - 1] } else { 0u64 };
+            bs.misses += (n_full - cached_blocks) as u64;
+            for lb in cached_blocks..n_full {
+                let h = prefix_block_hash(prev_h, &prompt[lb * bsz..(lb + 1) * bsz]);
+                prev_h = h;
+                let phys = bs.slot_blocks[slot as usize][lb];
+                // Only register if not already mapped (first writer owns the entry).
+                if !bs.cache_map.contains_key(&h) {
+                    bs.cache_map.insert(h, phys);
+                    bs.block_hash[phys as usize] = Some(h);
+                }
+            }
+        }
+        (first, cached_len)
+    }
+
+    /// Prefill `prompt` positions `[start_pos .. len)` into `slot`, assuming the
+    /// prefix `[0 .. start_pos)` is already resident in the slot's KV (via reused
+    /// cache blocks). Returns the greedy first generated token.
+    pub fn prefill_slot_from(&self, prompt: &[u32], slot: u32, start_pos: usize) -> u32 {
         let ctx = &self.model.ctx;
         let p = prompt.len();
         assert!(p >= 1, "prefill needs a non-empty prompt");
         assert!(p <= self.max_seq, "prompt len {p} exceeds max_seq {}", self.max_seq);
+        assert!(start_pos < p, "start_pos {start_pos} must be < prompt len {p}");
         let (n_embd, vocab, eps) = (self.model.n_embd, self.model.vocab, self.model.eps);
         let mut first_tok = 0u32;
-        let mut start = 0usize;
+        let mut start = start_pos;
         while start < p {
             let end = (start + self.row_cap).min(p);
             let m = end - start;
@@ -2919,6 +3046,8 @@ impl<'a> ContinuousBatcher<'a> {
     pub fn active_len(&self) -> usize { self.active.len() }
     /// (free, total) physical KV blocks — for observing pool pressure.
     pub fn block_pool(&self) -> (usize, usize) { (self.dec.free_blocks(), self.dec.n_blocks) }
+    /// Prefix-cache stats: (reused blocks, freshly-prefilled blocks) since start.
+    pub fn cache_stats(&self) -> (u64, u64) { self.dec.cache_stats() }
 
     /// Admit a sequence: batched-prefill its prompt into a free KV slot and join
     /// the decode batch. Returns (first_token, done) — `done` is true if that one
@@ -2931,7 +3060,7 @@ impl<'a> ContinuousBatcher<'a> {
         // (lazy block alloc + no preemption → don't admit what can't finish).
         if !self.dec.can_fit(prompt.len() + max_tokens) { return None; }
         let slot = self.free.pop()?;
-        let g = self.dec.prefill_slot(prompt, slot); // batched prefill into the slot
+        let (g, _cached_len) = self.dec.prefill_slot_cached(prompt, slot); // reuse shared-prefix KV; prefill the rest
         let done = max_tokens <= 1 || g == eos;
         if done {
             self.dec.free_slot(slot);
@@ -4229,6 +4358,49 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         eprintln!("  served {} concurrent sequences; peak use {}/{} blocks; recycled to {}/{} after eviction", prompts.len(), total - free_at_peak, total, free_after, total);
         assert_eq!(free_after, total, "blocks were not fully recycled after all sequences finished");
         eprintln!("all {} sequences correct on the overcommitted pool, blocks fully recycled ✓", prompts.len());
+    }
+
+    /// Cross-request prefix-cache reuse: a second request sharing a long prefix
+    /// with an already-processed one reuses its KV blocks (skips that prefill)
+    /// and produces output bit-identical to computing it cold.
+    /// `cargo test --release --features gpu --lib gpu_prefix_cache -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gpu_prefix_cache() {
+        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() { eprintln!("model not found; skipping"); return; }
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU ({e}); skipping"); return; } };
+        let model = GpuModel::load(path, ctx).expect("load");
+        let (max_seq, k, eos) = (512usize, 10usize, u32::MAX);
+
+        // 40-token shared prefix (> 2 blocks of 16) + distinct 3-token suffixes.
+        let shared: Vec<u32> = (0..40u32).map(|i| 1000 + i).collect();
+        let mut a = shared.clone(); a.extend([2001, 2002, 2003]);
+        let mut b = shared.clone(); b.extend([3001, 3002, 3003]);
+
+        // Reference: B computed COLD (fresh batcher, empty cache → no reuse).
+        let mut ref_b = {
+            let mut cb = ContinuousBatcher::new(&model, 1, max_seq);
+            let mut t = vec![cb.admit(0, &b, k, eos).unwrap().0];
+            while cb.active_len() > 0 { for (_, x, _) in cb.step() { t.push(x); } }
+            t
+        };
+
+        // Warm cache with A, finish it (frees refcounts but KEEPS A's prefix blocks
+        // registered), then admit B which should reuse A's shared-prefix blocks.
+        let mut cb = ContinuousBatcher::new(&model, 4, max_seq);
+        cb.admit(0, &a, k, eos);
+        while cb.active_len() > 0 { cb.step(); }
+        let (hits_before, _) = cb.cache_stats();
+        let mut got_b = vec![cb.admit(1, &b, k, eos).unwrap().0];
+        let (hits_after, _) = cb.cache_stats();
+        while cb.active_len() > 0 { for (_, x, _) in cb.step() { got_b.push(x); } }
+
+        let reused = hits_after - hits_before;
+        eprintln!("prefix cache: B reused {reused} blocks (~{} tokens) of the 40-token shared prefix", reused * 16);
+        assert!(reused >= 2, "expected B to reuse ≥2 shared-prefix blocks, got {reused}");
+        assert_eq!(got_b, ref_b, "prefix-cached output diverged from cold computation");
+        eprintln!("prefix-cached B is bit-identical to cold B ✓");
     }
 
     #[test]
