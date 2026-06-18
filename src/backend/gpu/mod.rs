@@ -2509,10 +2509,19 @@ impl GpuModel {
 /// batch, so this enters the compute-bound regime. Only the attention is
 /// per-stream (each stream attends its own KV cache). PoC for serving-
 /// throughput exploration.
+/// Prompt tokens processed per batched prefill pass (one coopmat GEMM over all
+/// of them, instead of one forward per token). Larger = fewer passes but more
+/// scratch; 128 keeps the GEMM comfortably compute-bound.
+pub const PREFILL_CHUNK: usize = 128;
+
 pub struct BatchedDecoder<'a> {
     model: &'a GpuModel,
     m_max: usize,
     max_seq: usize,
+    /// Row capacity of the per-token scratch buffers = max(m_max, PREFILL_CHUNK).
+    /// Decode uses ≤ m_max rows; prefill processes up to this many prompt tokens
+    /// per pass, so the scratch is sized for the larger of the two.
+    row_cap: usize,
     x_b: wgpu::Buffer, normed_b: wgpu::Buffer, q_b: wgpu::Buffer,
     k_b: wgpu::Buffer, v_b: wgpu::Buffer, attn_b: wgpu::Buffer,
     gate_b: wgpu::Buffer, up_b: wgpu::Buffer, h_b: wgpu::Buffer,
@@ -2529,17 +2538,22 @@ impl<'a> BatchedDecoder<'a> {
         let kv_dim = n_kv_head * head_dim;
         let attn_dim = n_head * head_dim;
         let half = head_dim / 2;
+        // Per-token scratch is sized for the larger of decode batch (m_max) and
+        // a prefill chunk, so one prefill pass can process up to `row_cap` prompt
+        // tokens. logits/argmax stay at m_max: lm_head runs ≤ m_max rows for
+        // decode and exactly 1 row for prefill (only the last token's logits).
+        let row_cap = m_max.max(PREFILL_CHUNK);
         let a = |len: usize| ctx.alloc_activation(len, false);
         let asrc = |len: usize| ctx.alloc_activation(len, true); // COPY_SRC: cache scatter / readback
         let k_caches = (0..model.layers.len()).map(|_| a(m_max * max_seq * kv_dim)).collect();
         let v_caches = (0..model.layers.len()).map(|_| a(m_max * max_seq * kv_dim)).collect();
         Self {
-            model, m_max, max_seq,
-            x_b: a(m_max * n_embd), normed_b: a(m_max * n_embd), q_b: asrc(m_max * attn_dim),
-            k_b: asrc(m_max * kv_dim), v_b: asrc(m_max * kv_dim), attn_b: a(m_max * attn_dim),
-            gate_b: a(m_max * n_inter), up_b: a(m_max * n_inter), h_b: a(m_max * n_inter),
-            cos_b: a(m_max * half), sin_b: a(m_max * half), logits_b: a(m_max * vocab),
-            pos_buf: a(m_max), slots_buf: a(m_max), argmax_out: asrc(m_max),
+            model, m_max, max_seq, row_cap,
+            x_b: a(row_cap * n_embd), normed_b: asrc(row_cap * n_embd), q_b: asrc(row_cap * attn_dim),
+            k_b: asrc(row_cap * kv_dim), v_b: asrc(row_cap * kv_dim), attn_b: a(row_cap * attn_dim),
+            gate_b: a(row_cap * n_inter), up_b: a(row_cap * n_inter), h_b: a(row_cap * n_inter),
+            cos_b: a(row_cap * half), sin_b: a(row_cap * half), logits_b: a(m_max * vocab),
+            pos_buf: a(row_cap), slots_buf: a(row_cap), argmax_out: asrc(m_max),
             argmax_read: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("bd-argmax-read"), size: (m_max * 4) as u64,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
@@ -2562,13 +2576,87 @@ impl<'a> BatchedDecoder<'a> {
         let ctx = &self.model.ctx;
         let m = tokens.len();
         assert!(m <= self.m_max && m == positions.len() && m == slots.len() && m >= 1);
-        let (n_embd, n_head, n_kv_head, head_dim, n_inter, vocab, eps) = (
-            self.model.n_embd, self.model.n_head, self.model.n_kv_head,
-            self.model.head_dim, self.model.n_inter, self.model.vocab, self.model.eps);
-        let kv_dim = n_kv_head * head_dim;
-        let attn_dim = n_head * head_dim;
-        let half = head_dim / 2;
+        let (n_embd, vocab, eps) = (self.model.n_embd, self.model.vocab, self.model.eps);
 
+        self.write_inputs(tokens, positions, slots);
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        self.record_layers(&mut enc, m, positions, slots);
+        // Decode: every row predicts a next token → lm_head + argmax over all m.
+        ctx.record_bnorm(&mut enc, &self.x_b, &self.model.final_norm_w, &self.normed_b, n_embd, eps, m);
+        ctx.record_gemm(&mut enc, &self.model.lm_head, &self.normed_b, &self.logits_b, n_embd, m, 0);
+        ctx.record_bargmax(&mut enc, &self.logits_b, &self.argmax_out, vocab, m);
+        enc.copy_buffer_to_buffer(&self.argmax_out, 0, &self.argmax_read, 0, (m * 4) as u64);
+        ctx.queue.submit([enc.finish()]);
+        ctx.device.poll(wgpu::Maintain::Wait);
+        let slice = self.argmax_read.slice(..(m * 4) as u64);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        ctx.device.poll(wgpu::Maintain::Wait);
+        let out = bytemuck::cast_slice::<u8, u32>(&slice.get_mapped_range()).to_vec();
+        self.argmax_read.unmap();
+        out
+    }
+
+    /// Batched prefill of a whole prompt into one KV cache `slot`, in a single
+    /// forward per `PREFILL_CHUNK` tokens instead of one forward per token. The
+    /// trick: feed the prompt's tokens as `m` rows with staggered positions
+    /// `start..end` all pointing at `slot`; the decode SDPA then has row `i`
+    /// attend the slot's cache `0..=position[i]` — which IS causal prefill
+    /// attention. K/V for every prompt position is written to the slot, so the
+    /// sequence can decode straight from `prompt.len()`. Returns the greedy first
+    /// generated token (argmax at the last prompt position). Long prompts are
+    /// chunked; chunk k attends all earlier chunks' K/V already resident in slot.
+    pub fn prefill_slot(&self, prompt: &[u32], slot: u32) -> u32 {
+        let ctx = &self.model.ctx;
+        let p = prompt.len();
+        assert!(p >= 1, "prefill needs a non-empty prompt");
+        assert!(p <= self.max_seq, "prompt len {p} exceeds max_seq {}", self.max_seq);
+        let (n_embd, vocab, eps) = (self.model.n_embd, self.model.vocab, self.model.eps);
+        let mut first_tok = 0u32;
+        let mut start = 0usize;
+        while start < p {
+            let end = (start + self.row_cap).min(p);
+            let m = end - start;
+            let toks = &prompt[start..end];
+            let positions: Vec<u32> = (start..end).map(|x| x as u32).collect();
+            let slots = vec![slot; m];
+            self.write_inputs(toks, &positions, &slots);
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            self.record_layers(&mut enc, m, &positions, &slots);
+            let is_last = end == p;
+            if is_last {
+                // Only the final prompt token's logits matter (the first output).
+                ctx.record_bnorm(&mut enc, &self.x_b, &self.model.final_norm_w, &self.normed_b, n_embd, eps, m);
+                // Pull the last row to the front so lm_head runs a single row.
+                let src = if m > 1 {
+                    enc.copy_buffer_to_buffer(&self.normed_b, ((m - 1) * n_embd * 4) as u64, &self.q_b, 0, (n_embd * 4) as u64);
+                    &self.q_b
+                } else { &self.normed_b };
+                ctx.record_gemm(&mut enc, &self.model.lm_head, src, &self.logits_b, n_embd, 1, 0);
+                ctx.record_bargmax(&mut enc, &self.logits_b, &self.argmax_out, vocab, 1);
+                enc.copy_buffer_to_buffer(&self.argmax_out, 0, &self.argmax_read, 0, 4);
+            }
+            ctx.queue.submit([enc.finish()]);
+            ctx.device.poll(wgpu::Maintain::Wait);
+            if is_last {
+                let slice = self.argmax_read.slice(..4);
+                slice.map_async(wgpu::MapMode::Read, |_| {});
+                ctx.device.poll(wgpu::Maintain::Wait);
+                first_tok = bytemuck::cast_slice::<u8, u32>(&slice.get_mapped_range())[0];
+                self.argmax_read.unmap();
+            }
+            start = end;
+        }
+        first_tok
+    }
+
+    /// Gather the per-row embeddings + RoPE tables for `tokens`/`positions` and
+    /// upload them (plus pos/slot index buffers) — the inputs both decode and
+    /// prefill feed into `record_layers`.
+    fn write_inputs(&self, tokens: &[u32], positions: &[u32], slots: &[u32]) {
+        let ctx = &self.model.ctx;
+        let m = tokens.len();
+        let n_embd = self.model.n_embd;
+        let half = self.model.head_dim / 2;
         let mut x_host = vec![0f32; m * n_embd];
         let mut cos_host = vec![0f32; m * half];
         let mut sin_host = vec![0f32; m * half];
@@ -2585,42 +2673,41 @@ impl<'a> BatchedDecoder<'a> {
         ctx.queue.write_buffer(&self.sin_b, 0, bytemuck::cast_slice(&sin_host));
         ctx.queue.write_buffer(&self.pos_buf, 0, bytemuck::cast_slice(positions));
         ctx.queue.write_buffer(&self.slots_buf, 0, bytemuck::cast_slice(slots));
+    }
 
-        let mut enc = ctx.device.create_command_encoder(&Default::default());
+    /// Record the full per-layer transformer forward for `m` rows (residual left
+    /// in `x_b`). Each row's new K/V is scattered to its `(slot, position)`; the
+    /// SDPA has row `i` attend slot[i]'s cache `0..=position[i]`. Shared by decode
+    /// (1 token/stream) and prefill (P prompt tokens, staggered positions).
+    fn record_layers(&self, enc: &mut wgpu::CommandEncoder, m: usize, positions: &[u32], slots: &[u32]) {
+        let ctx = &self.model.ctx;
+        let (n_embd, n_head, n_kv_head, head_dim, n_inter, eps) = (
+            self.model.n_embd, self.model.n_head, self.model.n_kv_head,
+            self.model.head_dim, self.model.n_inter, self.model.eps);
+        let kv_dim = n_kv_head * head_dim;
+        let attn_dim = n_head * head_dim;
         for (li, layer) in self.model.layers.iter().enumerate() {
-            ctx.record_bnorm(&mut enc, &self.x_b, &layer.attn_norm_w, &self.normed_b, n_embd, eps, m);
-            ctx.record_gemm(&mut enc, &layer.wq, &self.normed_b, &self.q_b, n_embd, m, 0);
-            ctx.record_gemm(&mut enc, &layer.wk, &self.normed_b, &self.k_b, n_embd, m, 0);
-            ctx.record_gemm(&mut enc, &layer.wv, &self.normed_b, &self.v_b, n_embd, m, 0);
-            ctx.record_brope(&mut enc, &self.q_b, &self.cos_b, &self.sin_b, n_head, head_dim, m);
-            ctx.record_brope(&mut enc, &self.k_b, &self.cos_b, &self.sin_b, n_kv_head, head_dim, m);
-            // scatter each batch position's new K/V into its cache SLOT at its position
+            ctx.record_bnorm(enc, &self.x_b, &layer.attn_norm_w, &self.normed_b, n_embd, eps, m);
+            ctx.record_gemm(enc, &layer.wq, &self.normed_b, &self.q_b, n_embd, m, 0);
+            ctx.record_gemm(enc, &layer.wk, &self.normed_b, &self.k_b, n_embd, m, 0);
+            ctx.record_gemm(enc, &layer.wv, &self.normed_b, &self.v_b, n_embd, m, 0);
+            ctx.record_brope(enc, &self.q_b, &self.cos_b, &self.sin_b, n_head, head_dim, m);
+            ctx.record_brope(enc, &self.k_b, &self.cos_b, &self.sin_b, n_kv_head, head_dim, m);
+            // scatter each row's new K/V into its cache SLOT at its position
             for s in 0..m {
                 let dst = ((slots[s] as usize * self.max_seq + positions[s] as usize) * kv_dim * 4) as u64;
                 let src = (s * kv_dim * 4) as u64;
                 enc.copy_buffer_to_buffer(&self.k_b, src, &self.k_caches[li], dst, (kv_dim * 4) as u64);
                 enc.copy_buffer_to_buffer(&self.v_b, src, &self.v_caches[li], dst, (kv_dim * 4) as u64);
             }
-            ctx.record_bdsdpa(&mut enc, &self.q_b, &self.k_caches[li], &self.v_caches[li], &self.attn_b, &self.pos_buf, &self.slots_buf, n_head, n_kv_head, head_dim, m, self.max_seq);
-            ctx.record_gemm(&mut enc, &layer.wo, &self.attn_b, &self.x_b, attn_dim, m, 1);
-            ctx.record_bnorm(&mut enc, &self.x_b, &layer.ffn_norm_w, &self.normed_b, n_embd, eps, m);
-            ctx.record_gemm(&mut enc, &layer.w1, &self.normed_b, &self.gate_b, n_embd, m, 0);
-            ctx.record_gemm(&mut enc, &layer.w3, &self.normed_b, &self.up_b, n_embd, m, 0);
-            ctx.record_silu_mul(&mut enc, &self.gate_b, &self.up_b, &self.h_b, m * n_inter);
-            ctx.record_gemm(&mut enc, &layer.w2, &self.h_b, &self.x_b, n_inter, m, 1);
+            ctx.record_bdsdpa(enc, &self.q_b, &self.k_caches[li], &self.v_caches[li], &self.attn_b, &self.pos_buf, &self.slots_buf, n_head, n_kv_head, head_dim, m, self.max_seq);
+            ctx.record_gemm(enc, &layer.wo, &self.attn_b, &self.x_b, attn_dim, m, 1);
+            ctx.record_bnorm(enc, &self.x_b, &layer.ffn_norm_w, &self.normed_b, n_embd, eps, m);
+            ctx.record_gemm(enc, &layer.w1, &self.normed_b, &self.gate_b, n_embd, m, 0);
+            ctx.record_gemm(enc, &layer.w3, &self.normed_b, &self.up_b, n_embd, m, 0);
+            ctx.record_silu_mul(enc, &self.gate_b, &self.up_b, &self.h_b, m * n_inter);
+            ctx.record_gemm(enc, &layer.w2, &self.h_b, &self.x_b, n_inter, m, 1);
         }
-        ctx.record_bnorm(&mut enc, &self.x_b, &self.model.final_norm_w, &self.normed_b, n_embd, eps, m);
-        ctx.record_gemm(&mut enc, &self.model.lm_head, &self.normed_b, &self.logits_b, n_embd, m, 0);
-        ctx.record_bargmax(&mut enc, &self.logits_b, &self.argmax_out, vocab, m);
-        enc.copy_buffer_to_buffer(&self.argmax_out, 0, &self.argmax_read, 0, (m * 4) as u64);
-        ctx.queue.submit([enc.finish()]);
-        ctx.device.poll(wgpu::Maintain::Wait);
-        let slice = self.argmax_read.slice(..(m * 4) as u64);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        ctx.device.poll(wgpu::Maintain::Wait);
-        let out = bytemuck::cast_slice::<u8, u32>(&slice.get_mapped_range()).to_vec();
-        self.argmax_read.unmap();
-        out
     }
 }
 
@@ -2653,8 +2740,7 @@ impl<'a> ContinuousBatcher<'a> {
     /// Returns None only if no slot is free.
     pub fn admit(&mut self, id: u64, prompt: &[u32], max_tokens: usize, eos: u32) -> Option<(u32, bool)> {
         let slot = self.free.pop()?;
-        let mut g = 0u32;
-        for (i, &tk) in prompt.iter().enumerate() { g = self.dec.step_slotted(&[tk], &[i as u32], &[slot])[0]; }
+        let g = self.dec.prefill_slot(prompt, slot); // batched prefill into the slot
         let done = max_tokens <= 1 || g == eos;
         if done {
             self.free.push(slot);
@@ -3865,6 +3951,46 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             assert_eq!(&got[i], r, "server seq {i} diverged from single-stream");
         }
         eprintln!("GpuBatchServer: {} concurrent requests, all match single-stream ✓", prompts.len());
+    }
+
+    /// Batched prefill must be bit-identical to sequential (token-by-token)
+    /// prefill — both the first generated token AND the KV it writes (verified
+    /// by decoding several tokens out of each slot). Uses a >PREFILL_CHUNK prompt
+    /// so the chunked path (chunk k attends earlier chunks' resident KV) is hit.
+    /// `cargo test --release --features gpu --lib gpu_prefill_slot -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gpu_prefill_slot() {
+        use std::time::Instant;
+        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() { eprintln!("model not found; skipping"); return; }
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU ({e}); skipping"); return; } };
+        let model = GpuModel::load(path, ctx).expect("load");
+        let dec = model.batched_decoder(4, 512);
+
+        // A 201-token prompt → two chunks (128 + 73).
+        let mut prompt = vec![128000u32];
+        for i in 0..200u32 { prompt.push(1000 + (i % 64)); }
+        let k = 8usize;
+
+        // Slot 0: batched prefill, then decode k tokens.
+        let t0 = Instant::now();
+        let g0 = dec.prefill_slot(&prompt, 0);
+        let prefill_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let (mut batched, mut tok, mut pos) = (vec![g0], g0, prompt.len() as u32);
+        for _ in 0..k { let n = dec.step_slotted(&[tok], &[pos], &[0])[0]; batched.push(n); tok = n; pos += 1; }
+
+        // Slot 1: sequential prefill (the reference), then decode k tokens.
+        let t1 = Instant::now();
+        let mut g = 0u32;
+        for (i, &t) in prompt.iter().enumerate() { g = dec.step_slotted(&[t], &[i as u32], &[1])[0]; }
+        let seq_ms = t1.elapsed().as_secs_f64() * 1e3;
+        let (mut seq, mut tok, mut pos) = (vec![g], g, prompt.len() as u32);
+        for _ in 0..k { let n = dec.step_slotted(&[tok], &[pos], &[1])[0]; seq.push(n); tok = n; pos += 1; }
+
+        eprintln!("prefill {} tok: batched {prefill_ms:.0} ms vs sequential {seq_ms:.0} ms => {:.1}x faster", prompt.len(), seq_ms / prefill_ms);
+        assert_eq!(batched, seq, "batched prefill diverged from sequential prefill");
+        eprintln!("batched prefill bit-identical to sequential (first tok + {k} decoded) ✓");
     }
 
     #[test]
