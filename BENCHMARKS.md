@@ -171,14 +171,15 @@ sampling. **Every layer validated bit-identical to single-stream decode.**
 | **Paged KV (PagedAttention)** | KV is a shared pool of 16-position blocks + per-slot block table; pool sized to *actual* use, not m_max × max_seq | **4× less KV memory** (8 seqs in a 64-block pool vs 256 contiguous), bit-identical, blocks recycled on evict |
 | **Prefix KV-cache reuse** | refcounted blocks + prefix→block hash map; a new prompt sharing a leading prefix (e.g. a system prompt) reuses those KV blocks and prefills only the suffix | a request sharing a 40-tok prefix **reuses 2 blocks (skips that prefill)**, output bit-identical to cold |
 | **Sampling (temp / top-k / top-p)** | temperature via Gumbel-max (argmax of `logit/temp + gumbel`, no readback); top-k/top-p via a GPU top-K(64) kernel + CPU nucleus sample (reads back M×64, not M×vocab); per-stream `temperature`/`top_k`/`top_p`/`seed` | temp=0 ≡ greedy; reproducible per seed; GPU top-64 bit-matches a CPU sort; coherent varied output |
+| **Preemption (recompute)** | optimistic admission; when a running sequence can't grow, evict (free KV of) a LIFO victim and recompute it later (re-prefill prompt++produced, prefix cache reuses the prompt) — makes paged-KV overcommit *safe* | a sequence preempted mid-generation resumes **bit-identical** to never being preempted |
 
 Notes / honest scope:
 - This raises **aggregate throughput under concurrency** (the right serving metric) — it doesn't change
   single-stream latency or the llama gap (separate axis). The underlying batched decode still scales
   ~6.4× from M=1→32, so aggregate climbs with batch size.
 - **Default pool is full** (every slot can reach max_seq → contiguous-equivalent, never starves);
-  `with_pool(m_max, max_seq, n_blocks)` opts into overcommit. **No preemption yet** — admission is
-  conservative (gates on `can_fit(prompt + max_tokens)`).
+  `with_pool(m_max, max_seq, n_blocks)` opts into overcommit, now made safe by **preemption** (admission
+  is optimistic; a sequence that can't grow is evicted and recomputed later).
 - The CB server loads its **own** model copy on a dedicated thread (handlers talk to it only by
   channel — no borrow-across-`Arc<Mutex>`), independent of the `ZLLM_GPU`/`ZLLM_VK` fast lanes, and
   does **not** hot-swap with the model selector.
@@ -218,6 +219,7 @@ cargo test --release --features gpu --lib gpu_prefix_cache      -- --ignored --n
 cargo test --release --features gpu --lib gpu_sampling          -- --ignored --nocapture  # temp=0 ≡ greedy, temp>0 reproducible per seed
 cargo test --release --features gpu --lib gpu_btopk_kernel      --            --nocapture  # GPU top-64 == CPU sort (no model needed)
 cargo test --release --features gpu --lib gpu_topkp             -- --ignored --nocapture  # top-k/top-p: temp=0 ≡ greedy, reproducible
+cargo test --release --features gpu --lib gpu_preemption        -- --ignored --nocapture  # preemption bit-identical to no-preemption
 # Server: build --features gpu, run with ZLLM_CB=1 (ZLLM_CB_SLOTS / ZLLM_CB_SEQ), POST /v1/cb/completions {prompt, max_tokens, stream}
 
 # zllm Phase 2 (raw-Vulkan coopmat) — --features vulkan
