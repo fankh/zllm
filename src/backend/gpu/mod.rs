@@ -3492,8 +3492,15 @@ pub struct GenReq {
 /// `submit()` enqueues a prompt + a token channel; the loop admits it into a
 /// free KV slot and decodes it together with every other in-flight request,
 /// streaming tokens back and freeing the slot on completion.
+/// A control message to the serving thread: a generation request, or a model
+/// hot-swap (drop the batcher, load a new model, rebuild — acks when done).
+enum CbMsg {
+    Gen(GenReq),
+    Swap { path: String, ack: std::sync::mpsc::Sender<bool> },
+}
+
 pub struct GpuBatchServer {
-    tx: std::sync::mpsc::Sender<GenReq>,
+    tx: std::sync::mpsc::Sender<CbMsg>,
     m_max: usize,
 }
 
@@ -3502,7 +3509,7 @@ impl GpuBatchServer {
     /// Send). `m_max` = max concurrent sequences (KV slots), `max_seq` = max
     /// context length per slot.
     pub fn spawn(model: GpuModel, m_max: usize, max_seq: usize) -> Self {
-        let (tx, rx) = std::sync::mpsc::channel::<GenReq>();
+        let (tx, rx) = std::sync::mpsc::channel::<CbMsg>();
         std::thread::Builder::new()
             .name("gpu-batcher".into())
             .spawn(move || Self::serve(model, rx, m_max, max_seq))
@@ -3519,37 +3526,59 @@ impl GpuBatchServer {
     pub fn submit(&self, prompt: Vec<u32>, max_tokens: usize, eos: u32, params: SamplingParams, seed: u32)
         -> Result<tokio::sync::mpsc::UnboundedReceiver<Option<u32>>, ()> {
         let (tok_tx, tok_rx) = tokio::sync::mpsc::unbounded_channel();
-        self.tx.send(GenReq { prompt, max_tokens, eos, params, seed, tok_tx }).map_err(|_| ())?;
+        self.tx.send(CbMsg::Gen(GenReq { prompt, max_tokens, eos, params, seed, tok_tx })).map_err(|_| ())?;
         Ok(tok_rx)
     }
 
-    fn serve(model: GpuModel, rx: std::sync::mpsc::Receiver<GenReq>, m_max: usize, max_seq: usize) {
+    /// Hot-swap the served model (e.g. on `/v1/models/select`). In-flight
+    /// sequences are aborted (their KV is on the old model). Blocks until the new
+    /// model is loaded; returns false if the load failed or the thread is gone.
+    pub fn swap_model(&self, path: String) -> bool {
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        if self.tx.send(CbMsg::Swap { path, ack: ack_tx }).is_err() { return false; }
+        ack_rx.recv().unwrap_or(false)
+    }
+
+    fn serve(mut model: GpuModel, rx: std::sync::mpsc::Receiver<CbMsg>, m_max: usize, max_seq: usize) {
         use std::sync::mpsc::TryRecvError;
-        let mut cb = ContinuousBatcher::new(&model, m_max, max_seq);
-        let mut chans: std::collections::HashMap<u64, tokio::sync::mpsc::UnboundedSender<Option<u32>>> = Default::default();
         let mut next_id: u64 = 0;
-        loop {
-            // Idle (no active AND no preempted work) → block for the next request.
-            let idle = cb.active_len() == 0 && cb.preempted_len() == 0;
-            if idle {
-                match rx.recv() {
-                    Ok(req) => Self::admit_req(&mut cb, &mut chans, &mut next_id, req),
-                    Err(_) => return, // every sender dropped → shut down
+        loop { // one iteration per loaded model
+            let mut cb = ContinuousBatcher::new(&model, m_max, max_seq);
+            let mut chans: std::collections::HashMap<u64, tokio::sync::mpsc::UnboundedSender<Option<u32>>> = Default::default();
+            let mut reload: Option<(String, std::sync::mpsc::Sender<bool>)> = None;
+            'serve: loop {
+                // Idle (no active AND no preempted work) → block for the next message.
+                let idle = cb.active_len() == 0 && cb.preempted_len() == 0;
+                if idle {
+                    match rx.recv() {
+                        Ok(CbMsg::Gen(req)) => Self::admit_req(&mut cb, &mut chans, &mut next_id, req),
+                        Ok(CbMsg::Swap { path, ack }) => { reload = Some((path, ack)); break 'serve; }
+                        Err(_) => return, // every sender dropped → shut down
+                    }
+                }
+                // Fill free slots with any waiting requests (non-blocking).
+                while cb.has_free() {
+                    match rx.try_recv() {
+                        Ok(CbMsg::Gen(req)) => Self::admit_req(&mut cb, &mut chans, &mut next_id, req),
+                        Ok(CbMsg::Swap { path, ack }) => { reload = Some((path, ack)); break 'serve; }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => { if cb.active_len() == 0 && cb.preempted_len() == 0 { return; } break; }
+                    }
+                }
+                if cb.active_len() == 0 && cb.preempted_len() == 0 { continue; }
+                // One decode step over the whole in-flight batch; stream + retire.
+                for (id, tok, done) in cb.step() {
+                    if let Some(ch) = chans.get(&id) { let _ = ch.send(Some(tok)); }
+                    if done { if let Some(ch) = chans.remove(&id) { let _ = ch.send(None); } }
                 }
             }
-            // Fill free slots with any waiting requests (non-blocking).
-            while cb.has_free() {
-                match rx.try_recv() {
-                    Ok(req) => Self::admit_req(&mut cb, &mut chans, &mut next_id, req),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => { if cb.active_len() == 0 && cb.preempted_len() == 0 { return; } break; }
-                }
-            }
-            if cb.active_len() == 0 && cb.preempted_len() == 0 { continue; }
-            // One decode step over the whole in-flight batch; stream + retire.
-            for (id, tok, done) in cb.step() {
-                if let Some(ch) = chans.get(&id) { let _ = ch.send(Some(tok)); }
-                if done { if let Some(ch) = chans.remove(&id) { let _ = ch.send(None); } }
+            // Swap requested: abort in-flight sequences (their KV is on the old model).
+            for (_, ch) in chans.drain() { let _ = ch.send(None); }
+            let Some((path, ack)) = reload else { return };
+            drop(cb); // release the borrow of `model` before replacing it
+            match GpuContext::new().and_then(|ctx| GpuModel::load(&path, ctx)) {
+                Ok(m) => { model = m; let _ = ack.send(true); }
+                Err(_) => { let _ = ack.send(false); return; } // failed load → shut down
             }
         }
     }

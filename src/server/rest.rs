@@ -626,6 +626,17 @@ async fn select_model(
             }
         }
     }
+    // Hot-swap the continuous-batching server's model too (it owns its own copy
+    // on a dedicated thread), so the default chat backend follows model selection.
+    #[cfg(feature = "gpu")]
+    if let Some(cb) = &s.cb {
+        let path_str = gguf_path.to_str().unwrap_or("").to_string();
+        if cb.swap_model(path_str) {
+            tracing::info!("continuous-batching server reloaded for swapped model");
+        } else {
+            tracing::warn!("continuous-batching server model swap failed");
+        }
+    }
     #[cfg(feature = "vulkan")]
     if std::env::var("ZLLM_VK").is_ok() {
         let path_str = gguf_path.to_str().unwrap_or("").to_string();
