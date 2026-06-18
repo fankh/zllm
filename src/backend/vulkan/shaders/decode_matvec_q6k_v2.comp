@@ -1,0 +1,66 @@
+// Q6_K decode matvec (LM head + attn_v/ffn_down), WORD-LOADED + i8 scales.
+// ggml block_q6_K: ql[128] (low nibbles), qh[64] (high 2 bits), scales[16] i8,
+// d f16. dequantize_row_q6_K shows one qh byte + two ql bytes (l, l+32) yield
+// FOUR outputs y[l], y[l+32], y[l+64], y[l+96] (scales is+0/+2/+4/+6, is=l/16).
+// So each thread loads 3 u32 (ql_a, ql_b, qh) and emits 16 quant·x terms — vs
+// the old per-element 2 loads/element. Scales kept i8 (sign-extracted) instead
+// of expanded to f32, cutting the SoA from 260 -> 212 B/block.
+// One workgroup (64 threads) per output row; shared-mem tree reduction.
+#version 450 core
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly  buffer QL_ { uint  ql[];   };  // 32 u32/block
+layout(binding = 1) readonly  buffer QH_ { uint  qh[];   };  // 16 u32/block
+layout(binding = 2) readonly  buffer SC_ { uint  scl[];  };  // 4 u32/block (16 i8)
+layout(binding = 3) readonly  buffer DD_ { float dd[];   };  // 1/block
+layout(binding = 4) readonly  buffer X_  { float x[];    };
+layout(binding = 5) writeonly buffer O_  { float outp[]; };
+layout(binding = 6) uniform   P_ { uint n_rows; uint nb; uint gx; uint pad; } p;
+shared float partial[64];
+void main() {
+    uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * p.gx;
+    if (row >= p.n_rows) { return; }
+    uint t = gl_LocalInvocationID.x;
+    uint nwords = p.nb * 16u;            // 16 words/block (8 per half)
+    float acc = 0.0;
+    uint w = t;
+    while (w < nwords) {
+        uint blk_local = w / 16u;
+        uint blk = row * p.nb + blk_local;
+        uint wb = w % 16u; uint hf = wb / 8u; uint wih = wb % 8u;
+        float d = dd[blk];
+        uint ql_base = blk * 32u + hf * 16u;
+        uint qh_base = blk * 16u + hf * 8u;
+        uint sc_base = blk * 4u;
+        uint scoff = hf * 8u;
+        uint ql_a = ql[ql_base + wih];
+        uint ql_b = ql[ql_base + wih + 8u];
+        uint qh_w = qh[qh_base + wih];
+        uint xbase = blk_local * 256u + hf * 128u;
+        uint l0 = wih * 4u;
+        // l/16 is constant across a 4-byte word (l0 is a multiple of 4), so the
+        // four sub-block scales are the same for all 4 bytes — extract once.
+        uint is = scoff + (l0 / 16u);
+        float s1 = float(bitfieldExtract(int(scl[sc_base + (is) / 4u]),      int((is) % 4u) * 8, 8));
+        float s2 = float(bitfieldExtract(int(scl[sc_base + (is + 2u) / 4u]), int((is + 2u) % 4u) * 8, 8));
+        float s3 = float(bitfieldExtract(int(scl[sc_base + (is + 4u) / 4u]), int((is + 4u) % 4u) * 8, 8));
+        float s4 = float(bitfieldExtract(int(scl[sc_base + (is + 6u) / 4u]), int((is + 6u) % 4u) * 8, 8));
+        for (uint b = 0u; b < 4u; b++) {
+            uint l = l0 + b;
+            uint qla = (ql_a >> (b * 8u)) & 0xffu;
+            uint qlb = (ql_b >> (b * 8u)) & 0xffu;
+            uint qhb = (qh_w >> (b * 8u)) & 0xffu;
+            int q1 = int((qla & 0xfu) | ((qhb & 3u) << 4u)) - 32;
+            int q2 = int((qlb & 0xfu) | (((qhb >> 2u) & 3u) << 4u)) - 32;
+            int q3 = int((qla >> 4u) | (((qhb >> 4u) & 3u) << 4u)) - 32;
+            int q4 = int((qlb >> 4u) | (((qhb >> 6u) & 3u) << 4u)) - 32;
+            acc += d * (s1 * float(q1) * x[xbase + l]
+                      + s2 * float(q2) * x[xbase + l + 32u]
+                      + s3 * float(q3) * x[xbase + l + 64u]
+                      + s4 * float(q4) * x[xbase + l + 96u]);
+        }
+        w += 64u;
+    }
+    partial[t] = acc; barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) { if (t < s) { partial[t] += partial[t + s]; } barrier(); }
+    if (t == 0u) { outp[row] = partial[0]; }
+}

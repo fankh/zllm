@@ -24,6 +24,8 @@ const SDPA_FLASH_COMBINE_SPV: &[u8] = include_bytes!("shaders/sdpa_flash_combine
 const SDPA_FLASH_BLOCK: usize = 32; // must match BLOCK in the flash shaders
 const SILU_MUL_SPV: &[u8] = include_bytes!("shaders/silu_mul.spv");
 const DECODE_MATVEC_Q6K_SPV: &[u8] = include_bytes!("shaders/decode_matvec_q6k.spv");
+#[cfg(test)]
+const DECODE_MATVEC_Q6K_V2_SPV: &[u8] = include_bytes!("shaders/decode_matvec_q6k_v2.spv");
 const KV_WRITE_SPV: &[u8] = include_bytes!("shaders/kv_write.spv");
 const RESIDUAL_ADD_SPV: &[u8] = include_bytes!("shaders/residual_add.spv");
 const ARGMAX_SPV: &[u8] = include_bytes!("shaders/argmax.spv");
@@ -1468,6 +1470,20 @@ mod tests {
         unsafe { barrier_coherence_inner(&ctx); }
     }
 
+    /// Q6_K MATVEC BANDWIDTH: measures the decode Q6_K matvec in isolation
+    /// (GB/s on the streamed SoA bytes) + validates vs candle. Lets the kernel
+    /// be tuned in ms instead of full-model runs. `VK_Q6K_SPV=v2` swaps variants.
+    /// `cargo test --release --features vulkan --lib vk_q6k_bandwidth -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_q6k_bandwidth() {
+        let ctx = match VkContext::new() {
+            Ok(c) => c,
+            Err(e) => { eprintln!("no Vulkan device ({e}); skipping"); return; }
+        };
+        unsafe { q6k_bandwidth_inner(&ctx); }
+    }
+
     /// SDPA CORRECTNESS: runs the parallel decode-SDPA kernel on pseudo-random
     /// GQA q/K/V and compares to a CPU softmax-attention reference. Guards the
     /// workgroup-per-head rewrite (which gave the decode forward its lead).
@@ -1489,6 +1505,85 @@ unsafe fn sdpa_correctness_inner(ctx: &VkContext) {
     // multiple KV blocks), each vs a CPU softmax-attention reference.
     sdpa_case(ctx, 32, false);
     sdpa_case(ctx, 520, true); // > SDPA_FLASH_BLOCK and not a block multiple
+}
+
+#[cfg(test)]
+unsafe fn q6k_bandwidth_inner(ctx: &VkContext) {
+    use ash::vk;
+    use candle_core::{Device, Tensor};
+    use candle_core::quantized::{QTensor, GgmlDType};
+    let dev = &ctx.device;
+    let (n, nb) = (131072usize, 8usize); // > MALL cache (~217 MB SoA) → real DRAM bandwidth
+    let k = nb * 256;
+    let variant = std::env::var("VK_Q6K_SPV").unwrap_or_default();
+    let (spv, soa_bytes_per_block): (&[u8], usize) = match variant.as_str() {
+        "v2" => (DECODE_MATVEC_Q6K_V2_SPV, 212),
+        _ => (DECODE_MATVEC_Q6K_SPV, 212),
+    };
+
+    // Quantize a tensor to Q6_K → raw bytes → SoA.
+    let mut wv = vec![0f32; n * k];
+    for i in 0..wv.len() { wv[i] = (((i as i64).wrapping_mul(2654435761) & 0xFFFF) as f32 / 32768.0 - 1.0) * 0.5; }
+    let qt = QTensor::quantize(&Tensor::from_vec(wv, (n, k), &Device::Cpu).unwrap(), GgmlDType::Q6K).unwrap();
+    let bytes = qt.data().unwrap();
+    let deq: Vec<f32> = qt.dequantize(&Device::Cpu).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+    let x: Vec<f32> = (0..k).map(|i| ((i % 23) as f32 - 11.0) * 0.03).collect();
+
+    let mut bufs: Vec<(vk::Buffer, vk::DeviceMemory)> = Vec::new();
+    let (ql, qh, scl, dd) = vk_up_q6k(ctx, &mut bufs, &bytes, n * nb);
+    let xb = vk_up_f32(ctx, &mut bufs, &x);
+    let (ob, ob_ptr) = vk_zeros(ctx, &mut bufs, n);
+    let (u, _) = vk_uni(ctx, &mut bufs, [n as u32, nb as u32, (n as u32).min(65535), 0]);
+
+    let (p, l, sl, m) = ctx.make_pipeline_raw(spv, 6);
+    let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&[
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(6),
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(1),
+    ]), None).unwrap();
+    let set = vk_alloc_set(dev, pool, sl, &[ql, qh, scl, dd, xb, ob], u);
+
+    let cmd_pool = dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family), None).unwrap();
+    let cmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).unwrap()[0];
+    let gx = (n as u32).min(65535); let gy = (n as u32).div_ceil(gx);
+    let barr = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
+    let cs = vk::PipelineStageFlags::COMPUTE_SHADER;
+    let iters = 100u32;
+    dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+    dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p);
+    dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, l, 0, &[set], &[]);
+    for _ in 0..iters { dev.cmd_dispatch(cmd, gx, gy, 1); dev.cmd_pipeline_barrier(cmd, cs, cs, vk::DependencyFlags::empty(), &[barr], &[], &[]); }
+    dev.end_command_buffer(cmd).unwrap();
+    let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+    let cmds = [cmd];
+    // warm
+    dev.queue_submit(ctx.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence).unwrap();
+    dev.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+    dev.reset_fences(&[fence]).unwrap();
+    let t0 = std::time::Instant::now();
+    dev.queue_submit(ctx.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence).unwrap();
+    dev.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+    let ms = t0.elapsed().as_secs_f64() * 1e3;
+    let bytes_streamed = (n * nb * soa_bytes_per_block) as f64 * iters as f64;
+    let gbs = bytes_streamed / (ms / 1e3) / 1e9;
+
+    // correctness
+    let op = ob_ptr as *const f32;
+    let (mut max_err, mut cos_a, mut cos_b, mut cos_ab) = (0f64, 0f64, 0f64, 0f64);
+    for nn in 0..n {
+        let mut acc = 0f64;
+        for kk in 0..k { acc += (deq[nn * k + kk] as f64) * (x[kk] as f64); }
+        let g = *op.add(nn) as f64;
+        max_err = max_err.max((g - acc).abs());
+        cos_a += g * g; cos_b += acc * acc; cos_ab += g * acc;
+    }
+    let cos = cos_ab / (cos_a.sqrt() * cos_b.sqrt());
+    let label = if variant.is_empty() { "current" } else { &variant };
+    eprintln!("Q6_K matvec [{label}]: {ms:.3} ms/{iters} => {:.2} ms/iter, {gbs:.1} GB/s | cos={cos:.6} max_err={max_err:.3e}", ms / iters as f64);
+    assert!(cos > 0.9999, "Q6_K matvec wrong: cos={cos}");
+
+    dev.destroy_fence(fence, None); dev.destroy_command_pool(cmd_pool, None); dev.destroy_descriptor_pool(pool, None);
+    dev.destroy_pipeline(p, None); dev.destroy_pipeline_layout(l, None); dev.destroy_descriptor_set_layout(sl, None); dev.destroy_shader_module(m, None);
+    for (b, mm) in bufs { dev.unmap_memory(mm); dev.destroy_buffer(b, None); dev.free_memory(mm, None); }
 }
 
 #[cfg(test)]
