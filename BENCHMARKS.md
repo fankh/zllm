@@ -137,12 +137,20 @@ Key Phase-2 levers (all bit-exact):
 - **The raw-Vulkan forward is now a real-weight server engine** (`VkModel`, `--features vulkan`,
   `ZLLM_VK=1`): loads the actual GGUF, runs the validated decode kernels with a resident KV cache,
   **bit-exact vs candle (greedy 24/24 tokens)**, wired into the chat fast-lane (blocking + streaming)
-  and verified live. On real weights the server decodes **~122 tok/s** (beats CPU/wgpu's 63 by ~1.9×)
-  — below the ~290 kernel ceiling because the Q6_K weights (`attn_v`, `ffn_down`, tied LM head) stream
-  more (the SoA repack expands i8 scales → f32) and prefill is sequential. The first real-weight cliff
-  was the readback: reading the 513 KB logit vector from write-combined host memory cost ~8.5 ms/token
-  — fixed with a GPU argmax (4-byte readback, 59 → 114 tok/s). Remaining: word-load the Q6_K matvec +
-  keep scales i8, and batched prefill via the coopmat GEMM.
+  and verified live. Real-weight decode went **122 → 180 tok/s** after word-loading the Q6_K matvec
+  (`attn_v`/`ffn_down`/tied LM head) and keeping scales i8 (212 B/block), plus a GPU argmax that fixed
+  an ~8.5 ms/token logit-readback cliff (59 → 114). Beats CPU/wgpu (63) by ~2.9×.
+- **Head-to-head decode, fair context (llama-bench `tg128`, avg ctx ~64, same box):** llama **204**,
+  zllm VkModel **~150** (≈74%; ~87% at short ctx). zllm is *not* past llama on the deployed engine yet.
+  Both degrade with context (llama 204→159 at ctx 2048; zllm's flash kernel 162–173 there — a tie at
+  the kernel level). **The differentiator is effective bandwidth on the *mixed-precision* forward:**
+  both stream ~840 MB/token, but llama sustains ~171 GB/s vs zllm's ~134. zllm's **Q4_K** matvec alone
+  does **208 GB/s (> llama)**, but the **Q6_K** parts run ~170 and the small ops (norm/rope/sdpa/silu)
+  add ~1.8 ms/token of non-streaming time (`VK_NOEXTRA` shows kv-write+residual are only ~0.4 ms of
+  that, so dispatch-fusion isn't the lever). zllm's all-Q4 decode *kernel* ceiling (~300 @ ctx 64) is
+  above llama; closing the deployed gap to beat llama needs the deep op-fusion (fold norm into the
+  matvec producer, fuse QKV) + the Q6 kernel to 208 — not more matvec tuning. Prefill is also still
+  sequential (~175 tok/s vs llama 5708); the coopmat GEMM is built but not wired into `VkModel`.
 
 ## zllm GPU kernel tuning (this engine's own progression)
 
