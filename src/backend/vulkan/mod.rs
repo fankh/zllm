@@ -712,19 +712,21 @@ unsafe fn vk_uni(ctx: &VkContext, bufs: &mut Vec<(ash::vk::Buffer, ash::vk::Devi
     std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, p, 16);
     bufs.push((b, m)); (b, p)
 }
-// Repack a raw Q6_K tensor (210-byte blocks) into aligned SoA buffers.
+// Repack a raw Q6_K tensor (210-byte blocks) into aligned SoA buffers: ql
+// (128 B/blk), qh (64 B), scales (16 i8/blk, sign-extracted in-shader), d (f32).
+// Scales stay i8 (not expanded to f32) so the matvec stays bandwidth-bound.
 unsafe fn vk_up_q6k(ctx: &VkContext, bufs: &mut Vec<(ash::vk::Buffer, ash::vk::DeviceMemory)>, bytes: &[u8], nbk: usize) -> (ash::vk::Buffer, ash::vk::Buffer, ash::vk::Buffer, ash::vk::Buffer) {
     assert_eq!(bytes.len(), nbk * 210, "Q6_K byte length");
     let mut ql = vec![0u8; nbk * 128]; let mut qh = vec![0u8; nbk * 64];
-    let mut scl = vec![0f32; nbk * 16]; let mut dd = vec![0f32; nbk];
+    let mut scl = vec![0u8; nbk * 16]; let mut dd = vec![0f32; nbk];
     for b in 0..nbk {
         let base = b * 210;
         ql[b * 128..b * 128 + 128].copy_from_slice(&bytes[base..base + 128]);
         qh[b * 64..b * 64 + 64].copy_from_slice(&bytes[base + 128..base + 192]);
-        for s in 0..16 { scl[b * 16 + s] = (bytes[base + 192 + s] as i8) as f32; }
+        scl[b * 16..b * 16 + 16].copy_from_slice(&bytes[base + 192..base + 208]); // raw i8 scales
         dd[b] = half::f16::from_bits(u16::from_le_bytes([bytes[base + 208], bytes[base + 209]])).to_f32();
     }
-    (vk_up_bytes(ctx, bufs, &ql), vk_up_bytes(ctx, bufs, &qh), vk_up_f32(ctx, bufs, &scl), vk_up_f32(ctx, bufs, &dd))
+    (vk_up_bytes(ctx, bufs, &ql), vk_up_bytes(ctx, bufs, &qh), vk_up_bytes(ctx, bufs, &scl), vk_up_f32(ctx, bufs, &dd))
 }
 
 // A loaded weight: Q4_K (raw bytes) or Q6_K (repacked SoA). nb = cols/256.
@@ -1078,10 +1080,12 @@ impl VkModel {
         }
         let _ = attn_dim;
         dv.end_command_buffer(cmd).unwrap();
+        let t_rec = std::time::Instant::now();
         dv.reset_fences(&[self.fence]).unwrap();
         let cmds = [cmd];
         dv.queue_submit(self.ctx.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], self.fence).unwrap();
         dv.wait_for_fences(&[self.fence], true, u64::MAX).unwrap();
+        if std::env::var("VK_TIME").is_ok() { eprintln!("  gpu {:.2}ms", t_rec.elapsed().as_secs_f64() * 1e3); }
         if !lm { (Vec::new(), 0) }
         else if argmax { (Vec::new(), *(self.argmax_ptr as *const u32)) }
         else { (std::slice::from_raw_parts(self.logits_ptr as *const f32, self.vocab).to_vec(), 0) }

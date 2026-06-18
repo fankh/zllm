@@ -1,14 +1,17 @@
-// Q6_K decode matvec (LM head): out[N] = dequant(W)[N,K] · x[K]. Reads the
-// repacked struct-of-arrays (ql 128B/blk, qh 64B/blk, scales 16 f32/blk, d
-// f32/blk) — raw Q6_K's 210-byte blocks aren't u32-aligned. Dequant mirrors
-// ggml dequantize_row_q6_K: q=((ql&0xF)|(qh_bits<<4))-32, val=d*scale*q.
+// Q6_K decode matvec (LM head + attn_v/ffn_down), WORD-LOADED + i8 scales.
+// ggml block_q6_K: ql[128] (low nibbles), qh[64] (high 2 bits), scales[16] i8,
+// d f16. dequantize_row_q6_K shows one qh byte + two ql bytes (l, l+32) yield
+// FOUR outputs y[l], y[l+32], y[l+64], y[l+96] (scales is+0/+2/+4/+6, is=l/16).
+// So each thread loads 3 u32 (ql_a, ql_b, qh) and emits 16 quant·x terms — vs
+// the old per-element 2 loads/element. Scales kept i8 (sign-extracted) instead
+// of expanded to f32, cutting the SoA from 260 -> 212 B/block.
 // One workgroup (64 threads) per output row; shared-mem tree reduction.
 #version 450 core
 layout(local_size_x = 64) in;
-layout(binding = 0) readonly  buffer QL_ { uint  ql[];   };
-layout(binding = 1) readonly  buffer QH_ { uint  qh[];   };
-layout(binding = 2) readonly  buffer SC_ { float scl[];  };
-layout(binding = 3) readonly  buffer DD_ { float dd[];   };
+layout(binding = 0) readonly  buffer QL_ { uint  ql[];   };  // 32 u32/block
+layout(binding = 1) readonly  buffer QH_ { uint  qh[];   };  // 16 u32/block
+layout(binding = 2) readonly  buffer SC_ { uint  scl[];  };  // 4 u32/block (16 i8)
+layout(binding = 3) readonly  buffer DD_ { float dd[];   };  // 1/block
 layout(binding = 4) readonly  buffer X_  { float x[];    };
 layout(binding = 5) writeonly buffer O_  { float outp[]; };
 layout(binding = 6) uniform   P_ { uint n_rows; uint nb; uint gx; uint pad; } p;
@@ -17,25 +20,43 @@ void main() {
     uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * p.gx;
     if (row >= p.n_rows) { return; }
     uint t = gl_LocalInvocationID.x;
-    uint ncols = p.nb * 256u;
+    uint nwords = p.nb * 16u;            // 16 words/block (8 per half)
     float acc = 0.0;
-    uint e = t;
-    while (e < ncols) {
-        uint b = e / 256u; uint pp = e % 256u;
-        uint hf = pp / 128u; uint pq = pp % 128u;
-        uint sub = pq / 32u; uint l = pq % 32u;
-        uint blk = row * p.nb + b;
-        uint ql_l = l + (sub & 1u) * 32u;
-        uint ql_bi = blk * 128u + hf * 64u + ql_l;
-        uint ql_byte = (ql[ql_bi >> 2u] >> ((ql_bi & 3u) * 8u)) & 0xffu;
-        uint nib = (sub < 2u) ? (ql_byte & 0xfu) : (ql_byte >> 4u);
-        uint qh_bi = blk * 64u + hf * 32u + l;
-        uint qh_byte = (qh[qh_bi >> 2u] >> ((qh_bi & 3u) * 8u)) & 0xffu;
-        uint qbits = (qh_byte >> (sub * 2u)) & 3u;
-        int q = int(nib | (qbits << 4u)) - 32;
-        float scale = scl[blk * 16u + hf * 8u + (l / 16u) + 2u * sub];
-        acc += dd[blk] * scale * float(q) * x[e];
-        e += 64u;
+    uint w = t;
+    while (w < nwords) {
+        uint blk_local = w / 16u;
+        uint blk = row * p.nb + blk_local;
+        uint wb = w % 16u; uint hf = wb / 8u; uint wih = wb % 8u;
+        float d = dd[blk];
+        uint ql_base = blk * 32u + hf * 16u;
+        uint qh_base = blk * 16u + hf * 8u;
+        uint sc_base = blk * 4u;
+        uint scoff = hf * 8u;
+        uint ql_a = ql[ql_base + wih];
+        uint ql_b = ql[ql_base + wih + 8u];
+        uint qh_w = qh[qh_base + wih];
+        uint xbase = blk_local * 256u + hf * 128u;
+        uint l0 = wih * 4u;
+        for (uint b = 0u; b < 4u; b++) {
+            uint l = l0 + b;
+            uint is = scoff + (l / 16u);
+            int s1 = bitfieldExtract(int(scl[sc_base + (is) / 4u]),        int((is) % 4u) * 8, 8);
+            int s2 = bitfieldExtract(int(scl[sc_base + (is + 2u) / 4u]),   int((is + 2u) % 4u) * 8, 8);
+            int s3 = bitfieldExtract(int(scl[sc_base + (is + 4u) / 4u]),   int((is + 4u) % 4u) * 8, 8);
+            int s4 = bitfieldExtract(int(scl[sc_base + (is + 6u) / 4u]),   int((is + 6u) % 4u) * 8, 8);
+            uint qla = (ql_a >> (b * 8u)) & 0xffu;
+            uint qlb = (ql_b >> (b * 8u)) & 0xffu;
+            uint qhb = (qh_w >> (b * 8u)) & 0xffu;
+            int q1 = int((qla & 0xfu) | ((qhb & 3u) << 4u)) - 32;
+            int q2 = int((qlb & 0xfu) | (((qhb >> 2u) & 3u) << 4u)) - 32;
+            int q3 = int((qla >> 4u) | (((qhb >> 4u) & 3u) << 4u)) - 32;
+            int q4 = int((qlb >> 4u) | (((qhb >> 6u) & 3u) << 4u)) - 32;
+            acc += d * (float(s1 * q1) * x[xbase + l]
+                      + float(s2 * q2) * x[xbase + l + 32u]
+                      + float(s3 * q3) * x[xbase + l + 64u]
+                      + float(s4 * q4) * x[xbase + l + 96u]);
+        }
+        w += 64u;
     }
     partial[t] = acc; barrier();
     for (uint s = 32u; s > 0u; s >>= 1u) { if (t < s) { partial[t] += partial[t + s]; } barrier(); }
