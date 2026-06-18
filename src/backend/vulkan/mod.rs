@@ -32,6 +32,8 @@ const GRID_BARRIER_PROBE_SPV: &[u8] = include_bytes!("shaders/grid_barrier_probe
 const DECODE_MATVEC_Q6K_PERSIST_SPV: &[u8] = include_bytes!("shaders/decode_matvec_q6k_persist.spv");
 #[cfg(test)]
 const Q6K_MEGAKERNEL_PROBE_SPV: &[u8] = include_bytes!("shaders/q6k_megakernel_probe.spv");
+#[cfg(test)]
+const FFN_MEGAKERNEL_SPV: &[u8] = include_bytes!("shaders/ffn_megakernel.spv");
 const KV_WRITE_SPV: &[u8] = include_bytes!("shaders/kv_write.spv");
 const RESIDUAL_ADD_SPV: &[u8] = include_bytes!("shaders/residual_add.spv");
 const ARGMAX_SPV: &[u8] = include_bytes!("shaders/argmax.spv");
@@ -1807,6 +1809,17 @@ mod tests {
         unsafe { q6k_bandwidth_inner(&ctx); }
     }
 
+    /// FFN MEGAKERNEL A/B: runs one FFN block (norm->W13->silu->W2->residual)
+    /// both as today's 5 separate dispatches and as one persistent-workgroup
+    /// megakernel with grid barriers; checks they produce the same output and
+    /// compares timing. `VK_GRID_G=480 cargo test --release --features vulkan --lib vk_ffn_megakernel_ab -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_ffn_megakernel_ab() {
+        let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan ({e}); skipping"); return; } };
+        unsafe { ffn_megakernel_ab_inner(&ctx); }
+    }
+
     /// MEGAKERNEL VIABILITY: persistent Q6_K matvec WITH grid barriers between
     /// passes (one dispatch, G workgroups). Reports bandwidth + deadlock. If it
     /// sustains ~210 GB/s at high G (above the in-forward 155), a megakernel can
@@ -1858,6 +1871,133 @@ unsafe fn sdpa_correctness_inner(ctx: &VkContext) {
     // multiple KV blocks), each vs a CPU softmax-attention reference.
     sdpa_case(ctx, 32, false);
     sdpa_case(ctx, 520, true); // > SDPA_FLASH_BLOCK and not a block multiple
+}
+
+#[cfg(test)]
+unsafe fn ffn_megakernel_ab_inner(ctx: &VkContext) {
+    use ash::vk;
+    use candle_core::{Device, Tensor};
+    use candle_core::quantized::{QTensor, GgmlDType};
+    let dev = &ctx.device;
+    let (n_embd, n_inter) = (2048usize, 8192usize);
+    let g: u32 = std::env::var("VK_GRID_G").ok().and_then(|s| s.parse().ok()).unwrap_or(480);
+    let eps = 1e-5f32;
+    let q = |n: usize, k: usize, dt: GgmlDType, s: i64| -> Vec<u8> {
+        let mut w = vec![0f32; n * k];
+        for i in 0..w.len() { w[i] = ((((i as i64).wrapping_mul(2654435761).wrapping_add(s) & 0xFFFF) as f32) / 32768.0 - 1.0) * 0.4; }
+        QTensor::quantize(&Tensor::from_vec(w, (n, k), &Device::Cpu).unwrap(), dt).unwrap().data().unwrap().to_vec()
+    };
+    let x0: Vec<f32> = (0..n_embd).map(|i| ((i % 31) as f32 - 15.0) * 0.05).collect();
+    let fnw: Vec<f32> = (0..n_embd).map(|i| 0.7 + (i % 13) as f32 * 0.02).collect();
+    let w13_bytes = q(2 * n_inter, n_embd, GgmlDType::Q4K, 1);
+    let w2_bytes = q(n_embd, n_inter, GgmlDType::Q6K, 7);
+
+    let mut bufs: Vec<(vk::Buffer, vk::DeviceMemory)> = Vec::new();
+    let w13b = vk_up_bytes(ctx, &mut bufs, &w13_bytes);
+    let (w2ql, w2qh, w2scl, w2dd) = vk_up_q6k(ctx, &mut bufs, &w2_bytes, n_embd * (n_inter / 256));
+    let fnwb = vk_up_f32(ctx, &mut bufs, &fnw);
+    let gxof = |n: usize| (n as u32).min(65535);
+    let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(12).pool_sizes(&[
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(40),
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(12),
+    ]), None).unwrap();
+    let cmd_pool = dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family), None).unwrap();
+    let cs = vk::PipelineStageFlags::COMPUTE_SHADER;
+    let barr = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
+    let fbar = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
+
+    let uni = |bufs: &mut Vec<(vk::Buffer, vk::DeviceMemory)>, d: [u32; 4]| -> vk::Buffer { let (b, m, p) = ctx.uma_buffer(16).unwrap(); std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, p, 16); bufs.push((b, m)); b };
+    let iters = 300u32;
+    let time_cmd = |cmd: vk::CommandBuffer| -> f64 {
+        let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None).unwrap(); let cmds = [cmd];
+        for _ in 0..2 { dev.reset_fences(&[fence]).unwrap(); dev.queue_submit(ctx.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence).unwrap(); dev.wait_for_fences(&[fence], true, u64::MAX).unwrap(); }
+        let t0 = std::time::Instant::now();
+        dev.reset_fences(&[fence]).unwrap(); dev.queue_submit(ctx.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence).unwrap(); dev.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+        let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64; dev.destroy_fence(fence, None); us
+    };
+    let alloc_set = |sl: vk::DescriptorSetLayout, sb: &[(vk::Buffer, u64, u64)], u: vk::Buffer| -> vk::DescriptorSet {
+        let set = dev.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(std::slice::from_ref(&sl))).unwrap()[0];
+        let infos: Vec<[vk::DescriptorBufferInfo; 1]> = sb.iter().map(|&(b, o, r)| [vk::DescriptorBufferInfo::default().buffer(b).offset(o).range(if r == 0 { vk::WHOLE_SIZE } else { r })]).collect();
+        let ui = [vk::DescriptorBufferInfo::default().buffer(u).range(vk::WHOLE_SIZE)];
+        let mut w: Vec<vk::WriteDescriptorSet> = infos.iter().enumerate().map(|(i, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(i as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(info)).collect();
+        w.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(sb.len() as u32).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&ui));
+        dev.update_descriptor_sets(&w, &[]); set
+    };
+
+    // ---- Separate path: rmsnorm -> W13 (Q4) -> silu -> W2 (Q6) -> residual ----
+    let (rms_p, rms_l, rms_sl, _) = ctx.make_pipeline_raw(RMSNORM_SPV, 3);
+    let (mv_p, mv_l, mv_sl, _) = ctx.make_pipeline_raw(DECODE_MATVEC_Q4K_SPV, 3);
+    let (si_p, si_l, si_sl, _) = ctx.make_pipeline_raw(SILU_MUL_SPV, 3);
+    let (q6_p, q6_l, q6_sl, _) = ctx.make_pipeline_raw(DECODE_MATVEC_Q6K_SPV, 6);
+    let (ad_p, ad_l, ad_sl, _) = ctx.make_pipeline_raw(RESIDUAL_ADD_SPV, 2);
+    let (xs, _xsm, xs_ptr) = ctx.uma_buffer((n_embd * 4) as u64).unwrap(); std::ptr::copy_nonoverlapping(x0.as_ptr() as *const u8, xs_ptr, n_embd * 4);
+    let (normed, _) = vk_zeros(ctx, &mut bufs, n_embd);
+    let (gu, _) = vk_zeros(ctx, &mut bufs, 2 * n_inter);
+    let (hb, _) = vk_zeros(ctx, &mut bufs, n_inter);
+    let (ffnb, _) = vk_zeros(ctx, &mut bufs, n_embd);
+    let w = |b: vk::Buffer| (b, 0u64, 0u64);
+    let s_rms = alloc_set(rms_sl, &[w(xs), w(fnwb), w(normed)], uni(&mut bufs, [n_embd as u32, eps.to_bits(), 0, 0]));
+    let s_w13 = alloc_set(mv_sl, &[w(w13b), w(normed), w(gu)], uni(&mut bufs, [(2 * n_inter) as u32, n_embd as u32, (n_embd / 256) as u32, gxof(2 * n_inter)]));
+    let s_si = alloc_set(si_sl, &[(gu, 0, (n_inter * 4) as u64), (gu, (n_inter * 4) as u64, (n_inter * 4) as u64), w(hb)], uni(&mut bufs, [n_inter as u32, 0, 0, 0]));
+    let s_w2 = alloc_set(q6_sl, &[w(w2ql), w(w2qh), w(w2scl), w(w2dd), w(hb), w(ffnb)], uni(&mut bufs, [n_embd as u32, (n_inter / 256) as u32, gxof(n_embd), 0]));
+    let s_add = alloc_set(ad_sl, &[w(xs), w(ffnb)], uni(&mut bufs, [n_embd as u32, 0, 0, 0]));
+    let cmd_sep = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).unwrap()[0];
+    dev.begin_command_buffer(cmd_sep, &vk::CommandBufferBeginInfo::default()).unwrap();
+    let bar_s = || dev.cmd_pipeline_barrier(cmd_sep, cs, cs, vk::DependencyFlags::empty(), &[barr], &[], &[]);
+    let d = |p: vk::Pipeline, l: vk::PipelineLayout, set: vk::DescriptorSet, gx: u32| { dev.cmd_bind_pipeline(cmd_sep, vk::PipelineBindPoint::COMPUTE, p); dev.cmd_bind_descriptor_sets(cmd_sep, vk::PipelineBindPoint::COMPUTE, l, 0, &[set], &[]); dev.cmd_dispatch(cmd_sep, gx, 1, 1); };
+    for _ in 0..iters {
+        d(rms_p, rms_l, s_rms, 1); bar_s();
+        d(mv_p, mv_l, s_w13, gxof(2 * n_inter)); bar_s();
+        d(si_p, si_l, s_si, ((n_inter as u32) + 63) / 64); bar_s();
+        d(q6_p, q6_l, s_w2, gxof(n_embd)); bar_s();
+        d(ad_p, ad_l, s_add, ((n_embd as u32) + 63) / 64); bar_s();
+    }
+    dev.end_command_buffer(cmd_sep).unwrap();
+    let sep_us = time_cmd(cmd_sep);
+    let x_sep = std::slice::from_raw_parts(xs_ptr as *const f32, n_embd).to_vec();
+
+    // ---- Megakernel: one persistent dispatch, grid barriers ----
+    let (mg_p, mg_l, mg_sl, _) = ctx.make_pipeline_raw(FFN_MEGAKERNEL_SPV, 11);
+    let (xm, _xmm, xm_ptr) = ctx.uma_buffer((n_embd * 4) as u64).unwrap(); std::ptr::copy_nonoverlapping(x0.as_ptr() as *const u8, xm_ptr, n_embd * 4);
+    let (nm, _) = vk_zeros(ctx, &mut bufs, n_embd);
+    let (gum, _) = vk_zeros(ctx, &mut bufs, 2 * n_inter);
+    let (hm, _) = vk_zeros(ctx, &mut bufs, n_inter);
+    let (ctr, _ctrm, ctr_ptr) = ctx.uma_buffer(8).unwrap(); std::ptr::write_bytes(ctr_ptr, 0, 8);
+    let (umega, _umm, ump) = ctx.uma_buffer(32).unwrap();
+    std::ptr::copy_nonoverlapping([n_embd as u32, n_inter as u32, (n_embd / 256) as u32, (n_inter / 256) as u32, g, eps.to_bits(), 0u32, 0u32].as_ptr() as *const u8, ump, 32);
+    let s_mega = {
+        let set = dev.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(std::slice::from_ref(&mg_sl))).unwrap()[0];
+        let sb = [xm, fnwb, nm, w13b, gum, hm, w2ql, w2qh, w2scl, w2dd, ctr];
+        let infos: Vec<[vk::DescriptorBufferInfo; 1]> = sb.iter().map(|&b| [vk::DescriptorBufferInfo::default().buffer(b).range(vk::WHOLE_SIZE)]).collect();
+        let ui = [vk::DescriptorBufferInfo::default().buffer(umega).range(vk::WHOLE_SIZE)];
+        let mut wr: Vec<vk::WriteDescriptorSet> = infos.iter().enumerate().map(|(i, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(i as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(info)).collect();
+        wr.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(11).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&ui));
+        dev.update_descriptor_sets(&wr, &[]); set
+    };
+    let cmd_mg = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).unwrap()[0];
+    dev.begin_command_buffer(cmd_mg, &vk::CommandBufferBeginInfo::default()).unwrap();
+    dev.cmd_bind_pipeline(cmd_mg, vk::PipelineBindPoint::COMPUTE, mg_p);
+    dev.cmd_bind_descriptor_sets(cmd_mg, vk::PipelineBindPoint::COMPUTE, mg_l, 0, &[s_mega], &[]);
+    for _ in 0..iters {
+        dev.cmd_fill_buffer(cmd_mg, ctr, 0, 8, 0);
+        dev.cmd_pipeline_barrier(cmd_mg, vk::PipelineStageFlags::TRANSFER | cs, cs, vk::DependencyFlags::empty(), &[fbar], &[], &[]);
+        dev.cmd_dispatch(cmd_mg, g, 1, 1);
+        dev.cmd_pipeline_barrier(cmd_mg, cs, vk::PipelineStageFlags::TRANSFER | cs, vk::DependencyFlags::empty(), &[barr], &[], &[]);
+    }
+    dev.end_command_buffer(cmd_mg).unwrap();
+    let mega_us = time_cmd(cmd_mg);
+    let x_mega = std::slice::from_raw_parts(xm_ptr as *const f32, n_embd).to_vec();
+
+    let (mut a, mut b, mut ab, mut me) = (0f64, 0f64, 0f64, 0f64);
+    for i in 0..n_embd { let (xs, xm) = (x_sep[i] as f64, x_mega[i] as f64); a += xs * xs; b += xm * xm; ab += xs * xm; me = me.max((xs - xm).abs()); }
+    let cos = ab / (a.sqrt() * b.sqrt());
+    eprintln!("FFN A/B [G={g}]: separate {sep_us:.1} us, megakernel {mega_us:.1} us => {:.2}x | cos={cos:.6} max_err={me:.3e}",
+        sep_us / mega_us);
+    assert!(cos > 0.9999, "megakernel output differs from separate path: cos={cos}");
+
+    let _ = (mg_p, mg_l);
+    dev.destroy_command_pool(cmd_pool, None); dev.destroy_descriptor_pool(pool, None);
+    for (b, m) in bufs { dev.unmap_memory(m); dev.destroy_buffer(b, None); dev.free_memory(m, None); }
 }
 
 #[cfg(test)]

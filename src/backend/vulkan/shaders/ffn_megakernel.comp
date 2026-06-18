@@ -1,0 +1,114 @@
+// FFN block as ONE persistent-workgroup dispatch with grid barriers (vs today's
+// 5 dispatches + 5 pipeline barriers). Phases: rmsnorm -> W13 matvec (Q4) ->
+// silu -> W2 matvec (Q6) + residual. The grid barrier (device-scope atomics,
+// sense-reversing) replaces the pipeline-barrier drains between phases. Launch
+// exactly G workgroups (<= resident capacity). Norm scale is computed
+// redundantly per-wg (x is tiny/cached) so phase 0 needs no extra sync.
+#version 450 core
+#extension GL_KHR_memory_scope_semantics : require
+#pragma use_vulkan_memory_model
+layout(local_size_x = 64) in;
+layout(binding = 0)  coherent buffer X_   { float x[];      };  // residual stream [n_embd] (in/out)
+layout(binding = 1)  readonly buffer FNW_ { float fnw[];    };  // ffn_norm weight
+layout(binding = 2)  coherent buffer NRM_ { float normed[]; };  // [n_embd] scratch
+layout(binding = 3)  readonly buffer W13_ { uint  w13[];    };  // Q4 raw [2*n_inter, n_embd]
+layout(binding = 4)  coherent buffer GU_  { float gu[];     };  // [2*n_inter] scratch
+layout(binding = 5)  coherent buffer H_   { float h[];      };  // [n_inter] scratch
+layout(binding = 6)  readonly buffer QL_  { uint  w2ql[];   };  // W2 Q6 SoA
+layout(binding = 7)  readonly buffer QH_  { uint  w2qh[];   };
+layout(binding = 8)  readonly buffer SC_  { uint  w2scl[];  };
+layout(binding = 9)  readonly buffer DD_  { float w2dd[];   };
+layout(binding = 10) coherent buffer CT_  { uint  ctr[];    };  // [0]=arrive [1]=sense
+layout(binding = 11) uniform   P_ { uint n_embd; uint n_inter; uint nb13; uint nb2; uint G; uint eps; uint p0; uint p1; } p;
+shared float red[64];
+shared uint wg_sense;
+
+void gbar() {
+    barrier();
+    if (gl_LocalInvocationID.x == 0u) {
+        uint s = 1u - wg_sense; wg_sense = s;
+        uint a = atomicAdd(ctr[0], 1u, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease) + 1u;
+        if (a == p.G) {
+            atomicStore(ctr[0], 0u, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+            atomicStore(ctr[1], s, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+        } else {
+            while (atomicLoad(ctr[1], gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquire) != s) {}
+        }
+    }
+    barrier();
+}
+
+// Q4_K word-loaded dot of W13 row `row` (nb blocks) with `normed`. 64-thread
+// cooperative; returns red[0] to all threads (caller barriers before reuse).
+float q4_dot(uint row, uint nb) {
+    uint t = gl_LocalInvocationID.x;
+    uint total_sub = nb * 8u; float acc = 0.0; uint g = t;
+    while (g < total_sub) {
+        uint b = g / 8u; uint sub = g % 8u; uint blk = (row * nb + b) * 36u;
+        vec2 dd = unpackHalf2x16(w13[blk]); float d = dd.x; float dmin = dd.y;
+        uint u0 = w13[blk + 1u]; uint u1 = w13[blk + 2u]; uint u2 = w13[blk + 3u];
+        uint u3 = ((u2 >> 4u) & 0x0f0f0f0fu) | (((u1 >> 6u) & 0x03030303u) << 4u);
+        uint uaux = u1 & 0x3f3f3f3fu; u1 = (u2 & 0x0f0f0f0fu) | (((u0 >> 6u) & 0x03030303u) << 4u); u2 = uaux; u0 = u0 & 0x3f3f3f3fu;
+        float sc; float mn;
+        if (sub < 4u) { sc = float((u0 >> (sub * 8u)) & 0xffu); mn = float((u2 >> (sub * 8u)) & 0xffu); }
+        else          { sc = float((u1 >> ((sub - 4u) * 8u)) & 0xffu); mn = float((u3 >> ((sub - 4u) * 8u)) & 0xffu); }
+        bool hi = (sub & 1u) == 1u; uint qs0 = blk + 4u + (sub / 2u) * 8u; uint xb = b * 256u + sub * 32u;
+        float dot = 0.0; float xsum = 0.0;
+        for (uint w = 0u; w < 8u; w++) { uint word = w13[qs0 + w];
+            for (uint bs = 0u; bs < 4u; bs++) { uint byte = (word >> (bs * 8u)) & 0xffu; uint q = hi ? (byte >> 4u) : (byte & 0x0fu);
+                float xv = normed[xb + w * 4u + bs]; dot += float(q) * xv; xsum += xv; } }
+        acc += d * sc * dot - dmin * mn * xsum;
+        g += 64u;
+    }
+    red[t] = acc; barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) { if (t < s) { red[t] += red[t + s]; } barrier(); }
+    return red[0];
+}
+
+// Q6_K word-loaded dot of W2 row `row` (nb blocks) with `h`.
+float q6_dot(uint row, uint nb) {
+    uint t = gl_LocalInvocationID.x;
+    uint nwords = nb * 16u; float acc = 0.0; uint w = t;
+    while (w < nwords) {
+        uint bl = w / 16u; uint blk = row * nb + bl; uint wb = w % 16u; uint hf = wb / 8u; uint wih = wb % 8u;
+        float d = w2dd[blk];
+        uint qlb = blk * 32u + hf * 16u; uint qhb = blk * 16u + hf * 8u; uint scb = blk * 4u; uint scoff = hf * 8u;
+        uint ql_a = w2ql[qlb + wih]; uint ql_b = w2ql[qlb + wih + 8u]; uint qh_w = w2qh[qhb + wih];
+        uint xbase = bl * 256u + hf * 128u; uint l0 = wih * 4u; uint is = scoff + (l0 / 16u);
+        float s1 = float(bitfieldExtract(int(w2scl[scb + (is) / 4u]), int((is) % 4u) * 8, 8));
+        float s2 = float(bitfieldExtract(int(w2scl[scb + (is + 2u) / 4u]), int((is + 2u) % 4u) * 8, 8));
+        float s3 = float(bitfieldExtract(int(w2scl[scb + (is + 4u) / 4u]), int((is + 4u) % 4u) * 8, 8));
+        float s4 = float(bitfieldExtract(int(w2scl[scb + (is + 6u) / 4u]), int((is + 6u) % 4u) * 8, 8));
+        for (uint b = 0u; b < 4u; b++) { uint l = l0 + b;
+            uint qla = (ql_a >> (b * 8u)) & 0xffu; uint qlb2 = (ql_b >> (b * 8u)) & 0xffu; uint qhb2 = (qh_w >> (b * 8u)) & 0xffu;
+            int q1 = int((qla & 0xfu) | ((qhb2 & 3u) << 4u)) - 32; int q2 = int((qlb2 & 0xfu) | (((qhb2 >> 2u) & 3u) << 4u)) - 32;
+            int q3 = int((qla >> 4u) | (((qhb2 >> 4u) & 3u) << 4u)) - 32; int q4 = int((qlb2 >> 4u) | (((qhb2 >> 6u) & 3u) << 4u)) - 32;
+            acc += d * (s1 * float(q1) * h[xbase + l] + s2 * float(q2) * h[xbase + l + 32u] + s3 * float(q3) * h[xbase + l + 64u] + s4 * float(q4) * h[xbase + l + 96u]); }
+        w += 64u;
+    }
+    red[t] = acc; barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) { if (t < s) { red[t] += red[t + s]; } barrier(); }
+    return red[0];
+}
+
+void main() {
+    uint wg = gl_WorkGroupID.x; uint t = gl_LocalInvocationID.x;
+    uint n_embd = p.n_embd; uint n_inter = p.n_inter;
+    if (t == 0u) { wg_sense = 0u; } barrier();
+    // Phase 0: rmsnorm (scale computed per-wg; x cached).
+    float ps = 0.0; for (uint i = t; i < n_embd; i += 64u) { ps += x[i] * x[i]; }
+    red[t] = ps; barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) { if (t < s) { red[t] += red[t + s]; } barrier(); }
+    float scale = inversesqrt(red[0] / float(n_embd) + uintBitsToFloat(p.eps));
+    barrier();
+    for (uint i = wg * 64u + t; i < n_embd; i += p.G * 64u) { normed[i] = x[i] * scale * fnw[i]; }
+    gbar();
+    // Phase 1: W13 (Q4) -> gu
+    for (uint row = wg; row < 2u * n_inter; row += p.G) { float a = q4_dot(row, p.nb13); if (t == 0u) { gu[row] = a; } barrier(); }
+    gbar();
+    // Phase 2: silu -> h
+    for (uint i = wg * 64u + t; i < n_inter; i += p.G * 64u) { float gg = gu[i]; float uu = gu[n_inter + i]; h[i] = (gg / (1.0 + exp(-gg))) * uu; }
+    gbar();
+    // Phase 3: W2 (Q6) -> ffn, residual x += ffn
+    for (uint row = wg; row < n_embd; row += p.G) { float a = q6_dot(row, p.nb2); if (t == 0u) { x[row] = x[row] + a; } barrier(); }
+}
