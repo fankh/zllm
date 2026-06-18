@@ -57,6 +57,9 @@ pub struct GpuContext {
     /// Batched decode: per-stream SDPA (each of M concurrent streams attends
     /// its OWN KV cache at its OWN position) and per-stream argmax.
     bdsdpa_pipeline: wgpu::ComputePipeline,
+    /// Paged variant of bdsdpa: the KV is a shared block pool and each stream's
+    /// key positions are gathered through a per-slot block table (PagedAttention).
+    bdsdpa_paged_pipeline: wgpu::ComputePipeline,
     bargmax_pipeline: wgpu::ComputePipeline,
 }
 
@@ -144,6 +147,7 @@ impl GpuContext {
         let brope_pipeline = Self::make_pipeline(&device, "brope", BROPE_WGSL);
         let bsdpa_pipeline = Self::make_pipeline(&device, "bsdpa", BSDPA_WGSL);
         let bdsdpa_pipeline = Self::make_pipeline(&device, "bdsdpa", BDSDPA_WGSL);
+        let bdsdpa_paged_pipeline = Self::make_pipeline(&device, "bdsdpa-paged", BDSDPA_PAGED_WGSL);
         let bargmax_pipeline = Self::make_pipeline(&device, "bargmax", BARGMAX_WGSL);
 
         Ok(Self {
@@ -168,6 +172,7 @@ impl GpuContext {
             brope_pipeline,
             bsdpa_pipeline,
             bdsdpa_pipeline,
+            bdsdpa_paged_pipeline,
             bargmax_pipeline,
         })
     }
@@ -245,6 +250,21 @@ impl GpuContext {
             entries: &[bge(0, q), bge(1, kc), bge(2, vc), bge(3, out), bge(4, posb), bge(5, slots), bge(6, &pbuf)] });
         let mut p = enc.begin_compute_pass(&Default::default());
         p.set_pipeline(&self.bdsdpa_pipeline); p.set_bind_group(0, &bg, &[]);
+        p.dispatch_workgroups(((m * n_head) as u32).div_ceil(64), 1, 1);
+    }
+    /// Paged decode SDPA: like `record_bdsdpa` but the KV is a shared block pool
+    /// (`kc`/`vc`) gathered per key position through `block_table` (per slot,
+    /// `max_blocks` entries). `block_size` positions per physical block.
+    #[allow(clippy::too_many_arguments)]
+    fn record_bdsdpa_paged(&self, enc: &mut wgpu::CommandEncoder, q: &wgpu::Buffer, kc: &wgpu::Buffer, vc: &wgpu::Buffer, out: &wgpu::Buffer, posb: &wgpu::Buffer, slots: &wgpu::Buffer, block_table: &wgpu::Buffer, n_head: usize, n_kv_head: usize, head_dim: usize, m: usize, block_size: usize, max_blocks: usize) {
+        use wgpu::util::DeviceExt;
+        let pbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::cast_slice(&[n_head as u32, n_kv_head as u32, head_dim as u32, m as u32, block_size as u32, max_blocks as u32, 0u32, 0u32]), usage: wgpu::BufferUsages::UNIFORM });
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.bdsdpa_paged_pipeline.get_bind_group_layout(0),
+            entries: &[bge(0, q), bge(1, kc), bge(2, vc), bge(3, out), bge(4, posb), bge(5, slots), bge(6, block_table), bge(7, &pbuf)] });
+        let mut p = enc.begin_compute_pass(&Default::default());
+        p.set_pipeline(&self.bdsdpa_paged_pipeline); p.set_bind_group(0, &bg, &[]);
         p.dispatch_workgroups(((m * n_head) as u32).div_ceil(64), 1, 1);
     }
     /// Batched argmax: one workgroup per stream → `out_idx[s]` (m u32 readback).
@@ -1141,6 +1161,52 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var mx: f32 = -1e30; var l: f32 = 0.0;
     for (var t: u32 = 0u; t < seq_len; t = t + 1u) {
         let kv_base = stream_kv + (t * p.n_kv_head + kvh) * hd;
+        var sdot: f32 = 0.0;
+        for (var d: u32 = 0u; d < hd; d = d + 1u) { sdot = sdot + q[q_base + d] * kc[kv_base + d]; }
+        sdot = sdot * scale;
+        let m_new = max(mx, sdot); let corr = exp(mx - m_new); let pe = exp(sdot - m_new);
+        l = l * corr + pe;
+        for (var d: u32 = 0u; d < hd; d = d + 1u) { av[d] = av[d] * corr + pe * vc[kv_base + d]; }
+        mx = m_new;
+    }
+    let inv = 1.0 / l;
+    for (var d: u32 = 0u; d < hd; d = d + 1u) { outp[q_base + d] = av[d] * inv; }
+}
+"#;
+
+/// PagedAttention decode SDPA. Identical math to BDSDPA, but the KV is a shared
+/// block pool and each key position `t` is gathered through a per-slot block
+/// table: physical position = block_table[slot*max_blocks + t/block_size] *
+/// block_size + t%block_size. Lets sequences hold non-contiguous KV and share a
+/// pool sized for *actual* usage rather than m_max × max_seq.
+const BDSDPA_PAGED_WGSL: &str = r#"
+struct BP { n_head: u32, n_kv_head: u32, head_dim: u32, m_streams: u32, block_size: u32, max_blocks: u32, p1: u32, p2: u32 };
+@group(0) @binding(0) var<storage, read>       q:    array<f32>;
+@group(0) @binding(1) var<storage, read>       kc:   array<f32>;   // block pool: n_blocks*block_size*kv_dim
+@group(0) @binding(2) var<storage, read>       vc:   array<f32>;
+@group(0) @binding(3) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(4) var<storage, read>       posb: array<u32>;
+@group(0) @binding(5) var<storage, read>       slots: array<u32>;
+@group(0) @binding(6) var<storage, read>       block_table: array<u32>;  // [n_slots * max_blocks]
+@group(0) @binding(7) var<uniform>             p:    BP;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= p.m_streams * p.n_head) { return; }
+    let s = idx / p.n_head; let h = idx % p.n_head;
+    let hd = p.head_dim;
+    let kvh = h / (p.n_head / p.n_kv_head);
+    let scale = 1.0 / sqrt(f32(hd));
+    let seq_len = posb[s] + 1u;
+    let q_base = s * (p.n_head * hd) + h * hd;
+    let bt_base = slots[s] * p.max_blocks;   // this slot's block-table row
+    var av: array<f32, 128>;
+    for (var d: u32 = 0u; d < hd; d = d + 1u) { av[d] = 0.0; }
+    var mx: f32 = -1e30; var l: f32 = 0.0;
+    for (var t: u32 = 0u; t < seq_len; t = t + 1u) {
+        let phys_block = block_table[bt_base + t / p.block_size];
+        let phys_pos = phys_block * p.block_size + (t % p.block_size);
+        let kv_base = (phys_pos * p.n_kv_head + kvh) * hd;
         var sdot: f32 = 0.0;
         for (var d: u32 = 0u; d < hd; d = d + 1u) { sdot = sdot + q[q_base + d] * kc[kv_base + d]; }
         sdot = sdot * scale;
@@ -2498,9 +2564,20 @@ impl GpuModel {
     /// Build a batched decoder: `m_max` concurrent decode streams coalesced
     /// into one forward (weights loaded once for all M = compute-bound, the
     /// regime where aggregate serving throughput can far exceed M× serialized
-    /// single-stream decode). Each stream gets its own KV cache up to `max_seq`.
+    /// single-stream decode). Each stream's KV lives in a paged block pool sized
+    /// so every slot can reach `max_seq` (no overcommit, contiguous-equivalent).
     pub fn batched_decoder(&self, m_max: usize, max_seq: usize) -> BatchedDecoder<'_> {
         BatchedDecoder::new(self, m_max, max_seq)
+    }
+
+    /// Like `batched_decoder` but with an explicit KV block pool of `n_blocks`
+    /// physical blocks (`DEFAULT_BLOCK_SIZE` positions each), shared across all
+    /// slots. `n_blocks < m_max * ceil(max_seq/block_size)` overcommits: more
+    /// concurrent (short) sequences than a contiguous reservation would allow,
+    /// at the cost of possible pool exhaustion if many grow long (no preemption
+    /// yet — admission gates on free blocks).
+    pub fn batched_decoder_paged(&self, m_max: usize, max_seq: usize, n_blocks: usize) -> BatchedDecoder<'_> {
+        BatchedDecoder::new_paged(self, m_max, max_seq, DEFAULT_BLOCK_SIZE, n_blocks)
     }
 }
 
@@ -2513,6 +2590,10 @@ impl GpuModel {
 /// of them, instead of one forward per token). Larger = fewer passes but more
 /// scratch; 128 keeps the GEMM comfortably compute-bound.
 pub const PREFILL_CHUNK: usize = 128;
+
+/// Positions per physical KV block in the paged cache. 16 (the vLLM default)
+/// trades a little block-table indirection for fine-grained allocation.
+pub const DEFAULT_BLOCK_SIZE: usize = 16;
 
 pub struct BatchedDecoder<'a> {
     model: &'a GpuModel,
@@ -2527,17 +2608,45 @@ pub struct BatchedDecoder<'a> {
     gate_b: wgpu::Buffer, up_b: wgpu::Buffer, h_b: wgpu::Buffer,
     cos_b: wgpu::Buffer, sin_b: wgpu::Buffer, logits_b: wgpu::Buffer,
     pos_buf: wgpu::Buffer, slots_buf: wgpu::Buffer, argmax_out: wgpu::Buffer, argmax_read: wgpu::Buffer,
-    k_caches: Vec<wgpu::Buffer>, v_caches: Vec<wgpu::Buffer>,
+    // Paged KV: a shared pool of physical blocks (n_blocks × block_size positions
+    // each) per layer, plus a per-slot block table mapping logical → physical
+    // blocks. Decouples a sequence's KV from a contiguous max_seq reservation.
+    block_size: usize,
+    n_blocks: usize,
+    max_blocks_per_seq: usize,
+    blocks: std::cell::RefCell<BlockState>,
+    block_table_buf: wgpu::Buffer,
+    k_pool: Vec<wgpu::Buffer>, v_pool: Vec<wgpu::Buffer>,
+}
+
+/// Host-side bookkeeping for the paged KV pool.
+struct BlockState {
+    /// Free physical block indices (a stack).
+    free: Vec<u32>,
+    /// `slot_blocks[slot]` = physical blocks owned by that slot, in logical order.
+    slot_blocks: Vec<Vec<u32>>,
+    /// Flattened block table `[m_max * max_blocks_per_seq]` uploaded to the GPU:
+    /// `table_host[slot*max_blocks_per_seq + logical] = physical block`.
+    table_host: Vec<u32>,
 }
 
 impl<'a> BatchedDecoder<'a> {
     fn new(model: &'a GpuModel, m_max: usize, max_seq: usize) -> Self {
+        // Full pool: every slot can reach max_seq, so admission never starves
+        // (contiguous-equivalent memory, paging mechanism exercised + validated).
+        let n_blocks = m_max * max_seq.div_ceil(DEFAULT_BLOCK_SIZE);
+        Self::new_paged(model, m_max, max_seq, DEFAULT_BLOCK_SIZE, n_blocks)
+    }
+
+    fn new_paged(model: &'a GpuModel, m_max: usize, max_seq: usize, block_size: usize, n_blocks: usize) -> Self {
         let ctx = &model.ctx;
         let (n_embd, n_head, n_kv_head, head_dim, n_inter, vocab) =
             (model.n_embd, model.n_head, model.n_kv_head, model.head_dim, model.n_inter, model.vocab);
         let kv_dim = n_kv_head * head_dim;
         let attn_dim = n_head * head_dim;
         let half = head_dim / 2;
+        let max_blocks_per_seq = max_seq.div_ceil(block_size);
+        assert!(n_blocks >= max_blocks_per_seq, "pool ({n_blocks} blocks) can't hold even one full sequence ({max_blocks_per_seq})");
         // Per-token scratch is sized for the larger of decode batch (m_max) and
         // a prefill chunk, so one prefill pass can process up to `row_cap` prompt
         // tokens. logits/argmax stay at m_max: lm_head runs ≤ m_max rows for
@@ -2545,8 +2654,14 @@ impl<'a> BatchedDecoder<'a> {
         let row_cap = m_max.max(PREFILL_CHUNK);
         let a = |len: usize| ctx.alloc_activation(len, false);
         let asrc = |len: usize| ctx.alloc_activation(len, true); // COPY_SRC: cache scatter / readback
-        let k_caches = (0..model.layers.len()).map(|_| a(m_max * max_seq * kv_dim)).collect();
-        let v_caches = (0..model.layers.len()).map(|_| a(m_max * max_seq * kv_dim)).collect();
+        // Shared KV block pool: n_blocks × (block_size positions) × kv_dim, per layer.
+        let k_pool = (0..model.layers.len()).map(|_| a(n_blocks * block_size * kv_dim)).collect();
+        let v_pool = (0..model.layers.len()).map(|_| a(n_blocks * block_size * kv_dim)).collect();
+        let blocks = BlockState {
+            free: (0..n_blocks as u32).rev().collect(),
+            slot_blocks: vec![Vec::new(); m_max],
+            table_host: vec![0u32; m_max * max_blocks_per_seq],
+        };
         Self {
             model, m_max, max_seq, row_cap,
             x_b: a(row_cap * n_embd), normed_b: asrc(row_cap * n_embd), q_b: asrc(row_cap * attn_dim),
@@ -2557,8 +2672,52 @@ impl<'a> BatchedDecoder<'a> {
             argmax_read: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("bd-argmax-read"), size: (m_max * 4) as u64,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
-            k_caches, v_caches,
+            block_size, n_blocks, max_blocks_per_seq,
+            blocks: std::cell::RefCell::new(blocks),
+            block_table_buf: a(m_max * max_blocks_per_seq),
+            k_pool, v_pool,
         }
+    }
+
+    /// Ensure `slot` owns enough physical blocks to hold `n_positions` positions,
+    /// updating the host block table. Returns false if the pool is exhausted.
+    fn ensure_blocks(&self, slot: u32, n_positions: usize) -> bool {
+        let need = n_positions.div_ceil(self.block_size);
+        let mut bs = self.blocks.borrow_mut();
+        let have = bs.slot_blocks[slot as usize].len();
+        if need <= have { return true; }
+        if bs.free.len() < need - have { return false; }
+        for lb in have..need {
+            let phys = bs.free.pop().unwrap();
+            bs.slot_blocks[slot as usize].push(phys);
+            bs.table_host[slot as usize * self.max_blocks_per_seq + lb] = phys;
+        }
+        true
+    }
+
+    /// Return all of `slot`'s physical blocks to the free pool (called on evict).
+    fn free_slot(&self, slot: u32) {
+        let mut bs = self.blocks.borrow_mut();
+        let returned = std::mem::take(&mut bs.slot_blocks[slot as usize]);
+        bs.free.extend(returned);
+    }
+
+    /// Free physical blocks available right now.
+    fn free_blocks(&self) -> usize { self.blocks.borrow().free.len() }
+
+    /// Whether the pool currently has enough free blocks for `n_positions`.
+    fn can_fit(&self, n_positions: usize) -> bool { self.free_blocks() >= n_positions.div_ceil(self.block_size) }
+
+    /// Physical position (into the block pool, in units of kv_dim) of `pos` for `slot`.
+    fn phys_pos(&self, slot: u32, pos: usize) -> usize {
+        let bs = self.blocks.borrow();
+        let phys_block = bs.slot_blocks[slot as usize][pos / self.block_size];
+        phys_block as usize * self.block_size + pos % self.block_size
+    }
+
+    fn upload_block_table(&self) {
+        let bs = self.blocks.borrow();
+        self.model.ctx.queue.write_buffer(&self.block_table_buf, 0, bytemuck::cast_slice(&bs.table_host));
     }
 
     /// One batched step over the active streams 0..m (cache slots 0..m).
@@ -2579,8 +2738,9 @@ impl<'a> BatchedDecoder<'a> {
         let (n_embd, vocab, eps) = (self.model.n_embd, self.model.vocab, self.model.eps);
 
         self.write_inputs(tokens, positions, slots);
+        let phys = self.prepare_paging(m, positions, slots);
         let mut enc = ctx.device.create_command_encoder(&Default::default());
-        self.record_layers(&mut enc, m, positions, slots);
+        self.record_layers(&mut enc, m, &phys);
         // Decode: every row predicts a next token → lm_head + argmax over all m.
         ctx.record_bnorm(&mut enc, &self.x_b, &self.model.final_norm_w, &self.normed_b, n_embd, eps, m);
         ctx.record_gemm(&mut enc, &self.model.lm_head, &self.normed_b, &self.logits_b, n_embd, m, 0);
@@ -2620,8 +2780,9 @@ impl<'a> BatchedDecoder<'a> {
             let positions: Vec<u32> = (start..end).map(|x| x as u32).collect();
             let slots = vec![slot; m];
             self.write_inputs(toks, &positions, &slots);
+            let phys = self.prepare_paging(m, &positions, &slots);
             let mut enc = ctx.device.create_command_encoder(&Default::default());
-            self.record_layers(&mut enc, m, &positions, &slots);
+            self.record_layers(&mut enc, m, &phys);
             let is_last = end == p;
             if is_last {
                 // Only the final prompt token's logits matter (the first output).
@@ -2676,10 +2837,12 @@ impl<'a> BatchedDecoder<'a> {
     }
 
     /// Record the full per-layer transformer forward for `m` rows (residual left
-    /// in `x_b`). Each row's new K/V is scattered to its `(slot, position)`; the
-    /// SDPA has row `i` attend slot[i]'s cache `0..=position[i]`. Shared by decode
-    /// (1 token/stream) and prefill (P prompt tokens, staggered positions).
-    fn record_layers(&self, enc: &mut wgpu::CommandEncoder, m: usize, positions: &[u32], slots: &[u32]) {
+    /// in `x_b`). Each row's new K/V is scattered to its physical pool position
+    /// `phys[i]` (precomputed from the block table); the paged SDPA has row `i`
+    /// attend its slot's KV `0..=position[i]` via the block table. Shared by
+    /// decode (1 token/stream) and prefill (P prompt tokens, staggered positions).
+    /// The caller must have run `ensure_blocks` + `upload_block_table` already.
+    fn record_layers(&self, enc: &mut wgpu::CommandEncoder, m: usize, phys: &[usize]) {
         let ctx = &self.model.ctx;
         let (n_embd, n_head, n_kv_head, head_dim, n_inter, eps) = (
             self.model.n_embd, self.model.n_head, self.model.n_kv_head,
@@ -2693,14 +2856,14 @@ impl<'a> BatchedDecoder<'a> {
             ctx.record_gemm(enc, &layer.wv, &self.normed_b, &self.v_b, n_embd, m, 0);
             ctx.record_brope(enc, &self.q_b, &self.cos_b, &self.sin_b, n_head, head_dim, m);
             ctx.record_brope(enc, &self.k_b, &self.cos_b, &self.sin_b, n_kv_head, head_dim, m);
-            // scatter each row's new K/V into its cache SLOT at its position
+            // scatter each row's new K/V into its physical block-pool position
             for s in 0..m {
-                let dst = ((slots[s] as usize * self.max_seq + positions[s] as usize) * kv_dim * 4) as u64;
+                let dst = (phys[s] * kv_dim * 4) as u64;
                 let src = (s * kv_dim * 4) as u64;
-                enc.copy_buffer_to_buffer(&self.k_b, src, &self.k_caches[li], dst, (kv_dim * 4) as u64);
-                enc.copy_buffer_to_buffer(&self.v_b, src, &self.v_caches[li], dst, (kv_dim * 4) as u64);
+                enc.copy_buffer_to_buffer(&self.k_b, src, &self.k_pool[li], dst, (kv_dim * 4) as u64);
+                enc.copy_buffer_to_buffer(&self.v_b, src, &self.v_pool[li], dst, (kv_dim * 4) as u64);
             }
-            ctx.record_bdsdpa(enc, &self.q_b, &self.k_caches[li], &self.v_caches[li], &self.attn_b, &self.pos_buf, &self.slots_buf, n_head, n_kv_head, head_dim, m, self.max_seq);
+            ctx.record_bdsdpa_paged(enc, &self.q_b, &self.k_pool[li], &self.v_pool[li], &self.attn_b, &self.pos_buf, &self.slots_buf, &self.block_table_buf, n_head, n_kv_head, head_dim, m, self.block_size, self.max_blocks_per_seq);
             ctx.record_gemm(enc, &layer.wo, &self.attn_b, &self.x_b, attn_dim, m, 1);
             ctx.record_bnorm(enc, &self.x_b, &layer.ffn_norm_w, &self.normed_b, n_embd, eps, m);
             ctx.record_gemm(enc, &layer.w1, &self.normed_b, &self.gate_b, n_embd, m, 0);
@@ -2708,6 +2871,21 @@ impl<'a> BatchedDecoder<'a> {
             ctx.record_silu_mul(enc, &self.gate_b, &self.up_b, &self.h_b, m * n_inter);
             ctx.record_gemm(enc, &layer.w2, &self.h_b, &self.x_b, n_inter, m, 1);
         }
+    }
+
+    /// Ensure each row's slot has blocks for its position, compute the physical
+    /// scatter positions, and upload the block table — the paging prologue both
+    /// step_slotted and prefill_slot run before `record_layers`. Panics if the
+    /// pool is exhausted (callers gate admission via `can_fit`/`free_blocks`).
+    fn prepare_paging(&self, m: usize, positions: &[u32], slots: &[u32]) -> Vec<usize> {
+        let mut phys = vec![0usize; m];
+        for s in 0..m {
+            assert!(self.ensure_blocks(slots[s], positions[s] as usize + 1),
+                "KV block pool exhausted (slot {}, pos {})", slots[s], positions[s]);
+            phys[s] = self.phys_pos(slots[s], positions[s] as usize);
+        }
+        self.upload_block_table();
+        phys
     }
 }
 
@@ -2729,20 +2907,34 @@ impl<'a> ContinuousBatcher<'a> {
     pub fn new(model: &'a GpuModel, m_max: usize, max_seq: usize) -> Self {
         Self { dec: model.batched_decoder(m_max, max_seq), free: (0..m_max as u32).rev().collect(), active: Vec::new() }
     }
+
+    /// Continuous batcher over a paged KV pool of `n_blocks` blocks shared by all
+    /// `m_max` slots. `n_blocks < m_max*ceil(max_seq/block)` overcommits memory:
+    /// many short sequences fit where a contiguous max_seq-per-slot reservation
+    /// could not. Admission gates on free blocks (no preemption yet).
+    pub fn with_pool(model: &'a GpuModel, m_max: usize, max_seq: usize, n_blocks: usize) -> Self {
+        Self { dec: model.batched_decoder_paged(m_max, max_seq, n_blocks), free: (0..m_max as u32).rev().collect(), active: Vec::new() }
+    }
     pub fn has_free(&self) -> bool { !self.free.is_empty() }
     pub fn active_len(&self) -> usize { self.active.len() }
+    /// (free, total) physical KV blocks — for observing pool pressure.
+    pub fn block_pool(&self) -> (usize, usize) { (self.dec.free_blocks(), self.dec.n_blocks) }
 
-    /// Admit a sequence: prefill its prompt into a free KV slot (sequential for
-    /// now — batched-prefill-into-slot is a follow-up) and join the decode
-    /// batch. Returns (first_token, done) — `done` is true if that one token
-    /// already completes the request (EOS or max_tokens<=1), in which case the
-    /// slot is returned immediately and the sequence does not join the batch.
-    /// Returns None only if no slot is free.
+    /// Admit a sequence: batched-prefill its prompt into a free KV slot and join
+    /// the decode batch. Returns (first_token, done) — `done` is true if that one
+    /// token already completes the request (EOS or max_tokens<=1), in which case
+    /// the slot + its blocks are returned immediately. Returns None if no slot is
+    /// free OR the KV pool can't fit prompt+max_tokens (caller should retry later;
+    /// with the default full pool this never trips).
     pub fn admit(&mut self, id: u64, prompt: &[u32], max_tokens: usize, eos: u32) -> Option<(u32, bool)> {
+        // Conservative admission: ensure room for the whole generation up front
+        // (lazy block alloc + no preemption → don't admit what can't finish).
+        if !self.dec.can_fit(prompt.len() + max_tokens) { return None; }
         let slot = self.free.pop()?;
         let g = self.dec.prefill_slot(prompt, slot); // batched prefill into the slot
         let done = max_tokens <= 1 || g == eos;
         if done {
+            self.dec.free_slot(slot);
             self.free.push(slot);
         } else {
             self.active.push(CbSeq { id, slot, pos: prompt.len() as u32, next: g, n_gen: 1, max_tokens, eos });
@@ -2752,7 +2944,7 @@ impl<'a> ContinuousBatcher<'a> {
 
     /// One decode step over all active sequences. Returns (id, new_token, done)
     /// for each — `done` = this token finished the sequence — and evicts (frees
-    /// the slot of) any finished sequence.
+    /// the slot AND its KV blocks of) any finished sequence.
     pub fn step(&mut self) -> Vec<(u64, u32, bool)> {
         if self.active.is_empty() { return Vec::new(); }
         let toks: Vec<u32> = self.active.iter().map(|s| s.next).collect();
@@ -2766,10 +2958,10 @@ impl<'a> ContinuousBatcher<'a> {
             let done = nt == s.eos || s.n_gen >= s.max_tokens;
             out.push((s.id, nt, done));
         }
-        let free = &mut self.free;
+        let (free, dec) = (&mut self.free, &self.dec);
         self.active.retain(|s| {
             let done = s.next == s.eos || s.n_gen >= s.max_tokens;
-            if done { free.push(s.slot); }
+            if done { dec.free_slot(s.slot); free.push(s.slot); }
             !done
         });
         out
@@ -3991,6 +4183,52 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         eprintln!("prefill {} tok: batched {prefill_ms:.0} ms vs sequential {seq_ms:.0} ms => {:.1}x faster", prompt.len(), seq_ms / prefill_ms);
         assert_eq!(batched, seq, "batched prefill diverged from sequential prefill");
         eprintln!("batched prefill bit-identical to sequential (first tok + {k} decoded) ✓");
+    }
+
+    /// Paged KV overcommit: serve more concurrent sequences than a contiguous
+    /// max_seq-per-slot reservation could fit, in a small shared block pool —
+    /// and prove (a) every sequence is still bit-identical to single-stream and
+    /// (b) blocks are recycled back to the pool on eviction.
+    /// `cargo test --release --features gpu --lib gpu_paged_overcommit -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gpu_paged_overcommit() {
+        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() { eprintln!("model not found; skipping"); return; }
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU ({e}); skipping"); return; } };
+        let model = GpuModel::load(path, ctx).expect("load");
+        let (m_max, max_seq, n_blocks) = (8usize, 512usize, 64usize);
+        let contiguous_blocks = m_max * max_seq.div_ceil(DEFAULT_BLOCK_SIZE); // what a per-slot reservation needs
+        let (k, eos) = (12usize, u32::MAX);
+        let prompts: Vec<Vec<u32>> = (0..8u32).map(|i| vec![128000, 1000 + i, 2000, 3000, 4000]).collect();
+
+        // Single-stream reference per prompt (full pool, one slot).
+        let mut refs: Vec<Vec<u32>> = Vec::new();
+        for p in &prompts {
+            let mut cb = ContinuousBatcher::new(&model, 1, max_seq);
+            let mut t = vec![cb.admit(0, p, k, eos).unwrap().0];
+            while cb.active_len() > 0 { for (_, x, _) in cb.step() { t.push(x); } }
+            refs.push(t);
+        }
+
+        // Overcommitted pool: 8 concurrent sequences through a 64-block pool.
+        let mut cb = ContinuousBatcher::with_pool(&model, m_max, max_seq, n_blocks);
+        let mut got: std::collections::HashMap<u64, Vec<u32>> = Default::default();
+        for (i, p) in prompts.iter().enumerate() {
+            let g = cb.admit(i as u64, p, k, eos).expect("admit (pool too small?)").0;
+            got.entry(i as u64).or_default().push(g);
+        }
+        let (free_at_peak, total) = cb.block_pool();
+        while cb.active_len() > 0 { for (id, x, _) in cb.step() { got.get_mut(&id).unwrap().push(x); } }
+        let (free_after, _) = cb.block_pool();
+
+        for (i, r) in refs.iter().enumerate() {
+            assert_eq!(&got[&(i as u64)], r, "paged seq {i} diverged from single-stream");
+        }
+        eprintln!("paged pool: {n_blocks} blocks (a contiguous {m_max}×{max_seq} reservation needs {contiguous_blocks}) — {:.0}x less KV memory", contiguous_blocks as f64 / n_blocks as f64);
+        eprintln!("  served {} concurrent sequences; peak use {}/{} blocks; recycled to {}/{} after eviction", prompts.len(), total - free_at_peak, total, free_after, total);
+        assert_eq!(free_after, total, "blocks were not fully recycled after all sequences finished");
+        eprintln!("all {} sequences correct on the overcommitted pool, blocks fully recycled ✓", prompts.len());
     }
 
     #[test]
