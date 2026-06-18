@@ -1074,9 +1074,15 @@ fn generate_vk(
     let eos = s.tokenizer.read().unwrap().eos_token_id().unwrap_or(128001);
     let greedy = sampler_cfg.temperature == 0.0;
     let t_prefill = std::time::Instant::now();
-    for (i, &tk) in prompt_tokens[..prompt_len - 1].iter().enumerate() { model.prefill_step(tk, i); }
-    let last = prompt_tokens[prompt_len - 1];
-    let mut next = if greedy { model.forward_argmax(last, prompt_len - 1) } else { sample(&model.forward(last, prompt_len - 1), sampler_cfg) };
+    // Batched prefill (one coopmat-GEMM pass) wins for longer prompts; sequential
+    // is cheaper for short ones (batched always processes a padded 128 rows).
+    let mut next = if prompt_len > 32 {
+        sample(&model.prefill_forward(prompt_tokens), sampler_cfg)
+    } else {
+        for (i, &tk) in prompt_tokens[..prompt_len - 1].iter().enumerate() { model.prefill_step(tk, i); }
+        let last = prompt_tokens[prompt_len - 1];
+        if greedy { model.forward_argmax(last, prompt_len - 1) } else { sample(&model.forward(last, prompt_len - 1), sampler_cfg) }
+    };
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1e3;
     let mut generated: Vec<u32> = Vec::new();
     let mut finish_reason: &'static str = "length";
@@ -1481,9 +1487,13 @@ fn chat_stream(
                         let greedy = sampler_cfg.temperature == 0.0;
                         let prompt_len = prompt_tokens.len();
                         let t_decode = std::time::Instant::now();
-                        for (i, &tk) in prompt_tokens[..prompt_len - 1].iter().enumerate() { model.prefill_step(tk, i); }
-                        let last = prompt_tokens[prompt_len - 1];
-                        let mut next = if greedy { model.forward_argmax(last, prompt_len - 1) } else { sample(&model.forward(last, prompt_len - 1), &sampler_cfg) };
+                        let mut next = if prompt_len > 32 {
+                            sample(&model.prefill_forward(&prompt_tokens), &sampler_cfg)
+                        } else {
+                            for (i, &tk) in prompt_tokens[..prompt_len - 1].iter().enumerate() { model.prefill_step(tk, i); }
+                            let last = prompt_tokens[prompt_len - 1];
+                            if greedy { model.forward_argmax(last, prompt_len - 1) } else { sample(&model.forward(last, prompt_len - 1), &sampler_cfg) }
+                        };
                         let mut finish_reason: &'static str = "length";
                         let mut pos = prompt_len;
                         let mut generated = 0usize;
