@@ -771,8 +771,7 @@ struct VkLayerOps {
     attn_norm: ash::vk::DescriptorSet, wq: Mv, wk: Mv, wv: Mv,
     kvw_k: ash::vk::DescriptorSet, kvw_v: ash::vk::DescriptorSet, sdpa: ash::vk::DescriptorSet,
     fp: ash::vk::DescriptorSet, fc: ash::vk::DescriptorSet, wo: Mv, radd_a: ash::vk::DescriptorSet,
-    ffn_norm: ash::vk::DescriptorSet, w1: Mv, w3: Mv,
-    silu: ash::vk::DescriptorSet, w2: Mv, radd_f: ash::vk::DescriptorSet,
+    ffn_norm: ash::vk::DescriptorSet, w13: Mv, w2: Mv, radd_f: ash::vk::DescriptorSet,
 }
 
 /// A loaded GGUF running on the raw-Vulkan decode kernels.
@@ -786,9 +785,13 @@ pub struct VkModel {
     x_ptr: *mut u8, cos_ptr: *mut u8, sin_ptr: *mut u8, base_ptr: *mut u8, seq_ptr: *mut u8, logits_ptr: *mut u8,
     // descriptor sets
     layers: Vec<VkLayerOps>,
-    s_rope_q: ash::vk::DescriptorSet, s_rope_k: ash::vk::DescriptorSet,
+    s_rope_q: ash::vk::DescriptorSet, s_rope_k: ash::vk::DescriptorSet, s_silu: ash::vk::DescriptorSet,
     s_final_norm: ash::vk::DescriptorSet, s_lm: ash::vk::DescriptorSet, s_argmax: ash::vk::DescriptorSet,
     argmax_ptr: *mut u8,
+    // Record-once cache: the command buffer only changes when the flash-attn
+    // grid (n_blocks) or the lm/argmax tail changes — reuse it otherwise and
+    // just refresh the mapped uniforms. -1 = not yet recorded.
+    last_rec: std::cell::Cell<i64>,
     // pipelines (pipeline, layout)
     p_rms: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_mv: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     p_rope: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_kvw: (ash::vk::Pipeline, ash::vk::PipelineLayout),
@@ -849,6 +852,20 @@ impl VkModel {
                 d => Err(format!("{name}: unsupported dtype {d:?}")),
             }
         };
+        // Concatenate ffn_gate + ffn_up into one Q4_K weight ([2*n_inter, n_embd])
+        // so the FFN's two projections are one bigger matvec dispatch (saturates
+        // the bus better than two medium ones). Both are Q4_K in Q4_K_M.
+        let load_gateup = |bufs: &mut Vec<_>, file: &mut std::fs::File, p: &str| -> Result<VkWeight, String> {
+            let g = ct.tensor(file, &format!("{p}.ffn_gate.weight"), &dev).map_err(|e| e.to_string())?;
+            let u = ct.tensor(file, &format!("{p}.ffn_up.weight"), &dev).map_err(|e| e.to_string())?;
+            if g.dtype() != GgmlDType::Q4K || u.dtype() != GgmlDType::Q4K {
+                return Err(format!("{p}: gate/up concat needs Q4_K (got {:?}/{:?})", g.dtype(), u.dtype()));
+            }
+            let nb = g.shape().dims()[1] / 256;
+            let mut b = g.data().map_err(|e| e.to_string())?.to_vec();
+            b.extend_from_slice(&u.data().map_err(|e| e.to_string())?);
+            Ok(VkWeight::Q4 { buf: vk_up_bytes(&ctx, bufs, &b), nb })
+        };
         let load_norm = |bufs: &mut Vec<_>, file: &mut std::fs::File, name: &str| -> Result<vk::Buffer, String> {
             let qt = ct.tensor(file, name, &dev).map_err(|e| e.to_string())?;
             let v: Vec<f32> = qt.dequantize(&dev).map_err(|e| e.to_string())?.flatten_all().map_err(|e| e.to_string())?.to_vec1().map_err(|e| e.to_string())?;
@@ -869,7 +886,7 @@ impl VkModel {
         let n_inter = ct.tensor(&mut file, "blk.0.ffn_gate.weight", &dev).map_err(|e| e.to_string())?.shape().dims()[0];
 
         // Per-layer weights + KV cache.
-        struct RawLayer { an: vk::Buffer, fn_: vk::Buffer, wq: VkWeight, wk: VkWeight, wv: VkWeight, wo: VkWeight, w1: VkWeight, w2: VkWeight, w3: VkWeight, kc: vk::Buffer, vc: vk::Buffer }
+        struct RawLayer { an: vk::Buffer, fn_: vk::Buffer, wq: VkWeight, wk: VkWeight, wv: VkWeight, wo: VkWeight, w13: VkWeight, w2: VkWeight, kc: vk::Buffer, vc: vk::Buffer }
         let mut raw: Vec<RawLayer> = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
             let p = format!("blk.{i}");
@@ -879,12 +896,11 @@ impl VkModel {
             let wk = load_w(&mut bufs, &mut file, &format!("{p}.attn_k.weight"))?;
             let wv = load_w(&mut bufs, &mut file, &format!("{p}.attn_v.weight"))?;
             let wo = load_w(&mut bufs, &mut file, &format!("{p}.attn_output.weight"))?;
-            let w1 = load_w(&mut bufs, &mut file, &format!("{p}.ffn_gate.weight"))?;
+            let w13 = load_gateup(&mut bufs, &mut file, &p)?;
             let w2 = load_w(&mut bufs, &mut file, &format!("{p}.ffn_down.weight"))?;
-            let w3 = load_w(&mut bufs, &mut file, &format!("{p}.ffn_up.weight"))?;
             let (kc, _) = vk_zeros(&ctx, &mut bufs, max_seq * kv_dim);
             let (vc, _) = vk_zeros(&ctx, &mut bufs, max_seq * kv_dim);
-            raw.push(RawLayer { an, fn_, wq, wk, wv, wo, w1, w2, w3, kc, vc });
+            raw.push(RawLayer { an, fn_, wq, wk, wv, wo, w13, w2, kc, vc });
         }
 
         // RoPE tables (interleaved rope_i, matching candle + rope.comp).
@@ -908,8 +924,7 @@ impl VkModel {
         let (v_buf, _) = vk_zeros(&ctx, &mut bufs, kv_dim);
         let (attn, _) = vk_zeros(&ctx, &mut bufs, attn_dim);
         let (o_buf, _) = vk_zeros(&ctx, &mut bufs, n_embd);
-        let (gate, _) = vk_zeros(&ctx, &mut bufs, n_inter);
-        let (up, _) = vk_zeros(&ctx, &mut bufs, n_inter);
+        let (gu, _) = vk_zeros(&ctx, &mut bufs, n_inter * 2); // [gate(n_inter); up(n_inter)]
         let (hbuf, _) = vk_zeros(&ctx, &mut bufs, n_inter);
         let (ffn_buf, _) = vk_zeros(&ctx, &mut bufs, n_embd);
         let (logits, logits_ptr) = vk_zeros(&ctx, &mut bufs, vocab);
@@ -966,6 +981,21 @@ impl VkModel {
         let (argmax_out, argmax_ptr) = vk_zeros(&ctx, &mut bufs, 1);
         let (u_argmax, _) = vk_uni(&ctx, &mut bufs, [vocab as u32, 0, 0, 0]);
         let s_argmax = mkset(argmax_sl, &[logits, argmax_out], u_argmax);
+        // Fused silu: gate = gu[0..n_inter], up = gu[n_inter..2*n_inter] (descriptor offsets).
+        let s_silu = {
+            let set = dv.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(desc_pool).set_layouts(std::slice::from_ref(&silu_sl))).unwrap()[0];
+            let gi = [vk::DescriptorBufferInfo::default().buffer(gu).offset(0).range((n_inter * 4) as u64)];
+            let upi = [vk::DescriptorBufferInfo::default().buffer(gu).offset((n_inter * 4) as u64).range((n_inter * 4) as u64)];
+            let hi = [vk::DescriptorBufferInfo::default().buffer(hbuf).range(vk::WHOLE_SIZE)];
+            let su = [vk::DescriptorBufferInfo::default().buffer(u_silu).range(vk::WHOLE_SIZE)];
+            dv.update_descriptor_sets(&[
+                vk::WriteDescriptorSet::default().dst_set(set).dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&gi),
+                vk::WriteDescriptorSet::default().dst_set(set).dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&upi),
+                vk::WriteDescriptorSet::default().dst_set(set).dst_binding(2).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&hi),
+                vk::WriteDescriptorSet::default().dst_set(set).dst_binding(3).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&su),
+            ], &[]);
+            set
+        };
 
         let mut layers = Vec::with_capacity(n_layers);
         for r in &raw {
@@ -973,8 +1003,7 @@ impl VkModel {
             let wk = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.wk, normed, k_buf, kv_dim);
             let wv = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.wv, normed, v_buf, kv_dim);
             let wo = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.wo, attn, o_buf, n_embd);
-            let w1 = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.w1, normed, gate, n_inter);
-            let w3 = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.w3, normed, up, n_inter);
+            let w13 = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.w13, normed, gu, n_inter * 2);
             let w2 = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.w2, hbuf, ffn_buf, n_embd);
             layers.push(VkLayerOps {
                 attn_norm: mkset(rms_sl, &[x_buf, r.an, normed], u_norm),
@@ -987,9 +1016,7 @@ impl VkModel {
                 wo,
                 radd_a: mkset(add_sl, &[x_buf, o_buf], u_add),
                 ffn_norm: mkset(rms_sl, &[x_buf, r.fn_, normed], u_norm),
-                w1, w3,
-                silu: mkset(silu_sl, &[gate, up, hbuf], u_silu),
-                w2,
+                w13, w2,
                 radd_f: mkset(add_sl, &[x_buf, ffn_buf], u_add),
             });
         }
@@ -1001,10 +1028,11 @@ impl VkModel {
         Ok(Self {
             n_embd, n_head, n_kv, hd, n_inter, vocab, n_layers, kv_dim, half, max_seq, embed, cos, sin, lm_nb,
             x_ptr, cos_ptr, sin_ptr, base_ptr, seq_ptr, logits_ptr,
-            layers, s_rope_q, s_rope_k, s_final_norm, s_lm, s_argmax, argmax_ptr,
+            layers, s_rope_q, s_rope_k, s_silu, s_final_norm, s_lm, s_argmax, argmax_ptr,
             p_rms: (rms_p, rms_l), p_mv: (mv_p, mv_l), p_rope: (rope_p, rope_l), p_kvw: (kvw_p, kvw_l),
             p_sdpa: (sdpa_p, sdpa_l), p_fp: (fp_p, fp_l), p_fc: (fc_p, fc_l), p_silu: (silu_p, silu_l),
             p_add: (add_p, add_l), p_q6k: (q6k_p, q6k_l), p_argmax: (argmax_p, argmax_l),
+            last_rec: std::cell::Cell::new(-1),
             bufs, pipes, desc_pool, cmd_pool, cmd, fence, ctx,
         })
     }
@@ -1040,9 +1068,15 @@ impl VkModel {
         std::ptr::copy_nonoverlapping([kv_dim as u32, (pos * kv_dim) as u32, 0u32, 0u32].as_ptr() as *const u8, self.base_ptr, 16);
         std::ptr::copy_nonoverlapping([n_head as u32, n_kv as u32, hd as u32, seq_len].as_ptr() as *const u8, self.seq_ptr, 16);
 
-        dv.reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty()).unwrap();
-        dv.begin_command_buffer(self.cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+        // Record-once: only re-record when the SDPA grid (single-pass vs flash
+        // n_blocks) or the lm/argmax tail changes; otherwise reuse self.cmd.
+        let sdpa_key = if (seq_len as usize) > SDPA_FLASH_BLOCK { (seq_len as usize).div_ceil(SDPA_FLASH_BLOCK) as i64 } else { 0 };
+        let rec_key = sdpa_key | ((lm as i64) << 20) | ((argmax as i64) << 21);
+        let need_record = self.last_rec.get() != rec_key;
         let cmd = self.cmd;
+        if need_record {
+        dv.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).unwrap();
+        dv.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
         let cs = vk::PipelineStageFlags::COMPUTE_SHADER;
         let barr = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
         let bar = || dv.cmd_pipeline_barrier(cmd, cs, cs, vk::DependencyFlags::empty(), &[barr], &[], &[]);
@@ -1076,8 +1110,8 @@ impl VkModel {
             mv(l.wo, n_embd); bar();                                                   // O proj
             if !skip_extra { disp(self.p_add, l.radd_a, (n_embd as u32).div_ceil(64), 1); bar(); } // x += attn out
             if !skip_norm { disp(self.p_rms, l.ffn_norm, 1, 1); bar(); }               // ffn norm
-            mv(l.w1, n_inter); mv(l.w3, n_inter); bar();                               // gate, up
-            if !skip_attn { disp(self.p_silu, l.silu, (n_inter as u32).div_ceil(64), 1); bar(); } // silu·mul
+            mv(l.w13, n_inter * 2); bar();                                             // gate+up (concat, one matvec)
+            if !skip_attn { disp(self.p_silu, self.s_silu, (n_inter as u32).div_ceil(64), 1); bar(); } // silu·mul
             mv(l.w2, n_embd); bar();                                                   // down proj
             if !skip_extra { disp(self.p_add, l.radd_f, (n_embd as u32).div_ceil(64), 1); bar(); } // x += ffn out
         }
@@ -1088,6 +1122,8 @@ impl VkModel {
         }
         let _ = attn_dim;
         dv.end_command_buffer(cmd).unwrap();
+        self.last_rec.set(rec_key);
+        } // end if need_record
         let t_rec = std::time::Instant::now();
         dv.reset_fences(&[self.fence]).unwrap();
         let cmds = [cmd];
