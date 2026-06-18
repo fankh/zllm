@@ -2928,6 +2928,12 @@ impl<'a> BatchedDecoder<'a> {
     /// Whether the pool can currently fit `n_positions` of fresh KV.
     fn can_fit(&self, n_positions: usize) -> bool { self.free_blocks() >= n_positions.div_ceil(self.block_size) }
 
+    /// How many MORE blocks `slot` needs to hold `n_positions` (0 if it already does).
+    fn blocks_short(&self, slot: u32, n_positions: usize) -> usize {
+        let bs = self.blocks.borrow();
+        n_positions.div_ceil(self.block_size).saturating_sub(bs.slot_blocks[slot as usize].len())
+    }
+
     /// Prefix-cache stats since construction: (reused blocks, freshly-prefilled blocks).
     fn cache_stats(&self) -> (u64, u64) { let bs = self.blocks.borrow(); (bs.hits, bs.misses) }
 
@@ -3235,7 +3241,22 @@ impl<'a> BatchedDecoder<'a> {
     }
 }
 
-struct CbSeq { id: u64, slot: u32, pos: u32, next: u32, n_gen: usize, max_tokens: usize, eos: u32, params: SamplingParams, base_seed: u32 }
+/// An active sequence. `tokens` is the full history (prompt ++ every produced
+/// token, including the not-yet-fed last one), so derived state is:
+/// next = tokens.last(); KV write pos = tokens.len()-1; gen index = tokens.len()-prompt_len.
+/// Keeping the full history lets a preempted sequence be recomputed on resume.
+struct CbSeq { id: u64, slot: u32, tokens: Vec<u32>, prompt_len: usize, max_tokens: usize, eos: u32, params: SamplingParams, base_seed: u32 }
+impl CbSeq {
+    fn next(&self) -> u32 { *self.tokens.last().unwrap() }
+    fn pos(&self) -> u32 { (self.tokens.len() - 1) as u32 }
+    fn gen_index(&self) -> usize { self.tokens.len() - self.prompt_len }
+}
+
+/// A sequence evicted under KV-pool pressure (recompute preemption). Its KV was
+/// freed; on reschedule it re-prefills `tokens` (prompt ++ produced) — the prefix
+/// cache reuses the prompt's blocks — and continues. Output is bit-identical to
+/// never preempting (KV at p depends only on tokens[0..=p]; same seed index).
+struct PreemptedSeq { id: u64, tokens: Vec<u32>, prompt_len: usize, max_tokens: usize, eos: u32, params: SamplingParams, base_seed: u32 }
 
 /// Per-token sampling seed: decorrelate by generation index (the kernel further
 /// hashes (seed, token_id), so a cheap mix here is enough).
@@ -3298,22 +3319,30 @@ pub struct ContinuousBatcher<'a> {
     dec: BatchedDecoder<'a>,
     free: Vec<u32>,
     active: Vec<CbSeq>,
+    /// Sequences evicted under KV-pool pressure, awaiting reschedule (recompute).
+    preempted: std::collections::VecDeque<PreemptedSeq>,
+    preemptions: u64,
 }
 
 impl<'a> ContinuousBatcher<'a> {
     pub fn new(model: &'a GpuModel, m_max: usize, max_seq: usize) -> Self {
-        Self { dec: model.batched_decoder(m_max, max_seq), free: (0..m_max as u32).rev().collect(), active: Vec::new() }
+        Self { dec: model.batched_decoder(m_max, max_seq), free: (0..m_max as u32).rev().collect(), active: Vec::new(), preempted: Default::default(), preemptions: 0 }
     }
 
     /// Continuous batcher over a paged KV pool of `n_blocks` blocks shared by all
     /// `m_max` slots. `n_blocks < m_max*ceil(max_seq/block)` overcommits memory:
     /// many short sequences fit where a contiguous max_seq-per-slot reservation
-    /// could not. Admission gates on free blocks (no preemption yet).
+    /// could not. Admission is optimistic; if a running sequence can't grow, a
+    /// victim is preempted (its KV freed) and recomputed later.
     pub fn with_pool(model: &'a GpuModel, m_max: usize, max_seq: usize, n_blocks: usize) -> Self {
-        Self { dec: model.batched_decoder_paged(m_max, max_seq, n_blocks), free: (0..m_max as u32).rev().collect(), active: Vec::new() }
+        Self { dec: model.batched_decoder_paged(m_max, max_seq, n_blocks), free: (0..m_max as u32).rev().collect(), active: Vec::new(), preempted: Default::default(), preemptions: 0 }
     }
     pub fn has_free(&self) -> bool { !self.free.is_empty() }
     pub fn active_len(&self) -> usize { self.active.len() }
+    /// Sequences currently preempted (evicted, awaiting recompute).
+    pub fn preempted_len(&self) -> usize { self.preempted.len() }
+    /// Total preemptions since construction (observability).
+    pub fn preemption_count(&self) -> u64 { self.preemptions }
     /// (free, total) physical KV blocks — for observing pool pressure.
     pub fn block_pool(&self) -> (usize, usize) { (self.dec.free_blocks(), self.dec.n_blocks) }
     /// Prefix-cache stats: (reused blocks, freshly-prefilled blocks) since start.
@@ -3338,9 +3367,9 @@ impl<'a> ContinuousBatcher<'a> {
     /// `seed` (reproducible per request). Note: the first (prefill) token uses
     /// temperature only; top-k/top-p apply from the first decode token on.
     pub fn admit_params(&mut self, id: u64, prompt: &[u32], max_tokens: usize, eos: u32, params: SamplingParams, seed: u32) -> Option<(u32, bool)> {
-        // Conservative admission: ensure room for the whole generation up front
-        // (lazy block alloc + no preemption → don't admit what can't finish).
-        if !self.dec.can_fit(prompt.len() + max_tokens) { return None; }
+        // Optimistic admission: only the prompt's prefill must fit now; decode
+        // growth is handled by preemption (make_room) if the pool fills later.
+        if !self.dec.can_fit(prompt.len()) { return None; }
         let slot = self.free.pop()?;
         // First token = generation index 0 (temperature only).
         let samp = if params.temp > 0.0 { Some((params.temp, step_seed(seed, 0))) } else { None };
@@ -3350,46 +3379,96 @@ impl<'a> ContinuousBatcher<'a> {
             self.dec.free_slot(slot);
             self.free.push(slot);
         } else {
-            self.active.push(CbSeq { id, slot, pos: prompt.len() as u32, next: g, n_gen: 1, max_tokens, eos, params, base_seed: seed });
+            let mut tokens = Vec::with_capacity(prompt.len() + max_tokens);
+            tokens.extend_from_slice(prompt);
+            tokens.push(g);
+            self.active.push(CbSeq { id, slot, tokens, prompt_len: prompt.len(), max_tokens, eos, params, base_seed: seed });
         }
         Some((g, done))
     }
 
     /// One decode step over all active sequences. Returns (id, new_token, done)
-    /// for each — `done` = this token finished the sequence — and evicts (frees
-    /// the slot AND its KV blocks of) any finished sequence.
+    /// for each — including tokens from any sequence resumed this step. Evicts
+    /// finished sequences (frees slot + KV blocks); under pool pressure, preempts
+    /// (evicts + queues for recompute) victims so running sequences can grow.
     pub fn step(&mut self) -> Vec<(u64, u32, bool)> {
-        if self.active.is_empty() { return Vec::new(); }
-        let toks: Vec<u32> = self.active.iter().map(|s| s.next).collect();
-        let pos: Vec<u32> = self.active.iter().map(|s| s.pos).collect();
-        let slots: Vec<u32> = self.active.iter().map(|s| s.slot).collect();
-        // Seed by generation index (n_gen = index of the token about to be drawn).
-        let seeds: Vec<u32> = self.active.iter().map(|s| step_seed(s.base_seed, s.n_gen as u32)).collect();
-        // Route to the cheapest path that satisfies every active stream:
-        // top-k/top-p (CPU sample over GPU top-K) > temperature (Gumbel) > greedy.
-        let nexts = if self.active.iter().any(|s| s.params.needs_topk()) {
-            let params: Vec<SamplingParams> = self.active.iter().map(|s| s.params).collect();
-            self.dec.step_slotted_topk(&toks, &pos, &slots, &params, &seeds)
-        } else if self.active.iter().any(|s| s.params.temp > 0.0) {
-            let temps: Vec<f32> = self.active.iter().map(|s| s.params.temp).collect();
-            self.dec.step_slotted_sample(&toks, &pos, &slots, &temps, &seeds)
-        } else {
-            self.dec.step_slotted(&toks, &pos, &slots)
-        };
-        let mut out = Vec::with_capacity(nexts.len());
-        for (i, &nt) in nexts.iter().enumerate() {
-            let s = &mut self.active[i];
-            s.pos += 1; s.next = nt; s.n_gen += 1;
-            let done = nt == s.eos || s.n_gen >= s.max_tokens;
-            out.push((s.id, nt, done));
+        let mut out = Vec::new();
+        if !self.active.is_empty() {
+            self.make_room(); // preempt victims so every active sequence can grow
+            let toks: Vec<u32> = self.active.iter().map(|s| s.next()).collect();
+            let pos: Vec<u32> = self.active.iter().map(|s| s.pos()).collect();
+            let slots: Vec<u32> = self.active.iter().map(|s| s.slot).collect();
+            let seeds: Vec<u32> = self.active.iter().map(|s| step_seed(s.base_seed, s.gen_index() as u32)).collect();
+            // Cheapest path that satisfies every active stream:
+            // top-k/top-p (CPU sample over GPU top-K) > temperature (Gumbel) > greedy.
+            let nexts = if self.active.iter().any(|s| s.params.needs_topk()) {
+                let params: Vec<SamplingParams> = self.active.iter().map(|s| s.params).collect();
+                self.dec.step_slotted_topk(&toks, &pos, &slots, &params, &seeds)
+            } else if self.active.iter().any(|s| s.params.temp > 0.0) {
+                let temps: Vec<f32> = self.active.iter().map(|s| s.params.temp).collect();
+                self.dec.step_slotted_sample(&toks, &pos, &slots, &temps, &seeds)
+            } else {
+                self.dec.step_slotted(&toks, &pos, &slots)
+            };
+            for (i, &nt) in nexts.iter().enumerate() {
+                let s = &mut self.active[i];
+                s.tokens.push(nt);
+                let done = nt == s.eos || s.gen_index() >= s.max_tokens;
+                out.push((s.id, nt, done));
+            }
+            let (free, dec) = (&mut self.free, &self.dec);
+            self.active.retain(|s| {
+                let done = s.next() == s.eos || s.gen_index() >= s.max_tokens;
+                if done { dec.free_slot(s.slot); free.push(s.slot); }
+                !done
+            });
         }
-        let (free, dec) = (&mut self.free, &self.dec);
-        self.active.retain(|s| {
-            let done = s.next == s.eos || s.n_gen >= s.max_tokens;
-            if done { dec.free_slot(s.slot); free.push(s.slot); }
-            !done
-        });
+        self.reschedule(&mut out); // resume preempted sequences that now fit
         out
+    }
+
+    /// Preempt (LIFO) active sequences until the pool can supply the blocks every
+    /// remaining active sequence needs to grow this step. A single sequence always
+    /// fits (pool ≥ one full sequence), so this terminates.
+    fn make_room(&mut self) {
+        let needed = |b: &BatchedDecoder, active: &[CbSeq]| -> usize {
+            active.iter().map(|s| b.blocks_short(s.slot, s.tokens.len())).sum()
+        };
+        while self.active.len() > 1 && self.dec.free_blocks() < needed(&self.dec, &self.active) {
+            let victim = self.active.pop().unwrap(); // most recently admitted
+            self.dec.free_slot(victim.slot);
+            self.free.push(victim.slot);
+            self.preemptions += 1;
+            self.preempted.push_back(PreemptedSeq {
+                id: victim.id, tokens: victim.tokens, prompt_len: victim.prompt_len,
+                max_tokens: victim.max_tokens, eos: victim.eos, params: victim.params, base_seed: victim.base_seed,
+            });
+        }
+    }
+
+    /// Resume preempted sequences (FIFO) while a slot is free and the pool can
+    /// re-prefill them. Recompute: re-prefill prompt ++ produced (prefix cache
+    /// reuses the prompt), producing the exact next token they'd have produced.
+    fn reschedule(&mut self, out: &mut Vec<(u64, u32, bool)>) {
+        while !self.preempted.is_empty() && !self.free.is_empty() {
+            let len = self.preempted.front().unwrap().tokens.len();
+            if !self.dec.can_fit(len) { break; }
+            let p = self.preempted.pop_front().unwrap();
+            let slot = self.free.pop().unwrap();
+            let gen_idx = (p.tokens.len() - p.prompt_len) as u32;
+            let samp = if p.params.temp > 0.0 { Some((p.params.temp, step_seed(p.base_seed, gen_idx))) } else { None };
+            let (g, _) = self.dec.prefill_slot_cached(&p.tokens, slot, samp);
+            let mut tokens = p.tokens;
+            tokens.push(g);
+            let done = g == p.eos || (tokens.len() - p.prompt_len) >= p.max_tokens;
+            out.push((p.id, g, done));
+            if done {
+                self.dec.free_slot(slot);
+                self.free.push(slot);
+            } else {
+                self.active.push(CbSeq { id: p.id, slot, tokens, prompt_len: p.prompt_len, max_tokens: p.max_tokens, eos: p.eos, params: p.params, base_seed: p.base_seed });
+            }
+        }
     }
 }
 
@@ -3450,8 +3529,9 @@ impl GpuBatchServer {
         let mut chans: std::collections::HashMap<u64, tokio::sync::mpsc::UnboundedSender<Option<u32>>> = Default::default();
         let mut next_id: u64 = 0;
         loop {
-            // Idle → block for the next request instead of spinning the GPU.
-            if cb.active_len() == 0 {
+            // Idle (no active AND no preempted work) → block for the next request.
+            let idle = cb.active_len() == 0 && cb.preempted_len() == 0;
+            if idle {
                 match rx.recv() {
                     Ok(req) => Self::admit_req(&mut cb, &mut chans, &mut next_id, req),
                     Err(_) => return, // every sender dropped → shut down
@@ -3462,10 +3542,10 @@ impl GpuBatchServer {
                 match rx.try_recv() {
                     Ok(req) => Self::admit_req(&mut cb, &mut chans, &mut next_id, req),
                     Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => { if cb.active_len() == 0 { return; } break; }
+                    Err(TryRecvError::Disconnected) => { if cb.active_len() == 0 && cb.preempted_len() == 0 { return; } break; }
                 }
             }
-            if cb.active_len() == 0 { continue; }
+            if cb.active_len() == 0 && cb.preempted_len() == 0 { continue; }
             // One decode step over the whole in-flight batch; stream + retire.
             for (id, tok, done) in cb.step() {
                 if let Some(ch) = chans.get(&id) { let _ = ch.send(Some(tok)); }
@@ -4804,6 +4884,54 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         eprintln!("greedy            : {greedy:?}");
         eprintln!("top_k=40,top_p=.92: {a:?}  (reproducible: {})", a == b);
         eprintln!("top-K path temp=0 ≡ greedy ✓, top-k/top-p reproducible ✓, diverges from greedy: {}", a != greedy);
+    }
+
+    /// Preemption (recompute) must be output-transparent: two sequences forced to
+    /// preempt each other in a tiny KV pool must produce tokens bit-identical to
+    /// running each alone with no preemption.
+    /// `cargo test --release --features gpu --lib gpu_preemption -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gpu_preemption() {
+        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() { eprintln!("model not found; skipping"); return; }
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU ({e}); skipping"); return; } };
+        let model = GpuModel::load(path, ctx).expect("load");
+        // max_seq 64 → 4 blocks/seq; pool = 4 holds exactly one full sequence, so
+        // two growing sequences must preempt. ~36 tokens each = 3 blocks.
+        let (max_seq, n_blocks, k, eos) = (64usize, 4usize, 30usize, u32::MAX);
+        let prompts: Vec<Vec<u32>> = vec![
+            vec![128000, 791, 6864, 315, 9822, 374],
+            vec![128000, 15724, 374, 264, 1296, 1473],
+        ];
+
+        // Reference: each sequence alone, full pool, no preemption.
+        let mut refs: Vec<Vec<u32>> = Vec::new();
+        for p in &prompts {
+            let mut cb = ContinuousBatcher::new(&model, 1, max_seq);
+            let mut t = vec![cb.admit(0, p, k, eos).unwrap().0];
+            while cb.active_len() > 0 { for (_, x, _) in cb.step() { t.push(x); } }
+            refs.push(t);
+        }
+
+        // Forced preemption: both sequences in a 4-block pool.
+        let mut cb = ContinuousBatcher::with_pool(&model, 2, max_seq, n_blocks);
+        let mut got: std::collections::HashMap<u64, Vec<u32>> = Default::default();
+        for (i, p) in prompts.iter().enumerate() {
+            let g = cb.admit(i as u64, p, k, eos).expect("admit").0;
+            got.entry(i as u64).or_default().push(g);
+        }
+        let mut steps = 0;
+        while cb.active_len() > 0 || cb.preempted_len() > 0 {
+            for (id, x, _) in cb.step() { got.get_mut(&id).unwrap().push(x); }
+            steps += 1;
+            assert!(steps < 2000, "preemption loop made no progress");
+        }
+        for (i, r) in refs.iter().enumerate() {
+            assert_eq!(&got[&(i as u64)], r, "sequence {i} diverged under preemption");
+        }
+        assert!(cb.preemption_count() > 0, "test did not actually trigger preemption (pool too large?)");
+        eprintln!("preemption: {} preemptions over {} steps; both sequences bit-identical to no-preemption ✓", cb.preemption_count(), steps);
     }
 
     #[test]
