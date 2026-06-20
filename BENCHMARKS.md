@@ -173,6 +173,7 @@ sampling. **Every layer validated bit-identical to single-stream decode.**
 | **Sampling (temp / top-k / top-p)** | temperature via Gumbel-max (argmax of `logit/temp + gumbel`, no readback); top-k/top-p via a GPU top-K(64) kernel + CPU nucleus sample (reads back M×64, not M×vocab); per-stream `temperature`/`top_k`/`top_p`/`seed` | temp=0 ≡ greedy; reproducible per seed; GPU top-64 bit-matches a CPU sort; coherent varied output |
 | **Preemption (recompute)** | optimistic admission; when a running sequence can't grow, evict (free KV of) a LIFO victim and recompute it later (re-prefill prompt++produced, prefix cache reuses the prompt) — makes paged-KV overcommit *safe* | a sequence preempted mid-generation resumes **bit-identical** to never being preempted |
 | **Chunked prefill** | a long prompt prefills one chunk (128 tok) per scheduler step, interleaved with the decode of the active batch (prefill-priority), instead of one synchronous multi-chunk admission | a 301-tok prompt prefills over 3 steps while a short seq decodes 4 tokens **during** it; output bit-identical — no long-prompt HOL blocking |
+| **Request cancellation** | when a client disconnects, the serve loop detects the closed token channel (`is_closed()`) and frees the sequence's slot + KV — reclaiming capacity instead of generating output nobody reads | with 1 slot, a 200-tok stream killed mid-flight lets the next request finish in **0.4s** (vs waiting ~5s) |
 
 Notes / honest scope:
 - This raises **aggregate throughput under concurrency** (the right serving metric) — it doesn't change
@@ -222,6 +223,7 @@ cargo test --release --features gpu --lib gpu_btopk_kernel      --            --
 cargo test --release --features gpu --lib gpu_topkp             -- --ignored --nocapture  # top-k/top-p: temp=0 ≡ greedy, reproducible
 cargo test --release --features gpu --lib gpu_preemption        -- --ignored --nocapture  # preemption bit-identical to no-preemption
 cargo test --release --features gpu --lib gpu_chunked_prefill   -- --ignored --nocapture  # long prefill interleaves w/ decode, bit-identical
+cargo test --release --features gpu --lib gpu_cancel            -- --ignored --nocapture  # cancel frees slot/KV, neighbor unaffected
 # Server: build --features gpu, run with ZLLM_CB=1 (ZLLM_CB_SLOTS / ZLLM_CB_SEQ), POST /v1/cb/completions {prompt, max_tokens, stream}
 
 # zllm Phase 2 (raw-Vulkan coopmat) — --features vulkan
