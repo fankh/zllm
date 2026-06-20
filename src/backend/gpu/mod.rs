@@ -3366,6 +3366,31 @@ impl<'a> ContinuousBatcher<'a> {
     }
     pub fn has_free(&self) -> bool { !self.free.is_empty() }
     pub fn active_len(&self) -> usize { self.active.len() }
+
+    /// Cancel a sequence by id (e.g. its client disconnected): remove it from
+    /// wherever it is — decoding, prefilling, or preempted — and free its KV slot
+    /// + blocks. Returns true if it was found. Reclaims capacity immediately
+    /// instead of generating output nobody will read.
+    pub fn cancel(&mut self, id: u64) -> bool {
+        if let Some(pos) = self.active.iter().position(|s| s.id == id) {
+            let s = self.active.remove(pos);
+            self.dec.free_slot(s.slot);
+            self.free.push(s.slot);
+            return true;
+        }
+        if let Some(pos) = self.prefilling.iter().position(|s| s.id == id) {
+            let s = self.prefilling.remove(pos).unwrap();
+            self.dec.free_slot(s.slot);
+            self.free.push(s.slot);
+            return true;
+        }
+        if let Some(pos) = self.preempted.iter().position(|s| s.id == id) {
+            self.preempted.remove(pos); // preempted holds no slot/blocks
+            return true;
+        }
+        false
+    }
+
     /// Sequences currently mid-prefill (chunked).
     pub fn prefilling_len(&self) -> usize { self.prefilling.len() }
     /// Sequences currently preempted (evicted, awaiting recompute).
@@ -3667,11 +3692,14 @@ impl GpuBatchServer {
                     }
                 }
                 if cb.active_len() + cb.prefilling_len() + cb.preempted_len() == 0 { continue; }
-                // One decode step over the whole in-flight batch; stream + retire.
+                // One scheduler step; stream + retire.
                 for (id, tok, done) in cb.step() {
                     if let Some(ch) = chans.get(&id) { let _ = ch.send(Some(tok)); }
                     if done { if let Some(ch) = chans.remove(&id) { let _ = ch.send(None); } }
                 }
+                // Reclaim sequences whose client disconnected (covers mid-prefill,
+                // where no token has been sent yet to surface a send error).
+                chans.retain(|id, ch| if ch.is_closed() { cb.cancel(*id); false } else { true });
             }
             // Swap requested: abort in-flight sequences (their KV is on the old model).
             for (_, ch) in chans.drain() { let _ = ch.send(None); }
@@ -5106,6 +5134,51 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         assert_eq!(got[&1], ref_long, "long sequence diverged under chunked prefill");
         assert!(long_first_step >= 2, "long prompt should span multiple prefill chunks (got {long_first_step})");
         eprintln!("chunked prefill: long ({} tok) prefilled over {} steps; short decoded {} tokens DURING that prefill; both outputs bit-identical ✓", long.len(), long_first_step, short_progress);
+    }
+
+    /// Request cancellation: a cancelled sequence frees its KV slot + blocks
+    /// immediately, stops producing tokens, and does not disturb its neighbors.
+    /// `cargo test --release --features gpu --lib gpu_cancel -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gpu_cancel() {
+        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() { eprintln!("model not found; skipping"); return; }
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU ({e}); skipping"); return; } };
+        let model = GpuModel::load(path, ctx).expect("load");
+        let (max_seq, eos) = (256usize, u32::MAX);
+        let p0 = vec![128000u32, 791, 6864, 315, 9822, 374];
+        let p1 = vec![128000u32, 15724, 374, 264, 1296, 1473];
+
+        // Reference: seq 1 run ALONE for 12 tokens (what it must produce regardless
+        // of seq 0 being cancelled alongside it).
+        let ref1 = {
+            let mut cb = ContinuousBatcher::new(&model, 1, max_seq);
+            let mut t = vec![cb.admit(0, &p1, 12, eos).unwrap().0];
+            while cb.active_len() > 0 { for (_, x, _) in cb.step() { t.push(x); } }
+            t
+        };
+
+        let mut cb = ContinuousBatcher::new(&model, 4, max_seq);
+        let mut got1 = vec![cb.admit(1, &p1, 12, eos).unwrap().0];
+        cb.admit(0, &p0, 100, eos); // long-running; will be cancelled
+        for _ in 0..4 { for (id, x, _) in cb.step() { if id == 1 { got1.push(x); } } }
+        let (free_before, _) = cb.block_pool();
+        assert!(cb.cancel(0), "cancel of an active sequence should succeed");
+        let (free_after, _) = cb.block_pool();
+        assert!(free_after > free_before, "cancel must free the sequence's KV blocks ({free_before} -> {free_after})");
+        assert!(!cb.cancel(0), "cancel of an unknown id returns false");
+
+        // Seq 1 keeps going and finishes; seq 0 produces nothing more.
+        let mut seq0_after = 0;
+        while cb.active_len() > 0 {
+            for (id, x, _) in cb.step() {
+                if id == 1 { got1.push(x); } else { seq0_after += 1; }
+            }
+        }
+        assert_eq!(seq0_after, 0, "cancelled sequence must produce no further tokens");
+        assert_eq!(got1, ref1, "neighbor sequence diverged after a cancel");
+        eprintln!("cancel: freed seq 0's KV (free {free_before} -> {free_after} blocks); seq 1 unaffected + bit-identical ✓");
     }
 
     #[test]
