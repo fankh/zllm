@@ -42,6 +42,7 @@ const ARGMAX_SPV: &[u8] = include_bytes!("shaders/argmax.spv");
 const BNORM_SPV: &[u8] = include_bytes!("shaders/bnorm.spv");
 const BROPE_SPV: &[u8] = include_bytes!("shaders/brope.spv");
 const BSDPA_SPV: &[u8] = include_bytes!("shaders/bsdpa.spv");
+const BSDPA_DECODE_SPV: &[u8] = include_bytes!("shaders/bsdpa_decode.spv");
 const BSILU_SPV: &[u8] = include_bytes!("shaders/bsilu.spv");
 const TO_F16_SPV: &[u8] = include_bytes!("shaders/to_f16.spv");
 
@@ -797,7 +798,7 @@ type Pipe3 = (ash::vk::Pipeline, ash::vk::PipelineLayout, ash::vk::DescriptorSet
 struct PrefillRes {
     w: Vec<PrefillW>,
     p_q4: Pipe3, p_f16: Pipe3, p_bn: Pipe3, p_br: Pipe3, p_bs: Pipe3, p_bsi: Pipe3, p_t16: Pipe3,
-    p_add: Pipe3, p_q6k: Pipe3,
+    p_add: Pipe3, p_q6k: Pipe3, p_bsd: Pipe3,
     lm_ql: ash::vk::Buffer, lm_qh: ash::vk::Buffer, lm_scl: ash::vk::Buffer, lm_dd: ash::vk::Buffer,
     final_norm: ash::vk::Buffer, logits: ash::vk::Buffer, logits_ptr: *mut u8,
     // scratch (sized for PREFILL_MAX_M rows)
@@ -821,6 +822,20 @@ unsafe fn vk_alloc_set(dv: &ash::Device, pool: ash::vk::DescriptorPool, sl: ash:
     use ash::vk;
     let set = dv.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(std::slice::from_ref(&sl))).unwrap()[0];
     let infos: Vec<[vk::DescriptorBufferInfo; 1]> = sb.iter().map(|&b| [vk::DescriptorBufferInfo::default().buffer(b).range(vk::WHOLE_SIZE)]).collect();
+    let uinfo = [vk::DescriptorBufferInfo::default().buffer(u).range(vk::WHOLE_SIZE)];
+    let mut w: Vec<vk::WriteDescriptorSet> = infos.iter().enumerate().map(|(i, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(i as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(info)).collect();
+    w.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(sb.len() as u32).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&uinfo));
+    dv.update_descriptor_sets(&w, &[]);
+    set
+}
+
+// Like vk_alloc_set but each storage binding carries an (offset, range) — lets a
+// dispatch read/write a sub-window of a buffer (e.g. write K/V into the resident
+// KV cache at position `pos`).
+unsafe fn vk_alloc_set_off(dv: &ash::Device, pool: ash::vk::DescriptorPool, sl: ash::vk::DescriptorSetLayout, sb: &[(ash::vk::Buffer, u64, u64)], u: ash::vk::Buffer) -> ash::vk::DescriptorSet {
+    use ash::vk;
+    let set = dv.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(std::slice::from_ref(&sl))).unwrap()[0];
+    let infos: Vec<[vk::DescriptorBufferInfo; 1]> = sb.iter().map(|&(b, off, range)| [vk::DescriptorBufferInfo::default().buffer(b).offset(off).range(range)]).collect();
     let uinfo = [vk::DescriptorBufferInfo::default().buffer(u).range(vk::WHOLE_SIZE)];
     let mut w: Vec<vk::WriteDescriptorSet> = infos.iter().enumerate().map(|(i, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(i as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(info)).collect();
     w.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(sb.len() as u32).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&uinfo));
@@ -876,7 +891,7 @@ pub struct VkModel {
     p_sdpa: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_fp: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     p_fc: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_silu: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     p_add: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_q6k: (ash::vk::Pipeline, ash::vk::PipelineLayout),
-    p_argmax: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_mvrope: (ash::vk::Pipeline, ash::vk::PipelineLayout),
+    p_argmax: Pipe3, p_mvrope: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     // owned resources for cleanup
     bufs: Vec<(ash::vk::Buffer, ash::vk::DeviceMemory)>,
     pipes: Vec<(ash::vk::Pipeline, ash::vk::PipelineLayout, ash::vk::DescriptorSetLayout, ash::vk::ShaderModule)>,
@@ -1128,6 +1143,7 @@ impl VkModel {
         let p_bn = mkp(BNORM_SPV, 3, false);
         let p_br = mkp(BROPE_SPV, 3, false);
         let p_bs = mkp(BSDPA_SPV, 4, false);
+        let p_bsd = mkp(BSDPA_DECODE_SPV, 4, false);
         let p_bsi = mkp(BSILU_SPV, 2, false);
         let p_t16 = mkp(TO_F16_SPV, 2, false);
         let p_add = mkp(RESIDUAL_ADD_SPV, 2, false);
@@ -1146,7 +1162,7 @@ impl VkModel {
         let (pf_sinb, pf_sinb_ptr) = vk_zeros(&ctx, &mut bufs, mm * half);
         let (pf_logits, pf_logits_ptr) = vk_zeros(&ctx, &mut bufs, vocab);
         PrefillRes {
-            w: pw, p_q4, p_f16, p_bn, p_br, p_bs, p_bsi, p_t16, p_add, p_q6k,
+            w: pw, p_q4, p_f16, p_bn, p_br, p_bs, p_bsi, p_t16, p_add, p_q6k, p_bsd,
             lm_ql, lm_qh, lm_scl, lm_dd, final_norm, logits: pf_logits, logits_ptr: pf_logits_ptr,
             x32: pf_x32, x32_ptr: pf_x32_ptr, x16: pf_x16, n32: pf_n32, n16: pf_n16, q: pf_q,
             attn32: pf_attn32, attn16: pf_attn16, gu: pf_gu, h32: pf_h32, h16: pf_h16, o32: pf_o32, ffn32: pf_ffn32,
@@ -1164,7 +1180,7 @@ impl VkModel {
             layers, s_rope_q, s_rope_k, s_silu, s_final_norm, s_lm, s_argmax, argmax_ptr,
             p_rms: (rms_p, rms_l), p_mv: (mv_p, mv_l), p_rope: (rope_p, rope_l), p_kvw: (kvw_p, kvw_l),
             p_sdpa: (sdpa_p, sdpa_l), p_fp: (fp_p, fp_l), p_fc: (fc_p, fc_l), p_silu: (silu_p, silu_l),
-            p_add: (add_p, add_l), p_q6k: (q6k_p, q6k_l), p_argmax: (argmax_p, argmax_l), p_mvrope: (mvr_p, mvr_l),
+            p_add: (add_p, add_l), p_q6k: (q6k_p, q6k_l), p_argmax: (argmax_p, argmax_l, argmax_sl), p_mvrope: (mvr_p, mvr_l),
             last_rec: std::cell::Cell::new(-1),
             bufs, pipes, desc_pool, cmd_pool, cmd, fence, prefill, ctx,
         })
@@ -1302,6 +1318,169 @@ impl VkModel {
         out
     }
 
+    /// Speculative-decode verification: run the batched coopmat forward over the
+    /// `tokens` ([next, draft…]) at consecutive positions `pos..pos+len`, against
+    /// the RESIDENT KV cache (filled 0..pos-1), and return the model's greedy
+    /// argmax at each position. K/V for the real tokens is written into the cache
+    /// at `pos` (so the sequence continues from there). Caller verifies the drafts
+    /// and rolls back by position (rejected tail is overwritten next call).
+    pub fn verify_forward(&self, tokens: &[u32], pos: usize) -> Vec<u32> {
+        unsafe { self.verify_inner(tokens, pos) }
+    }
+
+    /// Prompt-Lookup speculative decode (greedy) on the coopmat path: prefill
+    /// `prompt`, then each step verify an n-gram draft in ONE batched
+    /// `verify_forward` and commit every token the model agrees with. Output is
+    /// identical to greedy single-token decode; >1 token per forward on echo-heavy
+    /// text. Returns (generated tokens, forwards). The prompt must already be the
+    /// only thing in the resident cache (call on a fresh model / after a reset).
+    pub fn generate_pld(&self, prompt: &[u32], max_new: usize, eos: u32, lookup_len: usize, draft_k: usize) -> (Vec<u32>, usize) {
+        assert!(!prompt.is_empty() && prompt.len() + max_new < self.max_seq);
+        // Prefill: feed the prompt; the last argmax is the first generated token.
+        let mut next = 0u32;
+        for (i, &t) in prompt.iter().enumerate() { next = self.forward_argmax(t, i); }
+        let mut pos = prompt.len();
+        let mut hist: Vec<u32> = prompt.to_vec();
+        hist.push(next);
+        let mut produced = vec![next];
+        let mut forwards = 0usize;
+        while produced.len() < max_new && next != eos {
+            let k = draft_k.min(max_new - produced.len());
+            match crate::engine::spec_decode::lookup_draft(&hist, &hist, lookup_len, k) {
+                Some(d) => {
+                    let mut inp = Vec::with_capacity(d.len() + 1);
+                    inp.push(next);
+                    inp.extend_from_slice(&d);
+                    let outs = self.verify_forward(&inp, pos);
+                    forwards += 1;
+                    let mut accepted = 0usize;
+                    while accepted < d.len() && outs[accepted] == d[accepted] { accepted += 1; }
+                    for &tok in outs.iter().take(accepted + 1) {
+                        produced.push(tok); hist.push(tok); next = tok;
+                        if tok == eos || produced.len() >= max_new { break; }
+                    }
+                    pos += accepted + 1;
+                }
+                None => {
+                    let tok = self.forward_argmax(next, pos);
+                    forwards += 1;
+                    produced.push(tok); hist.push(tok); next = tok; pos += 1;
+                }
+            }
+        }
+        (produced, forwards)
+    }
+
+    unsafe fn verify_inner(&self, tokens: &[u32], pos: usize) -> Vec<u32> {
+        use ash::vk;
+        let dv = &self.ctx.device;
+        let pf = &self.prefill;
+        let (n_embd, n_head, n_kv, hd, n_inter, kv_dim, half, vocab) =
+            (self.n_embd, self.n_head, self.n_kv, self.hd, self.n_inter, self.kv_dim, self.half, self.vocab);
+        let lm_nb = self.lm_nb;
+        let real_m = tokens.len();
+        assert!(real_m >= 1 && real_m <= PREFILL_MAX_M && pos + real_m <= self.max_seq);
+        let m = PREFILL_MAX_M;
+
+        // Inputs: real-token embeddings (pad rows zero), cos/sin for positions pos..
+        std::ptr::write_bytes(pf.x32_ptr, 0, m * n_embd * 4);
+        for (i, &tk) in tokens.iter().enumerate() {
+            std::ptr::copy_nonoverlapping(self.embed[tk as usize * n_embd..].as_ptr() as *const u8, pf.x32_ptr.add(i * n_embd * 4), n_embd * 4);
+        }
+        for i in 0..m {
+            let p = (pos + i).min(self.max_seq - 1);
+            std::ptr::copy_nonoverlapping(self.cos[p * half..].as_ptr() as *const u8, pf.cosb_ptr.add(i * half * 4), half * 4);
+            std::ptr::copy_nonoverlapping(self.sin[p * half..].as_ptr() as *const u8, pf.sinb_ptr.add(i * half * 4), half * 4);
+        }
+
+        let mut ub: Vec<(vk::Buffer, vk::DeviceMemory)> = Vec::new();
+        let uni = |ub: &mut Vec<(vk::Buffer, vk::DeviceMemory)>, d: [u32; 4]| -> vk::Buffer {
+            let (b, mm, p) = self.ctx.uma_buffer(16).unwrap(); std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, p, 16); ub.push((b, mm)); b
+        };
+        let uni5 = |ub: &mut Vec<(vk::Buffer, vk::DeviceMemory)>, d: [u32; 5]| -> vk::Buffer {
+            let (b, mm, p) = self.ctx.uma_buffer(32).unwrap(); std::ptr::write_bytes(p, 0, 32); std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, p, 20); ub.push((b, mm)); b
+        };
+        let (varg, varg_ptr) = vk_zeros(&self.ctx, &mut ub, real_m); // verify argmax out
+        let pool = dv.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets((self.n_layers * 20 + real_m * 2 + 8) as u32).pool_sizes(&[
+            vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count((self.n_layers * 80 + real_m * 8 + 16) as u32),
+            vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count((self.n_layers * 20 + real_m * 2 + 8) as u32),
+        ]), None).unwrap();
+        let mkset = |sl: vk::DescriptorSetLayout, sb: &[vk::Buffer], u: vk::Buffer| vk_alloc_set(dv, pool, sl, sb, u);
+        let cmd_pool = dv.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(self.ctx.queue_family), None).unwrap();
+        let cmd = dv.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).unwrap()[0];
+        dv.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+        let cs = vk::PipelineStageFlags::COMPUTE_SHADER;
+        let tr = vk::PipelineStageFlags::TRANSFER;
+        let bar = || { let b = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ); dv.cmd_pipeline_barrier(cmd, cs, cs, vk::DependencyFlags::empty(), &[b], &[], &[]); };
+        let bar_c2t = || { let b = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ); dv.cmd_pipeline_barrier(cmd, cs, tr, vk::DependencyFlags::empty(), &[b], &[], &[]); };
+        let bar_t2c = || { let b = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ); dv.cmd_pipeline_barrier(cmd, tr, cs, vk::DependencyFlags::empty(), &[b], &[], &[]); };
+        let disp = |p: Pipe3, set: vk::DescriptorSet, gx: u32, gy: u32| {
+            dv.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p.0);
+            dv.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, p.1, 0, &[set], &[]);
+            dv.cmd_dispatch(cmd, gx, gy, 1);
+        };
+        let c64 = |x: usize| ((x + 63) / 64) as u32;
+        let u_eps = uni(&mut ub, [n_embd as u32, self.eps.to_bits(), 0, 0]);
+        let kvoff = (pos * kv_dim * 4) as u64;
+        let kvsz = (real_m * kv_dim * 4) as u64;
+
+        for l in &pf.w {
+            disp(pf.p_bn, mkset(pf.p_bn.2, &[pf.x32, l.attn_norm, pf.n32], u_eps), m as u32, 1); bar();
+            disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.n32, pf.n16], uni(&mut ub, [(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
+            // QKV: Q -> pf.q, K -> pf.o32 (scratch), V -> pf.ffn32 (scratch).
+            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.n16, l.wq, pf.q], uni(&mut ub, [m as u32, n_embd as u32, n_embd as u32, (n_embd / 256) as u32])), (n_embd / 128) as u32, (m / 128) as u32);
+            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.n16, l.wk, pf.o32], uni(&mut ub, [m as u32, kv_dim as u32, n_embd as u32, (n_embd / 256) as u32])), (kv_dim / 128).max(1) as u32, (m / 128) as u32);
+            disp(pf.p_f16, mkset(pf.p_f16.2, &[pf.n16, l.wv_f16, pf.ffn32], uni(&mut ub, [m as u32, kv_dim as u32, n_embd as u32, 0])), (kv_dim / 64) as u32, (m / 64) as u32); bar();
+            // RoPE q (pf.q), k (pf.o32 scratch).
+            disp(pf.p_br, mkset(pf.p_br.2, &[pf.q, pf.cosb, pf.sinb], uni(&mut ub, [n_head as u32, hd as u32, m as u32, 0])), c64(m * n_head * half), 1);
+            disp(pf.p_br, mkset(pf.p_br.2, &[pf.o32, pf.cosb, pf.sinb], uni(&mut ub, [n_kv as u32, hd as u32, m as u32, 0])), c64(m * n_kv * half), 1); bar();
+            // Copy the real K/V into the resident cache at position `pos`.
+            bar_c2t();
+            dv.cmd_copy_buffer(cmd, pf.o32, l.kc, &[vk::BufferCopy::default().size(kvsz).dst_offset(kvoff)]);
+            dv.cmd_copy_buffer(cmd, pf.ffn32, l.vc, &[vk::BufferCopy::default().size(kvsz).dst_offset(kvoff)]);
+            bar_t2c();
+            // Decode SDPA over the resident cache (row i attends 0..=pos+i).
+            disp(pf.p_bsd, mkset(pf.p_bsd.2, &[pf.q, l.kc, l.vc, pf.attn32], uni5(&mut ub, [n_head as u32, n_kv as u32, hd as u32, real_m as u32, pos as u32])), c64(real_m * n_head), 1); bar();
+            // Wo + residual.
+            disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.attn32, pf.attn16], uni(&mut ub, [(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
+            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.attn16, l.wo, pf.o32], uni(&mut ub, [m as u32, n_embd as u32, n_embd as u32, (n_embd / 256) as u32])), (n_embd / 128) as u32, (m / 128) as u32); bar();
+            disp(pf.p_add, mkset(pf.p_add.2, &[pf.x32, pf.o32], uni(&mut ub, [(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
+            // FFN.
+            disp(pf.p_bn, mkset(pf.p_bn.2, &[pf.x32, l.ffn_norm, pf.n32], u_eps), m as u32, 1); bar();
+            disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.n32, pf.n16], uni(&mut ub, [(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
+            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.n16, l.w13, pf.gu], uni(&mut ub, [m as u32, (2 * n_inter) as u32, n_embd as u32, (n_embd / 256) as u32])), ((2 * n_inter) / 128) as u32, (m / 128) as u32); bar();
+            disp(pf.p_bsi, mkset(pf.p_bsi.2, &[pf.gu, pf.h32], uni(&mut ub, [n_inter as u32, m as u32, 0, 0])), c64(m * n_inter), 1); bar();
+            disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.h32, pf.h16], uni(&mut ub, [(m * n_inter) as u32, 0, 0, 0])), c64(m * n_inter), 1); bar();
+            disp(pf.p_f16, mkset(pf.p_f16.2, &[pf.h16, l.w2_f16, pf.ffn32], uni(&mut ub, [m as u32, n_embd as u32, n_inter as u32, 0])), (n_embd / 64) as u32, (m / 64) as u32); bar();
+            disp(pf.p_add, mkset(pf.p_add.2, &[pf.x32, pf.ffn32], uni(&mut ub, [(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
+        }
+        // Final norm; per-position LM head (Q6 matvec) + argmax for each real token.
+        disp(pf.p_bn, mkset(pf.p_bn.2, &[pf.x32, pf.final_norm, pf.n32], u_eps), m as u32, 1); bar();
+        let gx = (vocab as u32).min(65535);
+        for i in 0..real_m {
+            let n_off = (i * n_embd * 4) as u64;
+            let ulm = uni(&mut ub, [vocab as u32, lm_nb as u32, gx, 0]);
+            let lm_set = vk_alloc_set_off(dv, pool, pf.p_q6k.2, &[
+                (pf.lm_ql, 0, vk::WHOLE_SIZE), (pf.lm_qh, 0, vk::WHOLE_SIZE), (pf.lm_scl, 0, vk::WHOLE_SIZE),
+                (pf.lm_dd, 0, vk::WHOLE_SIZE), (pf.n32, n_off, (n_embd * 4) as u64), (pf.logits, 0, vk::WHOLE_SIZE),
+            ], ulm);
+            disp(pf.p_q6k, lm_set, gx, (vocab as u32).div_ceil(gx)); bar();
+            let uarg = uni(&mut ub, [vocab as u32, 0, 0, 0]);
+            let arg_set = vk_alloc_set_off(dv, pool, self.p_argmax.2, &[(pf.logits, 0, vk::WHOLE_SIZE), (varg, (i * 4) as u64, 4)], uarg);
+            disp(self.p_argmax, arg_set, 1, 1); bar();
+        }
+        dv.end_command_buffer(cmd).unwrap();
+        let fence = dv.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+        dv.queue_submit(self.ctx.queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence).unwrap();
+        dv.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+        let out = std::slice::from_raw_parts(varg_ptr as *const u32, real_m).to_vec();
+        dv.destroy_fence(fence, None);
+        dv.destroy_command_pool(cmd_pool, None);
+        dv.destroy_descriptor_pool(pool, None);
+        for (b, mem) in ub { dv.unmap_memory(mem); dv.destroy_buffer(b, None); dv.free_memory(mem, None); }
+        out
+    }
+
     unsafe fn forward_inner(&self, token: u32, pos: usize, lm: bool, argmax: bool) -> (Vec<f32>, u32) {
         use ash::vk;
         let dv = &self.ctx.device;
@@ -1367,7 +1546,7 @@ impl VkModel {
         if lm {
             if !skip_norm { disp(self.p_rms, self.s_final_norm, 1, 1); bar(); }        // final norm
             disp(self.p_q6k, self.s_lm, gxof(self.vocab), (self.vocab as u32).div_ceil(gxof(self.vocab))); // LM head
-            if argmax { bar(); disp(self.p_argmax, self.s_argmax, 1, 1); }              // GPU argmax (4-byte readback)
+            if argmax { bar(); disp((self.p_argmax.0, self.p_argmax.1), self.s_argmax, 1, 1); }  // GPU argmax (4-byte readback)
         }
         let _ = attn_dim;
         dv.end_command_buffer(cmd).unwrap();
@@ -1697,6 +1876,65 @@ mod tests {
     }
 
     /// END-TO-END: load the real Llama-3.2-1B GGUF into the VkModel and check
+    /// verify_forward (batched-decode forward for spec-decode verification) must
+    /// produce the same per-position argmax as feeding the tokens one at a time.
+    /// `cargo test --release --features vulkan --lib vk_verify_forward -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_verify_forward() {
+        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() { eprintln!("model not found; skipping"); return; }
+        let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan device ({e}); skipping"); return; } };
+        let model = VkModel::load(path, ctx).expect("load");
+        let prompt = [128000u32, 791, 6864, 315, 9822, 374];
+        // Fill the resident KV cache 0..P-1, ending with the token to feed at P.
+        let mut next = 0u32;
+        for (i, &t) in prompt.iter().enumerate() { next = model.forward_argmax(t, i); }
+        let p = prompt.len();
+        // Sequential reference: feed [next, 500, 600] at P, P+1, P+2 one at a time.
+        let s = [next, 500u32, 600u32];
+        let seq: Vec<u32> = s.iter().enumerate().map(|(i, &t)| model.forward_argmax(t, p + i)).collect();
+        // Batched verify over the same tokens at the same positions (overwrites P..P+2).
+        let ver = model.verify_forward(&s, p);
+        assert_eq!(ver, seq, "verify_forward per-position argmax diverged from sequential");
+        eprintln!("verify_forward: {} positions, per-position argmax == sequential {seq:?} ✓", s.len());
+    }
+
+    /// VkModel coopmat-path Prompt-Lookup speculative decode: bit-identical to
+    /// greedy single-token decode, but >1 token/forward on echo-heavy text.
+    /// `cargo test --release --features vulkan --lib vk_pld -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_pld() {
+        use std::time::Instant;
+        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() { eprintln!("model not found; skipping"); return; }
+        let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan device ({e}); skipping"); return; } };
+        let model = VkModel::load(path, ctx).expect("load");
+        let (k, eos) = (48usize, u32::MAX);
+        let mut prompt = vec![128000u32];
+        for _ in 0..10 { prompt.extend_from_slice(&[264, 265, 266, 267, 268]); }
+
+        // Greedy single-token reference (timed).
+        let tg = Instant::now();
+        let mut next = 0u32;
+        for (i, &t) in prompt.iter().enumerate() { next = model.forward_argmax(t, i); }
+        let (mut greedy, mut pos) = (vec![next], prompt.len());
+        while greedy.len() < k && next != eos {
+            let t = model.forward_argmax(next, pos); greedy.push(t); next = t; pos += 1;
+        }
+        let g_tps = greedy.len() as f64 / tg.elapsed().as_secs_f64();
+
+        // PLD (timed) — fresh prefill overwrites the cache.
+        let tp = Instant::now();
+        let (produced, forwards) = model.generate_pld(&prompt, k, eos, 3, 7);
+        let p_tps = produced.len() as f64 / tp.elapsed().as_secs_f64();
+
+        assert_eq!(produced, greedy, "VkModel PLD diverged from greedy");
+        eprintln!("VkModel PLD: {} tokens in {forwards} forwards = {:.2} tok/forward, bit-identical ✓", produced.len(), produced.len() as f64 / forwards.max(1) as f64);
+        eprintln!("  wall-clock: greedy {g_tps:.0} -> PLD {p_tps:.0} tok/s = {:.2}x (coopmat path)", p_tps / g_tps);
+    }
+
     /// greedy decode matches candle CPU token-for-token (the engine the server
     /// will use). Also prints decode tok/s on real weights.
     /// `cargo test --release --features vulkan --lib vk_model_vs_candle -- --ignored --nocapture`
