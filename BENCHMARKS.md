@@ -152,6 +152,23 @@ Key Phase-2 levers (all bit-exact):
   matvec producer, fuse QKV) + the Q6 kernel to 208 — not more matvec tuning. Prefill is also still
   sequential (~175 tok/s vs llama 5708); the coopmat GEMM is built but not wired into `VkModel`.
 
+## 4.5 Breaking the decode roofline — speculative decoding (the *mathematical* lever)
+
+Single-stream decode is bandwidth-bound: 1 token/forward, each forward streaming ~760 MB of weights,
+so `tok/s ≈ 215 GB/s ÷ 0.76 GB ≈ 283` caps **everyone** (llama 201, zllm 150). No kernel beats it —
+the bottleneck is moving weights, not computing. The only escape is **>1 token per weight-stream**:
+- **batching** (n = concurrent requests) → §5, the serving stack;
+- **speculative decoding** (n = accepted drafts + 1) → single-stream latency.
+
+`BatchedDecoder::generate_pld` implements **Prompt-Lookup Decoding** on the GPU path: an n-gram draft
+from the generated history is verified in ONE batched forward (`step_slotted` over consecutive
+positions — the staggered-position trick), committing every token the model's own argmax agrees with.
+Greedy verification ⇒ output **identical** to single-token decode. Validated (`gpu_pld`) on echo-heavy
+text: **4.0 tokens/forward, 3.19× wall-clock** (17 → 53 tok/s on the same wgpu kernels), bit-identical;
+open-ended text falls back to single-token at ~zero cost. With acceptance `p` and draft length `γ`,
+`E[tokens/forward] = (1−p^(γ+1))/(1−p)` (p=0.7, γ=4 → ~2.4×). Porting this to the VkModel coopmat path
+(150 tok/s single-stream) puts echo-heavy decode **well past llama** — the roofline only bounds 1-tok/forward.
+
 ## 5. Continuous-batching serving (in-flight batching + paged KV)
 
 Section 3 measured *raw* batched decode (M streams in one forward). This section is the **serving
@@ -224,6 +241,7 @@ cargo test --release --features gpu --lib gpu_topkp             -- --ignored --n
 cargo test --release --features gpu --lib gpu_preemption        -- --ignored --nocapture  # preemption bit-identical to no-preemption
 cargo test --release --features gpu --lib gpu_chunked_prefill   -- --ignored --nocapture  # long prefill interleaves w/ decode, bit-identical
 cargo test --release --features gpu --lib gpu_cancel            -- --ignored --nocapture  # cancel frees slot/KV, neighbor unaffected
+cargo test --release --features gpu --lib gpu_pld               -- --ignored --nocapture  # prompt-lookup spec decode: 4 tok/forward, 3.19x, bit-identical
 # Server: build --features gpu, run with ZLLM_CB=1 (ZLLM_CB_SLOTS / ZLLM_CB_SEQ), POST /v1/cb/completions {prompt, max_tokens, stream}
 
 # zllm Phase 2 (raw-Vulkan coopmat) — --features vulkan
