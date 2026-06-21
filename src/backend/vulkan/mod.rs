@@ -1951,6 +1951,18 @@ mod tests {
         assert_eq!(produced, greedy, "VkModel PLD diverged from greedy");
         eprintln!("VkModel PLD: {} tokens in {forwards} forwards = {:.2} tok/forward, bit-identical ✓", produced.len(), produced.len() as f64 / forwards.max(1) as f64);
         eprintln!("  wall-clock: greedy {g_tps:.0} -> PLD {p_tps:.0} tok/s = {:.2}x (coopmat path)", p_tps / g_tps);
+
+        // Cost probe — why coopmat-PLD loses: verify_forward pays the full 128-row
+        // coopmat tile (BM=128 in coopmat_q4k_gemm.comp) no matter how few rows are
+        // real. PLD only wins when verify_cost < (accepted+1)*greedy_cost. Here
+        // verify(8 tokens) ~= 11 greedy tokens, so even 4 tok/forward can't beat it.
+        // The real lever is a small-M (BM<=32) batched matmul, not allocation/record-once.
+        let vinp = [next, 264, 265, 266, 267, 268, 264, 265];
+        let _ = model.verify_forward(&vinp, prompt.len()); // warm up
+        let n = 20;
+        let tv = Instant::now(); for _ in 0..n { let _ = model.verify_forward(&vinp, prompt.len()); } let v_ms = tv.elapsed().as_secs_f64() * 1e3 / n as f64;
+        let tg1 = Instant::now(); for i in 0..n { let _ = model.forward_argmax(next, prompt.len() + i % 4); } let g_ms = tg1.elapsed().as_secs_f64() * 1e3 / n as f64;
+        eprintln!("  probe: verify(8)={v_ms:.2}ms  greedy_tok={g_ms:.2}ms  -> verify ~= {:.1} greedy tokens (win needs < accepted+1)", v_ms / g_ms);
     }
 
     /// greedy decode matches candle CPU token-for-token (the engine the server
