@@ -851,15 +851,18 @@ unsafe fn vk_alloc_set_off(dv: &ash::Device, pool: ash::vk::DescriptorPool, sl: 
 }
 
 // Build a matvec descriptor set for a weight (Q4 or Q6) producing `rows` outputs.
-unsafe fn vk_mk_mv(ctx: &VkContext, pool: ash::vk::DescriptorPool, mv_sl: ash::vk::DescriptorSetLayout, q6k_sl: ash::vk::DescriptorSetLayout, bufs: &mut Vec<(ash::vk::Buffer, ash::vk::DeviceMemory)>, w: &VkWeight, x_in: ash::vk::Buffer, out: ash::vk::Buffer, rows: usize) -> Mv {
+// `acc` folds a residual add into the matvec output (out[row] += proj instead of =),
+// removing the separate residual-add dispatch. Q4 packs acc into bit 16 of gx (kernel
+// masks it); Q6 uses its spare uniform field. `out` is then bound to the residual stream.
+unsafe fn vk_mk_mv(ctx: &VkContext, pool: ash::vk::DescriptorPool, mv_sl: ash::vk::DescriptorSetLayout, q6k_sl: ash::vk::DescriptorSetLayout, bufs: &mut Vec<(ash::vk::Buffer, ash::vk::DeviceMemory)>, w: &VkWeight, x_in: ash::vk::Buffer, out: ash::vk::Buffer, rows: usize, acc: bool) -> Mv {
     let gx = (rows as u32).min(65535);
     match *w {
         VkWeight::Q4 { buf, nb } => {
-            let (u, _) = vk_uni(ctx, bufs, [rows as u32, (nb * 256) as u32, nb as u32, gx]);
+            let (u, _) = vk_uni(ctx, bufs, [rows as u32, (nb * 256) as u32, nb as u32, gx | ((acc as u32) << 16)]);
             Mv { q6: false, set: vk_alloc_set(&ctx.device, pool, mv_sl, &[buf, x_in, out], u) }
         }
         VkWeight::Q6 { ql, qh, scl, dd, nb } => {
-            let (u, _) = vk_uni(ctx, bufs, [rows as u32, nb as u32, gx, 0]);
+            let (u, _) = vk_uni(ctx, bufs, [rows as u32, nb as u32, gx, acc as u32]);
             Mv { q6: true, set: vk_alloc_set(&ctx.device, pool, q6k_sl, &[ql, qh, scl, dd, x_in, out], u) }
         }
     }
@@ -870,8 +873,8 @@ struct VkLayerOps {
     attn_norm: ash::vk::DescriptorSet, wq: Mv, wk: Mv, wv: Mv,
     wq_rope: ash::vk::DescriptorSet, wk_rope: ash::vk::DescriptorSet, // QKV+rope fused (q/k)
     kvw_k: ash::vk::DescriptorSet, kvw_v: ash::vk::DescriptorSet, sdpa: ash::vk::DescriptorSet,
-    fp: ash::vk::DescriptorSet, fc: ash::vk::DescriptorSet, wo: Mv, radd_a: ash::vk::DescriptorSet,
-    ffn_norm: ash::vk::DescriptorSet, w13: Mv, w2: Mv, radd_f: ash::vk::DescriptorSet,
+    fp: ash::vk::DescriptorSet, fc: ash::vk::DescriptorSet, wo: Mv,
+    ffn_norm: ash::vk::DescriptorSet, w13: Mv, w2: Mv,
 }
 
 /// A loaded GGUF running on the raw-Vulkan decode kernels.
@@ -1110,12 +1113,13 @@ impl VkModel {
 
         let mut layers = Vec::with_capacity(n_layers);
         for r in &raw {
-            let wq = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.wq, normed, q, n_embd);
-            let wk = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.wk, normed, k_buf, kv_dim);
-            let wv = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.wv, normed, v_buf, kv_dim);
-            let wo = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.wo, attn, o_buf, n_embd);
-            let w13 = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.w13, normed, gu, n_inter * 2);
-            let w2 = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.w2, hbuf, ffn_buf, n_embd);
+            let wq = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.wq, normed, q, n_embd, false);
+            let wk = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.wk, normed, k_buf, kv_dim, false);
+            let wv = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.wv, normed, v_buf, kv_dim, false);
+            // wo/w2 fold the residual: write x_buf += proj (no separate radd dispatch).
+            let wo = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.wo, attn, x_buf, n_embd, true);
+            let w13 = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.w13, normed, gu, n_inter * 2, false);
+            let w2 = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.w2, hbuf, x_buf, n_embd, true);
             let wqb = match &r.wq { VkWeight::Q4 { buf, .. } => *buf, _ => panic!("wq not Q4") };
             let wkb = match &r.wk { VkWeight::Q4 { buf, .. } => *buf, _ => panic!("wk not Q4") };
             let u_wqr = vk_uni8(&ctx, &mut bufs, [n_embd as u32, n_embd as u32, (n_embd / 256) as u32, gxof(n_embd / 2), half as u32, 0, 0, 0]);
@@ -1131,10 +1135,8 @@ impl VkModel {
                 fp: mkset(fp_sl, &[q, r.kc, r.vc, part], u_seq),
                 fc: mkset(fc_sl, &[part, attn], u_seq),
                 wo,
-                radd_a: mkset(add_sl, &[x_buf, o_buf], u_add),
                 ffn_norm: mkset(rms_sl, &[x_buf, r.fn_, normed], u_norm),
                 w13, w2,
-                radd_f: mkset(add_sl, &[x_buf, ffn_buf], u_add),
             });
         }
 
@@ -1569,13 +1571,11 @@ impl VkModel {
                 disp(self.p_sdpa, l.sdpa, n_head as u32, 1); bar();
             }
             }
-            mv(l.wo, n_embd); bar();                                                   // O proj
-            if !skip_extra { disp(self.p_add, l.radd_a, (n_embd as u32).div_ceil(64), 1); bar(); } // x += attn out
+            mv(l.wo, n_embd); bar();                                                   // O proj + residual (folded: x += attn)
             if !skip_norm { disp(self.p_rms, l.ffn_norm, 1, 1); bar(); }               // ffn norm
             mv(l.w13, n_inter * 2); bar();                                             // gate+up (concat, one matvec)
             if !skip_attn { disp(self.p_silu, self.s_silu, (n_inter as u32).div_ceil(64), 1); bar(); } // silu·mul
-            mv(l.w2, n_embd); bar();                                                   // down proj
-            if !skip_extra { disp(self.p_add, l.radd_f, (n_embd as u32).div_ceil(64), 1); bar(); } // x += ffn out
+            mv(l.w2, n_embd); bar();                                                   // down proj + residual (folded: x += ffn)
         }
         if lm {
             if !skip_norm { disp(self.p_rms, self.s_final_norm, 1, 1); bar(); }        // final norm

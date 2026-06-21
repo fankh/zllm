@@ -13,8 +13,8 @@ layout(binding = 1) readonly  buffer QH_ { uint  qh[];   };  // 16 u32/block
 layout(binding = 2) readonly  buffer SC_ { uint  scl[];  };  // 4 u32/block (16 i8)
 layout(binding = 3) readonly  buffer DD_ { float dd[];   };  // 1/block
 layout(binding = 4) readonly  buffer X_  { float x[];    };
-layout(binding = 5) writeonly buffer O_  { float outp[]; };
-layout(binding = 6) uniform   P_ { uint n_rows; uint nb; uint gx; uint pad; } p;
+layout(binding = 5)          buffer O_  { float outp[]; };  // rw: acc folds residual
+layout(binding = 6) uniform   P_ { uint n_rows; uint nb; uint gx; uint acc; } p;
 shared float partial[64];
 void main() {
     uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * p.gx;
@@ -62,5 +62,5 @@ void main() {
     }
     partial[t] = acc; barrier();
     for (uint s = 32u; s > 0u; s >>= 1u) { if (t < s) { partial[t] += partial[t + s]; } barrier(); }
-    if (t == 0u) { outp[row] = partial[0]; }
+    if (t == 0u) { outp[row] = (p.acc == 1u) ? outp[row] + partial[0] : partial[0]; }
 }

@@ -10,15 +10,18 @@
 
 layout(local_size_x = 64) in;
 
-layout(binding = 0) readonly  buffer WQ { uint  wq[];   };  // Q4_K weights [N,K]
-layout(binding = 1) readonly  buffer X_ { float x[];    };  // activation [K]
-layout(binding = 2) writeonly buffer O_ { float outp[]; };  // [N]
-layout(binding = 3) uniform   P_ { uint N; uint K; uint nb; uint gx; } p;
+layout(binding = 0) readonly buffer WQ { uint  wq[];   };  // Q4_K weights [N,K]
+layout(binding = 1) readonly buffer X_ { float x[];    };  // activation [K]
+layout(binding = 2)          buffer O_ { float outp[]; };  // [N] (rw: acc folds residual)
+layout(binding = 3) uniform  P_ { uint N; uint K; uint nb; uint gx; } p;
 
 shared float partial[64];
 
+// acc (fold x += proj) is packed into bit 16 of gx; row-grid width is the low 16.
 void main() {
-    uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * p.gx;
+    uint gx = p.gx & 0xffffu;
+    uint racc = (p.gx >> 16) & 1u;
+    uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * gx;
     if (row >= p.N) { partial[gl_LocalInvocationID.x] = 0.0; return; }
     uint t = gl_LocalInvocationID.x;       // 0..63
     uint total_sub = p.nb * 8u;            // sub-blocks in the row
@@ -60,5 +63,5 @@ void main() {
         if (t < s) { partial[t] += partial[t + s]; }
         barrier();
     }
-    if (t == 0u) { outp[row] = partial[0]; }
+    if (t == 0u) { outp[row] = (racc == 1u) ? outp[row] + partial[0] : partial[0]; }
 }
