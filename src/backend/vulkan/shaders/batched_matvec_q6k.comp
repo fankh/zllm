@@ -14,11 +14,11 @@ layout(binding = 4) readonly  buffer X_  { float x[];    };  // [M,K]
 layout(binding = 5) writeonly buffer O_  { float outp[]; };  // [M,N]
 layout(binding = 6) uniform   P_ { uint n_rows; uint nb; uint gx; uint M; } p;
 const uint MAXM = 8u;
-shared float partial[MAXM][64];
+shared float partial[64];   // reused across M reductions (acc[] in registers) — occupancy
 void main() {
     uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * p.gx;
     uint t = gl_LocalInvocationID.x;
-    if (row >= p.n_rows) { for (uint m = 0u; m < MAXM; m++) partial[m][t] = 0.0; return; }
+    if (row >= p.n_rows) { return; }
     uint nwords = p.nb * 16u;            // 16 words/block (8 per half)
     uint K = p.nb * 256u;                // columns (n_embd)
     float acc[MAXM];
@@ -60,11 +60,11 @@ void main() {
         }
         w += 64u;
     }
-    for (uint m = 0u; m < p.M; m++) partial[m][t] = acc[m];
-    barrier();
-    for (uint s = 32u; s > 0u; s >>= 1u) {
-        if (t < s) { for (uint m = 0u; m < p.M; m++) partial[m][t] += partial[m][t + s]; }
+    for (uint m = 0u; m < p.M; m++) {
         barrier();
+        partial[t] = acc[m];
+        barrier();
+        for (uint s = 32u; s > 0u; s >>= 1u) { if (t < s) partial[t] += partial[t + s]; barrier(); }
+        if (t == 0u) outp[m * p.n_rows + row] = partial[0];
     }
-    if (t == 0u) { for (uint m = 0u; m < p.M; m++) outp[m * p.n_rows + row] = partial[m][0]; }
 }

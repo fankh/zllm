@@ -16,12 +16,15 @@ layout(binding = 2) writeonly buffer O_ { float outp[]; };  // [M,N]
 layout(binding = 3) uniform   P_ { uint M; uint N; uint K; uint nb; uint gx; } p;
 
 const uint MAXM = 8u;
-shared float partial[MAXM][64];
+// One partial[64] reused across the M reductions (M accumulators stay in registers).
+// Keeping LDS at the M=1 kernel's footprint preserves occupancy on RDNA — an
+// MAXM*64 array (8x larger) collapsed wave occupancy and made verify ~7x slower.
+shared float partial[64];
 
 void main() {
     uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * p.gx;   // output column n
     uint t = gl_LocalInvocationID.x;                          // 0..63
-    if (row >= p.N) { for (uint m = 0u; m < MAXM; m++) partial[m][t] = 0.0; return; }
+    if (row >= p.N) { return; }
     float acc[MAXM];
     for (uint m = 0u; m < MAXM; m++) acc[m] = 0.0;
     uint total_sub = p.nb * 8u;
@@ -57,11 +60,11 @@ void main() {
         }
         g += 64u;
     }
-    for (uint m = 0u; m < p.M; m++) partial[m][t] = acc[m];
-    barrier();
-    for (uint s = 32u; s > 0u; s >>= 1u) {
-        if (t < s) { for (uint m = 0u; m < p.M; m++) partial[m][t] += partial[m][t + s]; }
+    for (uint m = 0u; m < p.M; m++) {
         barrier();
+        partial[t] = acc[m];
+        barrier();
+        for (uint s = 32u; s > 0u; s >>= 1u) { if (t < s) partial[t] += partial[t + s]; barrier(); }
+        if (t == 0u) outp[m * p.N + row] = partial[0];
     }
-    if (t == 0u) { for (uint m = 0u; m < p.M; m++) outp[m * p.N + row] = partial[m][0]; }
 }
