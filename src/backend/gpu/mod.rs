@@ -3119,6 +3119,59 @@ impl<'a> BatchedDecoder<'a> {
     /// Max context length per sequence (positions).
     pub fn max_seq_len(&self) -> usize { self.max_seq }
 
+    /// Single-sequence **Prompt-Lookup speculative decode** (greedy) of up to
+    /// `max_new` tokens from `prompt`. Each step finds an n-gram draft from the
+    /// generated history (`lookup_len`-gram, up to `draft_k` tokens) and verifies
+    /// it in ONE batched forward — `step_slotted` over `[next, draft…]` at
+    /// consecutive positions in slot 0 — committing every token the model agrees
+    /// with. Output is IDENTICAL to greedy single-token decode (verification only
+    /// commits the model's own argmaxes), but at >1 token/forward on echo-heavy
+    /// text: the weight stream is amortized across the verified positions, beating
+    /// the 1-token/forward bandwidth roofline. Rejected drafts' KV is overwritten
+    /// next step (SDPA reads only 0..=pos). Returns (tokens, forwards).
+    pub fn generate_pld(&self, prompt: &[u32], max_new: usize, eos: u32, lookup_len: usize, draft_k: usize) -> (Vec<u32>, usize) {
+        assert!(draft_k + 1 <= self.m_max, "draft_k+1 ({}) must be <= m_max ({})", draft_k + 1, self.m_max);
+        let slot = 0u32;
+        let g0 = self.prefill_slot(prompt, slot);
+        let mut hist: Vec<u32> = prompt.to_vec();
+        hist.push(g0);
+        let mut produced = vec![g0];
+        let mut next = g0;
+        let mut pos = prompt.len(); // position where `next` will write its KV
+        let mut forwards = 0usize;
+        while produced.len() < max_new && next != eos {
+            let k = draft_k.min(max_new - produced.len());
+            match crate::engine::spec_decode::lookup_draft(&hist, &hist, lookup_len, k) {
+                Some(d) => {
+                    // Verify [next, draft…] over consecutive positions in one pass.
+                    let mut inp = Vec::with_capacity(d.len() + 1);
+                    inp.push(next);
+                    inp.extend_from_slice(&d);
+                    let positions: Vec<u32> = (0..inp.len()).map(|i| (pos + i) as u32).collect();
+                    let slots = vec![slot; inp.len()];
+                    let outs = self.step_slotted(&inp, &positions, &slots); // argmax per position
+                    forwards += 1;
+                    // out[0] is the real next token; draft d[i] is accepted iff out[i]==d[i].
+                    let mut accepted = 0usize;
+                    while accepted < d.len() && outs[accepted] == d[accepted] { accepted += 1; }
+                    // Commit out[0..=accepted] (accepted drafts + the bonus/correction).
+                    for &tok in outs.iter().take(accepted + 1) {
+                        produced.push(tok); hist.push(tok); next = tok;
+                        if tok == eos || produced.len() >= max_new { break; }
+                    }
+                    pos += accepted + 1; // KV valid through pos+accepted; bonus feeds next
+                }
+                None => {
+                    let outs = self.step_slotted(&[next], &[pos as u32], &[slot]);
+                    forwards += 1;
+                    let tok = outs[0];
+                    produced.push(tok); hist.push(tok); next = tok; pos += 1;
+                }
+            }
+        }
+        (produced, forwards)
+    }
+
     /// Prefill ONE chunk — positions `[start .. min(start+chunk_size, len))` — of
     /// `prompt` into `slot` (the prefix `[0..start)` must already be resident).
     /// Returns (new_start, first_token_if_complete). When the chunk reaches the
@@ -5179,6 +5232,47 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         assert_eq!(seq0_after, 0, "cancelled sequence must produce no further tokens");
         assert_eq!(got1, ref1, "neighbor sequence diverged after a cancel");
         eprintln!("cancel: freed seq 0's KV (free {free_before} -> {free_after} blocks); seq 1 unaffected + bit-identical ✓");
+    }
+
+    /// Prompt-Lookup speculative decode (generate_pld): the output must be
+    /// bit-identical to greedy single-token decode, but use FEWER forwards on
+    /// echo-heavy text (>1 token/forward — past the 1-token/forward roofline).
+    /// `cargo test --release --features gpu --lib gpu_pld -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gpu_pld() {
+        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() { eprintln!("model not found; skipping"); return; }
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU ({e}); skipping"); return; } };
+        let model = GpuModel::load(path, ctx).expect("load");
+        let (max_seq, k, eos) = (512usize, 48usize, u32::MAX);
+        // Echo-heavy prompt: a repeated pattern the greedy model continues, so
+        // prompt-lookup finds high-acceptance drafts.
+        let mut prompt = vec![128000u32];
+        for _ in 0..10 { prompt.extend_from_slice(&[264, 265, 266, 267, 268]); }
+
+        use std::time::Instant;
+        // Greedy single-token reference (timed).
+        let dec_g = model.batched_decoder(8, max_seq);
+        let g0 = dec_g.prefill_slot(&prompt, 0);
+        let (mut greedy, mut next, mut pos) = (vec![g0], g0, prompt.len());
+        let tg = Instant::now();
+        while greedy.len() < k && next != eos {
+            let t = dec_g.step_slotted(&[next], &[pos as u32], &[0])[0];
+            greedy.push(t); next = t; pos += 1;
+        }
+        let g_tps = greedy.len() as f64 / tg.elapsed().as_secs_f64();
+
+        // PLD (timed).
+        let dec_p = model.batched_decoder(8, max_seq);
+        let tp = Instant::now();
+        let (produced, forwards) = dec_p.generate_pld(&prompt, k, eos, 3, 7);
+        let p_tps = produced.len() as f64 / tp.elapsed().as_secs_f64();
+
+        assert_eq!(produced, greedy, "PLD output diverged from greedy single-token decode");
+        let toks = produced.len();
+        eprintln!("PLD: {toks} tokens in {forwards} forwards = {:.2} tokens/forward; output bit-identical to greedy ✓", toks as f64 / forwards.max(1) as f64);
+        eprintln!("  wall-clock: greedy {g_tps:.0} tok/s -> PLD {p_tps:.0} tok/s = {:.2}x faster (same wgpu kernels)", p_tps / g_tps);
     }
 
     #[test]
