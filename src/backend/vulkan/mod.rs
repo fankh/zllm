@@ -892,6 +892,15 @@ pub struct VkModel {
     p_fc: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_silu: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     p_add: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_q6k: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     p_argmax: Pipe3, p_mvrope: (ash::vk::Pipeline, ash::vk::PipelineLayout),
+    // Pre-allocated scratch for verify_forward (spec-decode), reused every call so
+    // it doesn't vkAllocateMemory ~280 uniforms per verification (the overhead that
+    // made the first cut slower than greedy). A reusable uniform-buffer pool +
+    // descriptor pool + command buffer + the per-position argmax readback buffer.
+    verify_unis: Vec<(ash::vk::Buffer, *mut u8)>,
+    verify_argmax: (ash::vk::Buffer, *mut u8),
+    verify_pool: ash::vk::DescriptorPool,
+    verify_cmd: ash::vk::CommandBuffer,
+    verify_fence: ash::vk::Fence,
     // owned resources for cleanup
     bufs: Vec<(ash::vk::Buffer, ash::vk::DeviceMemory)>,
     pipes: Vec<(ash::vk::Pipeline, ash::vk::PipelineLayout, ash::vk::DescriptorSetLayout, ash::vk::ShaderModule)>,
@@ -1171,8 +1180,19 @@ impl VkModel {
         };
 
         let cmd_pool = dv.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).map_err(|e| format!("cmd pool: {e}"))?;
-        let cmd = dv.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).map_err(|e| format!("cmd buf: {e}"))?[0];
+        let cmds2 = dv.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(2)).map_err(|e| format!("cmd buf: {e}"))?;
+        let cmd = cmds2[0];
+        let verify_cmd = cmds2[1];
         let fence = dv.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| format!("fence: {e}"))?;
+        // Reusable verify_forward scratch (so it doesn't allocate per call).
+        let mut verify_unis: Vec<(vk::Buffer, *mut u8)> = Vec::with_capacity(384);
+        for _ in 0..384 { let (b, m, p) = ctx.uma_buffer(32).map_err(|e| format!("verify uni: {e}"))?; bufs.push((b, m)); verify_unis.push((b, p)); }
+        let verify_argmax = { let (b, m, p) = ctx.uma_buffer((PREFILL_MAX_M * 4) as u64).map_err(|e| format!("verify argmax: {e}"))?; bufs.push((b, m)); (b, p) };
+        let verify_pool = dv.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(640).pool_sizes(&[
+            vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(3200),
+            vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(640),
+        ]), None).map_err(|e| format!("verify pool: {e}"))?;
+        let verify_fence = dv.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| format!("verify fence: {e}"))?;
 
         Ok(Self {
             n_embd, n_head, n_kv, hd, n_inter, vocab, n_layers, kv_dim, half, max_seq, eps, embed, cos, sin, lm_nb,
@@ -1182,6 +1202,7 @@ impl VkModel {
             p_sdpa: (sdpa_p, sdpa_l), p_fp: (fp_p, fp_l), p_fc: (fc_p, fc_l), p_silu: (silu_p, silu_l),
             p_add: (add_p, add_l), p_q6k: (q6k_p, q6k_l), p_argmax: (argmax_p, argmax_l, argmax_sl), p_mvrope: (mvr_p, mvr_l),
             last_rec: std::cell::Cell::new(-1),
+            verify_unis, verify_argmax, verify_pool, verify_cmd, verify_fence,
             bufs, pipes, desc_pool, cmd_pool, cmd, fence, prefill, ctx,
         })
     }
@@ -1231,9 +1252,9 @@ impl VkModel {
         std::ptr::copy_nonoverlapping(self.sin[..m * half].as_ptr() as *const u8, pf.sinb_ptr, m * half * 4);
 
         // Per-call uniforms + descriptor pool + command buffer (prefill is one call).
-        let mut ub: Vec<(vk::Buffer, vk::DeviceMemory)> = Vec::new();
-        let uni = |ub: &mut Vec<(vk::Buffer, vk::DeviceMemory)>, d: [u32; 4]| -> vk::Buffer {
-            let (b, mm, p) = self.ctx.uma_buffer(16).unwrap(); std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, p, 16); ub.push((b, mm)); b
+        let ub = std::cell::RefCell::new(Vec::<(vk::Buffer, vk::DeviceMemory)>::new());
+        let uni = |d: [u32; 4]| -> vk::Buffer {
+            let (b, mm, p) = self.ctx.uma_buffer(16).unwrap(); std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, p, 16); ub.borrow_mut().push((b, mm)); b
         };
         let pool = dv.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets((self.n_layers * 20 + 8) as u32).pool_sizes(&[
             vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count((self.n_layers * 80 + 16) as u32),
@@ -1252,35 +1273,35 @@ impl VkModel {
             dv.cmd_dispatch(cmd, gx, gy, 1);
         };
         let c64 = |x: usize| ((x + 63) / 64) as u32;
-        let u_eps = uni(&mut ub, [n_embd as u32, self.eps.to_bits(), 0, 0]);
+        let u_eps = uni([n_embd as u32, self.eps.to_bits(), 0, 0]);
 
         for l in &pf.w {
             // attn rmsnorm -> n32 -> f16
             disp(pf.p_bn, mkset(pf.p_bn.2, &[pf.x32, l.attn_norm, pf.n32], u_eps), m as u32, 1); bar();
-            disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.n32, pf.n16], uni(&mut ub, [(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
+            disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.n32, pf.n16], uni([(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
             // QKV: wq->q (Q4), wk->kc (Q4), wv->vc (f16 dense). K=n_embd.
-            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.n16, l.wq, pf.q], uni(&mut ub, [m as u32, n_embd as u32, n_embd as u32, (n_embd / 256) as u32])), (n_embd / 128) as u32, (m / 128) as u32);
-            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.n16, l.wk, l.kc], uni(&mut ub, [m as u32, kv_dim as u32, n_embd as u32, (n_embd / 256) as u32])), (kv_dim / 128) as u32, (m / 128) as u32);
-            disp(pf.p_f16, mkset(pf.p_f16.2, &[pf.n16, l.wv_f16, l.vc], uni(&mut ub, [m as u32, kv_dim as u32, n_embd as u32, 0])), (kv_dim / 64) as u32, (m / 64) as u32); bar();
+            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.n16, l.wq, pf.q], uni([m as u32, n_embd as u32, n_embd as u32, (n_embd / 256) as u32])), (n_embd / 128) as u32, (m / 128) as u32);
+            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.n16, l.wk, l.kc], uni([m as u32, kv_dim as u32, n_embd as u32, (n_embd / 256) as u32])), (kv_dim / 128) as u32, (m / 128) as u32);
+            disp(pf.p_f16, mkset(pf.p_f16.2, &[pf.n16, l.wv_f16, l.vc], uni([m as u32, kv_dim as u32, n_embd as u32, 0])), (kv_dim / 64) as u32, (m / 64) as u32); bar();
             // RoPE q, k (k in the cache).
-            disp(pf.p_br, mkset(pf.p_br.2, &[pf.q, pf.cosb, pf.sinb], uni(&mut ub, [n_head as u32, hd as u32, m as u32, 0])), c64(m * n_head * half), 1);
-            disp(pf.p_br, mkset(pf.p_br.2, &[l.kc, pf.cosb, pf.sinb], uni(&mut ub, [n_kv as u32, hd as u32, m as u32, 0])), c64(m * n_kv * half), 1); bar();
+            disp(pf.p_br, mkset(pf.p_br.2, &[pf.q, pf.cosb, pf.sinb], uni([n_head as u32, hd as u32, m as u32, 0])), c64(m * n_head * half), 1);
+            disp(pf.p_br, mkset(pf.p_br.2, &[l.kc, pf.cosb, pf.sinb], uni([n_kv as u32, hd as u32, m as u32, 0])), c64(m * n_kv * half), 1); bar();
             // causal SDPA -> attn
-            disp(pf.p_bs, mkset(pf.p_bs.2, &[pf.q, l.kc, l.vc, pf.attn32], uni(&mut ub, [n_head as u32, n_kv as u32, hd as u32, m as u32])), c64(m * n_head), 1); bar();
+            disp(pf.p_bs, mkset(pf.p_bs.2, &[pf.q, l.kc, l.vc, pf.attn32], uni([n_head as u32, n_kv as u32, hd as u32, m as u32])), c64(m * n_head), 1); bar();
             // Wo: attn->f16, GEMM->o32, residual x += o32
-            disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.attn32, pf.attn16], uni(&mut ub, [(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
-            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.attn16, l.wo, pf.o32], uni(&mut ub, [m as u32, n_embd as u32, n_embd as u32, (n_embd / 256) as u32])), (n_embd / 128) as u32, (m / 128) as u32); bar();
-            disp(pf.p_add, mkset(pf.p_add.2, &[pf.x32, pf.o32], uni(&mut ub, [(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
+            disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.attn32, pf.attn16], uni([(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
+            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.attn16, l.wo, pf.o32], uni([m as u32, n_embd as u32, n_embd as u32, (n_embd / 256) as u32])), (n_embd / 128) as u32, (m / 128) as u32); bar();
+            disp(pf.p_add, mkset(pf.p_add.2, &[pf.x32, pf.o32], uni([(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
             // ffn rmsnorm -> n32 -> f16
             disp(pf.p_bn, mkset(pf.p_bn.2, &[pf.x32, l.ffn_norm, pf.n32], u_eps), m as u32, 1); bar();
-            disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.n32, pf.n16], uni(&mut ub, [(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
+            disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.n32, pf.n16], uni([(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
             // W13 GEMM -> gu [M, 2*n_inter] (Q4), silu -> h32 -> f16
-            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.n16, l.w13, pf.gu], uni(&mut ub, [m as u32, (2 * n_inter) as u32, n_embd as u32, (n_embd / 256) as u32])), ((2 * n_inter) / 128) as u32, (m / 128) as u32); bar();
-            disp(pf.p_bsi, mkset(pf.p_bsi.2, &[pf.gu, pf.h32], uni(&mut ub, [n_inter as u32, m as u32, 0, 0])), c64(m * n_inter), 1); bar();
-            disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.h32, pf.h16], uni(&mut ub, [(m * n_inter) as u32, 0, 0, 0])), c64(m * n_inter), 1); bar();
+            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.n16, l.w13, pf.gu], uni([m as u32, (2 * n_inter) as u32, n_embd as u32, (n_embd / 256) as u32])), ((2 * n_inter) / 128) as u32, (m / 128) as u32); bar();
+            disp(pf.p_bsi, mkset(pf.p_bsi.2, &[pf.gu, pf.h32], uni([n_inter as u32, m as u32, 0, 0])), c64(m * n_inter), 1); bar();
+            disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.h32, pf.h16], uni([(m * n_inter) as u32, 0, 0, 0])), c64(m * n_inter), 1); bar();
             // W2 GEMM (f16 dense, K=n_inter) -> ffn32, residual x += ffn32
-            disp(pf.p_f16, mkset(pf.p_f16.2, &[pf.h16, l.w2_f16, pf.ffn32], uni(&mut ub, [m as u32, n_embd as u32, n_inter as u32, 0])), (n_embd / 64) as u32, (m / 64) as u32); bar();
-            disp(pf.p_add, mkset(pf.p_add.2, &[pf.x32, pf.ffn32], uni(&mut ub, [(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
+            disp(pf.p_f16, mkset(pf.p_f16.2, &[pf.h16, l.w2_f16, pf.ffn32], uni([m as u32, n_embd as u32, n_inter as u32, 0])), (n_embd / 64) as u32, (m / 64) as u32); bar();
+            disp(pf.p_add, mkset(pf.p_add.2, &[pf.x32, pf.ffn32], uni([(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
         }
         // final rmsnorm -> n32; LM head (Q6 matvec) on the last real token's row.
         disp(pf.p_bn, mkset(pf.p_bn.2, &[pf.x32, pf.final_norm, pf.n32], u_eps), m as u32, 1); bar();
@@ -1295,7 +1316,7 @@ impl VkModel {
                 (4, [vk::DescriptorBufferInfo::default().buffer(pf.n32).offset(off).range((n_embd * 4) as u64)]),
                 (5, [vk::DescriptorBufferInfo::default().buffer(pf.logits).range(vk::WHOLE_SIZE)]),
             ];
-            let ulm = uni(&mut ub, [vocab as u32, lm_nb as u32, (vocab as u32).min(65535), 0]);
+            let ulm = uni([vocab as u32, lm_nb as u32, (vocab as u32).min(65535), 0]);
             let uinfo = [vk::DescriptorBufferInfo::default().buffer(ulm).range(vk::WHOLE_SIZE)];
             let mut w: Vec<vk::WriteDescriptorSet> = infos.iter().map(|(b, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*b).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(info)).collect();
             w.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(6).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&uinfo));
@@ -1314,7 +1335,7 @@ impl VkModel {
         dv.destroy_fence(fence, None);
         dv.destroy_command_pool(cmd_pool, None);
         dv.destroy_descriptor_pool(pool, None);
-        for (b, mem) in ub { dv.unmap_memory(mem); dv.destroy_buffer(b, None); dv.free_memory(mem, None); }
+        for (b, mem) in ub.into_inner() { dv.unmap_memory(mem); dv.destroy_buffer(b, None); dv.free_memory(mem, None); }
         out
     }
 
@@ -1393,21 +1414,22 @@ impl VkModel {
             std::ptr::copy_nonoverlapping(self.sin[p * half..].as_ptr() as *const u8, pf.sinb_ptr.add(i * half * 4), half * 4);
         }
 
-        let mut ub: Vec<(vk::Buffer, vk::DeviceMemory)> = Vec::new();
-        let uni = |ub: &mut Vec<(vk::Buffer, vk::DeviceMemory)>, d: [u32; 4]| -> vk::Buffer {
-            let (b, mm, p) = self.ctx.uma_buffer(16).unwrap(); std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, p, 16); ub.push((b, mm)); b
+        // Reuse the pre-allocated verify scratch (no per-call vkAllocateMemory).
+        let uni_i = std::cell::Cell::new(0usize);
+        let uni = |d: [u32; 4]| -> vk::Buffer {
+            let i = uni_i.get(); let (b, p) = self.verify_unis[i];
+            std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, p, 16); uni_i.set(i + 1); b
         };
-        let uni5 = |ub: &mut Vec<(vk::Buffer, vk::DeviceMemory)>, d: [u32; 5]| -> vk::Buffer {
-            let (b, mm, p) = self.ctx.uma_buffer(32).unwrap(); std::ptr::write_bytes(p, 0, 32); std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, p, 20); ub.push((b, mm)); b
+        let uni5 = |d: [u32; 5]| -> vk::Buffer {
+            let i = uni_i.get(); let (b, p) = self.verify_unis[i];
+            std::ptr::write_bytes(p, 0, 32); std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, p, 20); uni_i.set(i + 1); b
         };
-        let (varg, varg_ptr) = vk_zeros(&self.ctx, &mut ub, real_m); // verify argmax out
-        let pool = dv.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets((self.n_layers * 20 + real_m * 2 + 8) as u32).pool_sizes(&[
-            vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count((self.n_layers * 80 + real_m * 8 + 16) as u32),
-            vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count((self.n_layers * 20 + real_m * 2 + 8) as u32),
-        ]), None).unwrap();
+        let (varg, varg_ptr) = self.verify_argmax;
+        let pool = self.verify_pool;
+        dv.reset_descriptor_pool(pool, vk::DescriptorPoolResetFlags::empty()).unwrap();
         let mkset = |sl: vk::DescriptorSetLayout, sb: &[vk::Buffer], u: vk::Buffer| vk_alloc_set(dv, pool, sl, sb, u);
-        let cmd_pool = dv.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(self.ctx.queue_family), None).unwrap();
-        let cmd = dv.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).unwrap()[0];
+        let cmd = self.verify_cmd;
+        dv.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).unwrap();
         dv.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
         let cs = vk::PipelineStageFlags::COMPUTE_SHADER;
         let tr = vk::PipelineStageFlags::TRANSFER;
@@ -1420,65 +1442,61 @@ impl VkModel {
             dv.cmd_dispatch(cmd, gx, gy, 1);
         };
         let c64 = |x: usize| ((x + 63) / 64) as u32;
-        let u_eps = uni(&mut ub, [n_embd as u32, self.eps.to_bits(), 0, 0]);
+        let u_eps = uni([n_embd as u32, self.eps.to_bits(), 0, 0]);
         let kvoff = (pos * kv_dim * 4) as u64;
         let kvsz = (real_m * kv_dim * 4) as u64;
 
         for l in &pf.w {
             disp(pf.p_bn, mkset(pf.p_bn.2, &[pf.x32, l.attn_norm, pf.n32], u_eps), m as u32, 1); bar();
-            disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.n32, pf.n16], uni(&mut ub, [(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
+            disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.n32, pf.n16], uni([(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
             // QKV: Q -> pf.q, K -> pf.o32 (scratch), V -> pf.ffn32 (scratch).
-            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.n16, l.wq, pf.q], uni(&mut ub, [m as u32, n_embd as u32, n_embd as u32, (n_embd / 256) as u32])), (n_embd / 128) as u32, (m / 128) as u32);
-            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.n16, l.wk, pf.o32], uni(&mut ub, [m as u32, kv_dim as u32, n_embd as u32, (n_embd / 256) as u32])), (kv_dim / 128).max(1) as u32, (m / 128) as u32);
-            disp(pf.p_f16, mkset(pf.p_f16.2, &[pf.n16, l.wv_f16, pf.ffn32], uni(&mut ub, [m as u32, kv_dim as u32, n_embd as u32, 0])), (kv_dim / 64) as u32, (m / 64) as u32); bar();
+            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.n16, l.wq, pf.q], uni([m as u32, n_embd as u32, n_embd as u32, (n_embd / 256) as u32])), (n_embd / 128) as u32, (m / 128) as u32);
+            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.n16, l.wk, pf.o32], uni([m as u32, kv_dim as u32, n_embd as u32, (n_embd / 256) as u32])), (kv_dim / 128).max(1) as u32, (m / 128) as u32);
+            disp(pf.p_f16, mkset(pf.p_f16.2, &[pf.n16, l.wv_f16, pf.ffn32], uni([m as u32, kv_dim as u32, n_embd as u32, 0])), (kv_dim / 64) as u32, (m / 64) as u32); bar();
             // RoPE q (pf.q), k (pf.o32 scratch).
-            disp(pf.p_br, mkset(pf.p_br.2, &[pf.q, pf.cosb, pf.sinb], uni(&mut ub, [n_head as u32, hd as u32, m as u32, 0])), c64(m * n_head * half), 1);
-            disp(pf.p_br, mkset(pf.p_br.2, &[pf.o32, pf.cosb, pf.sinb], uni(&mut ub, [n_kv as u32, hd as u32, m as u32, 0])), c64(m * n_kv * half), 1); bar();
+            disp(pf.p_br, mkset(pf.p_br.2, &[pf.q, pf.cosb, pf.sinb], uni([n_head as u32, hd as u32, m as u32, 0])), c64(m * n_head * half), 1);
+            disp(pf.p_br, mkset(pf.p_br.2, &[pf.o32, pf.cosb, pf.sinb], uni([n_kv as u32, hd as u32, m as u32, 0])), c64(m * n_kv * half), 1); bar();
             // Copy the real K/V into the resident cache at position `pos`.
             bar_c2t();
             dv.cmd_copy_buffer(cmd, pf.o32, l.kc, &[vk::BufferCopy::default().size(kvsz).dst_offset(kvoff)]);
             dv.cmd_copy_buffer(cmd, pf.ffn32, l.vc, &[vk::BufferCopy::default().size(kvsz).dst_offset(kvoff)]);
             bar_t2c();
             // Decode SDPA over the resident cache (row i attends 0..=pos+i).
-            disp(pf.p_bsd, mkset(pf.p_bsd.2, &[pf.q, l.kc, l.vc, pf.attn32], uni5(&mut ub, [n_head as u32, n_kv as u32, hd as u32, real_m as u32, pos as u32])), c64(real_m * n_head), 1); bar();
+            disp(pf.p_bsd, mkset(pf.p_bsd.2, &[pf.q, l.kc, l.vc, pf.attn32], uni5([n_head as u32, n_kv as u32, hd as u32, real_m as u32, pos as u32])), c64(real_m * n_head), 1); bar();
             // Wo + residual.
-            disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.attn32, pf.attn16], uni(&mut ub, [(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
-            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.attn16, l.wo, pf.o32], uni(&mut ub, [m as u32, n_embd as u32, n_embd as u32, (n_embd / 256) as u32])), (n_embd / 128) as u32, (m / 128) as u32); bar();
-            disp(pf.p_add, mkset(pf.p_add.2, &[pf.x32, pf.o32], uni(&mut ub, [(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
+            disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.attn32, pf.attn16], uni([(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
+            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.attn16, l.wo, pf.o32], uni([m as u32, n_embd as u32, n_embd as u32, (n_embd / 256) as u32])), (n_embd / 128) as u32, (m / 128) as u32); bar();
+            disp(pf.p_add, mkset(pf.p_add.2, &[pf.x32, pf.o32], uni([(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
             // FFN.
             disp(pf.p_bn, mkset(pf.p_bn.2, &[pf.x32, l.ffn_norm, pf.n32], u_eps), m as u32, 1); bar();
-            disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.n32, pf.n16], uni(&mut ub, [(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
-            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.n16, l.w13, pf.gu], uni(&mut ub, [m as u32, (2 * n_inter) as u32, n_embd as u32, (n_embd / 256) as u32])), ((2 * n_inter) / 128) as u32, (m / 128) as u32); bar();
-            disp(pf.p_bsi, mkset(pf.p_bsi.2, &[pf.gu, pf.h32], uni(&mut ub, [n_inter as u32, m as u32, 0, 0])), c64(m * n_inter), 1); bar();
-            disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.h32, pf.h16], uni(&mut ub, [(m * n_inter) as u32, 0, 0, 0])), c64(m * n_inter), 1); bar();
-            disp(pf.p_f16, mkset(pf.p_f16.2, &[pf.h16, l.w2_f16, pf.ffn32], uni(&mut ub, [m as u32, n_embd as u32, n_inter as u32, 0])), (n_embd / 64) as u32, (m / 64) as u32); bar();
-            disp(pf.p_add, mkset(pf.p_add.2, &[pf.x32, pf.ffn32], uni(&mut ub, [(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
+            disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.n32, pf.n16], uni([(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
+            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.n16, l.w13, pf.gu], uni([m as u32, (2 * n_inter) as u32, n_embd as u32, (n_embd / 256) as u32])), ((2 * n_inter) / 128) as u32, (m / 128) as u32); bar();
+            disp(pf.p_bsi, mkset(pf.p_bsi.2, &[pf.gu, pf.h32], uni([n_inter as u32, m as u32, 0, 0])), c64(m * n_inter), 1); bar();
+            disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.h32, pf.h16], uni([(m * n_inter) as u32, 0, 0, 0])), c64(m * n_inter), 1); bar();
+            disp(pf.p_f16, mkset(pf.p_f16.2, &[pf.h16, l.w2_f16, pf.ffn32], uni([m as u32, n_embd as u32, n_inter as u32, 0])), (n_embd / 64) as u32, (m / 64) as u32); bar();
+            disp(pf.p_add, mkset(pf.p_add.2, &[pf.x32, pf.ffn32], uni([(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
         }
         // Final norm; per-position LM head (Q6 matvec) + argmax for each real token.
         disp(pf.p_bn, mkset(pf.p_bn.2, &[pf.x32, pf.final_norm, pf.n32], u_eps), m as u32, 1); bar();
         let gx = (vocab as u32).min(65535);
         for i in 0..real_m {
             let n_off = (i * n_embd * 4) as u64;
-            let ulm = uni(&mut ub, [vocab as u32, lm_nb as u32, gx, 0]);
+            let ulm = uni([vocab as u32, lm_nb as u32, gx, 0]);
             let lm_set = vk_alloc_set_off(dv, pool, pf.p_q6k.2, &[
                 (pf.lm_ql, 0, vk::WHOLE_SIZE), (pf.lm_qh, 0, vk::WHOLE_SIZE), (pf.lm_scl, 0, vk::WHOLE_SIZE),
                 (pf.lm_dd, 0, vk::WHOLE_SIZE), (pf.n32, n_off, (n_embd * 4) as u64), (pf.logits, 0, vk::WHOLE_SIZE),
             ], ulm);
             disp(pf.p_q6k, lm_set, gx, (vocab as u32).div_ceil(gx)); bar();
-            let uarg = uni(&mut ub, [vocab as u32, 0, 0, 0]);
+            let uarg = uni([vocab as u32, 0, 0, 0]);
             let arg_set = vk_alloc_set_off(dv, pool, self.p_argmax.2, &[(pf.logits, 0, vk::WHOLE_SIZE), (varg, (i * 4) as u64, 4)], uarg);
             disp(self.p_argmax, arg_set, 1, 1); bar();
         }
         dv.end_command_buffer(cmd).unwrap();
-        let fence = dv.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
-        dv.queue_submit(self.ctx.queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence).unwrap();
-        dv.wait_for_fences(&[fence], true, u64::MAX).unwrap();
-        let out = std::slice::from_raw_parts(varg_ptr as *const u32, real_m).to_vec();
-        dv.destroy_fence(fence, None);
-        dv.destroy_command_pool(cmd_pool, None);
-        dv.destroy_descriptor_pool(pool, None);
-        for (b, mem) in ub { dv.unmap_memory(mem); dv.destroy_buffer(b, None); dv.free_memory(mem, None); }
-        out
+        dv.reset_fences(&[self.verify_fence]).unwrap();
+        dv.queue_submit(self.ctx.queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], self.verify_fence).unwrap();
+        dv.wait_for_fences(&[self.verify_fence], true, u64::MAX).unwrap();
+        // Reused resources (pool/cmd/fence/uniforms) — nothing to free per call.
+        std::slice::from_raw_parts(varg_ptr as *const u32, real_m).to_vec()
     }
 
     unsafe fn forward_inner(&self, token: u32, pos: usize, lm: bool, argmax: bool) -> (Vec<f32>, u32) {
