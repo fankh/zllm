@@ -1,0 +1,70 @@
+// Small-M weight-stationary Q6_K matvec: C[M,N] = A[M,K] * dequant(W)[N,K].
+// The spec-decode verify LM head: instead of M separate M=1 Q6 matvecs (each
+// re-streaming + re-unpacking the whole 215MB tied-embedding weight), unpack each
+// weight ONCE and apply it to all M activation rows (M<=8). Mirrors the unpack of
+// decode_matvec_q6k.comp (word-loaded, i8 scales) extended to M accumulators.
+// Compile: glslangValidator --target-env vulkan1.3 -V batched_matvec_q6k.comp -o batched_matvec_q6k.spv
+#version 450 core
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly  buffer QL_ { uint  ql[];   };  // 32 u32/block
+layout(binding = 1) readonly  buffer QH_ { uint  qh[];   };  // 16 u32/block
+layout(binding = 2) readonly  buffer SC_ { uint  scl[];  };  // 4 u32/block (16 i8)
+layout(binding = 3) readonly  buffer DD_ { float dd[];   };  // 1/block
+layout(binding = 4) readonly  buffer X_  { float x[];    };  // [M,K]
+layout(binding = 5) writeonly buffer O_  { float outp[]; };  // [M,N]
+layout(binding = 6) uniform   P_ { uint n_rows; uint nb; uint gx; uint M; } p;
+const uint MAXM = 8u;
+shared float partial[MAXM][64];
+void main() {
+    uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * p.gx;
+    uint t = gl_LocalInvocationID.x;
+    if (row >= p.n_rows) { for (uint m = 0u; m < MAXM; m++) partial[m][t] = 0.0; return; }
+    uint nwords = p.nb * 16u;            // 16 words/block (8 per half)
+    uint K = p.nb * 256u;                // columns (n_embd)
+    float acc[MAXM];
+    for (uint m = 0u; m < MAXM; m++) acc[m] = 0.0;
+    uint w = t;
+    while (w < nwords) {
+        uint blk_local = w / 16u;
+        uint blk = row * p.nb + blk_local;
+        uint wb = w % 16u; uint hf = wb / 8u; uint wih = wb % 8u;
+        float d = dd[blk];
+        uint ql_base = blk * 32u + hf * 16u;
+        uint qh_base = blk * 16u + hf * 8u;
+        uint sc_base = blk * 4u;
+        uint scoff = hf * 8u;
+        uint ql_a = ql[ql_base + wih];
+        uint ql_b = ql[ql_base + wih + 8u];
+        uint qh_w = qh[qh_base + wih];
+        uint xbase = blk_local * 256u + hf * 128u;
+        uint l0 = wih * 4u;
+        uint is = scoff + (l0 / 16u);
+        float s1 = float(bitfieldExtract(int(scl[sc_base + (is) / 4u]),      int((is) % 4u) * 8, 8));
+        float s2 = float(bitfieldExtract(int(scl[sc_base + (is + 2u) / 4u]), int((is + 2u) % 4u) * 8, 8));
+        float s3 = float(bitfieldExtract(int(scl[sc_base + (is + 4u) / 4u]), int((is + 4u) % 4u) * 8, 8));
+        float s4 = float(bitfieldExtract(int(scl[sc_base + (is + 6u) / 4u]), int((is + 6u) % 4u) * 8, 8));
+        for (uint b = 0u; b < 4u; b++) {
+            uint l = l0 + b;
+            uint qla = (ql_a >> (b * 8u)) & 0xffu;
+            uint qlb = (ql_b >> (b * 8u)) & 0xffu;
+            uint qhb = (qh_w >> (b * 8u)) & 0xffu;
+            float q1 = float(int((qla & 0xfu) | ((qhb & 3u) << 4u)) - 32);
+            float q2 = float(int((qlb & 0xfu) | (((qhb >> 2u) & 3u) << 4u)) - 32);
+            float q3 = float(int((qla >> 4u) | (((qhb >> 4u) & 3u) << 4u)) - 32);
+            float q4 = float(int((qlb >> 4u) | (((qhb >> 6u) & 3u) << 4u)) - 32);
+            float w1 = d * s1 * q1; float w2 = d * s2 * q2; float w3 = d * s3 * q3; float w4 = d * s4 * q4;
+            for (uint m = 0u; m < p.M; m++) {
+                uint xb = m * K + xbase;
+                acc[m] += w1 * x[xb + l] + w2 * x[xb + l + 32u] + w3 * x[xb + l + 64u] + w4 * x[xb + l + 96u];
+            }
+        }
+        w += 64u;
+    }
+    for (uint m = 0u; m < p.M; m++) partial[m][t] = acc[m];
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (t < s) { for (uint m = 0u; m < p.M; m++) partial[m][t] += partial[m][t + s]; }
+        barrier();
+    }
+    if (t == 0u) { for (uint m = 0u; m < p.M; m++) outp[m * p.n_rows + row] = partial[m][0]; }
+}

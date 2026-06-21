@@ -45,6 +45,9 @@ const BSDPA_SPV: &[u8] = include_bytes!("shaders/bsdpa.spv");
 const BSDPA_DECODE_SPV: &[u8] = include_bytes!("shaders/bsdpa_decode.spv");
 const BSILU_SPV: &[u8] = include_bytes!("shaders/bsilu.spv");
 const TO_F16_SPV: &[u8] = include_bytes!("shaders/to_f16.spv");
+const BMV_Q4K_SPV: &[u8] = include_bytes!("shaders/batched_matvec_q4k.spv");
+const BMV_F16_SPV: &[u8] = include_bytes!("shaders/batched_matvec_f16.spv");
+const BMV_Q6K_SPV: &[u8] = include_bytes!("shaders/batched_matvec_q6k.spv");
 
 /// Max prompt length for the raw-Vulkan server fast-lane. Prefill is sequential
 /// (one forward per prompt token) so this is kept modest; batched prefill via
@@ -792,6 +795,7 @@ struct PrefillW {
 }
 
 const PREFILL_MAX_M: usize = 128; // fast-lane prompt cap; M padded to this
+const VERIFY_MAX_M: usize = 8;    // spec-decode verify window cap (matvec MAXM)
 
 // Resources for the batched prefill forward (built once at load).
 type Pipe3 = (ash::vk::Pipeline, ash::vk::PipelineLayout, ash::vk::DescriptorSetLayout);
@@ -799,6 +803,9 @@ struct PrefillRes {
     w: Vec<PrefillW>,
     p_q4: Pipe3, p_f16: Pipe3, p_bn: Pipe3, p_br: Pipe3, p_bs: Pipe3, p_bsi: Pipe3, p_t16: Pipe3,
     p_add: Pipe3, p_q6k: Pipe3, p_bsd: Pipe3,
+    // Small-M weight-stationary matvecs for spec-decode verify (M = draft window).
+    p_bmq4: Pipe3, p_bmf16: Pipe3, p_bmq6: Pipe3,
+    vlogits: ash::vk::Buffer,  // [VERIFY_MAX_M, vocab] batched LM-head logits
     lm_ql: ash::vk::Buffer, lm_qh: ash::vk::Buffer, lm_scl: ash::vk::Buffer, lm_dd: ash::vk::Buffer,
     final_norm: ash::vk::Buffer, logits: ash::vk::Buffer, logits_ptr: *mut u8,
     // scratch (sized for PREFILL_MAX_M rows)
@@ -1157,6 +1164,9 @@ impl VkModel {
         let p_t16 = mkp(TO_F16_SPV, 2, false);
         let p_add = mkp(RESIDUAL_ADD_SPV, 2, false);
         let p_q6k = mkp(DECODE_MATVEC_Q6K_SPV, 6, false);
+        let p_bmq4 = mkp(BMV_Q4K_SPV, 3, false);
+        let p_bmf16 = mkp(BMV_F16_SPV, 3, false);
+        let p_bmq6 = mkp(BMV_Q6K_SPV, 6, false);
         let mm = PREFILL_MAX_M;
         let f16buf = |bufs: &mut Vec<(vk::Buffer, vk::DeviceMemory)>, len: usize| -> vk::Buffer { let (b, m, p) = ctx.uma_buffer((len * 2) as u64).unwrap(); std::ptr::write_bytes(p, 0, len * 2); bufs.push((b, m)); b };
         let (pf_x32, pf_x32_ptr) = vk_zeros(&ctx, &mut bufs, mm * n_embd);
@@ -1170,8 +1180,10 @@ impl VkModel {
         let (pf_cosb, pf_cosb_ptr) = vk_zeros(&ctx, &mut bufs, mm * half);
         let (pf_sinb, pf_sinb_ptr) = vk_zeros(&ctx, &mut bufs, mm * half);
         let (pf_logits, pf_logits_ptr) = vk_zeros(&ctx, &mut bufs, vocab);
+        let (pf_vlogits, _) = vk_zeros(&ctx, &mut bufs, VERIFY_MAX_M * vocab);
         PrefillRes {
-            w: pw, p_q4, p_f16, p_bn, p_br, p_bs, p_bsi, p_t16, p_add, p_q6k, p_bsd,
+            w: pw, p_q4, p_f16, p_bn, p_br, p_bs, p_bsi, p_t16, p_add, p_q6k, p_bsd, p_bmq4, p_bmf16, p_bmq6,
+            vlogits: pf_vlogits,
             lm_ql, lm_qh, lm_scl, lm_dd, final_norm, logits: pf_logits, logits_ptr: pf_logits_ptr,
             x32: pf_x32, x32_ptr: pf_x32_ptr, x16: pf_x16, n32: pf_n32, n16: pf_n16, q: pf_q,
             attn32: pf_attn32, attn16: pf_attn16, gu: pf_gu, h32: pf_h32, h16: pf_h16, o32: pf_o32, ffn32: pf_ffn32,
@@ -1400,15 +1412,13 @@ impl VkModel {
             (self.n_embd, self.n_head, self.n_kv, self.hd, self.n_inter, self.kv_dim, self.half, self.vocab);
         let lm_nb = self.lm_nb;
         let real_m = tokens.len();
-        assert!(real_m >= 1 && real_m <= PREFILL_MAX_M && pos + real_m <= self.max_seq);
-        let m = PREFILL_MAX_M;
-
-        // Inputs: real-token embeddings (pad rows zero), cos/sin for positions pos..
-        std::ptr::write_bytes(pf.x32_ptr, 0, m * n_embd * 4);
+        assert!(real_m >= 1 && real_m <= VERIFY_MAX_M && pos + real_m <= self.max_seq);
+        // Inputs: real-token embeddings + cos/sin for positions pos.. (real_m rows;
+        // no padding — the small-M matvecs and batched ops all run at real_m).
         for (i, &tk) in tokens.iter().enumerate() {
             std::ptr::copy_nonoverlapping(self.embed[tk as usize * n_embd..].as_ptr() as *const u8, pf.x32_ptr.add(i * n_embd * 4), n_embd * 4);
         }
-        for i in 0..m {
+        for i in 0..real_m {
             let p = (pos + i).min(self.max_seq - 1);
             std::ptr::copy_nonoverlapping(self.cos[p * half..].as_ptr() as *const u8, pf.cosb_ptr.add(i * half * 4), half * 4);
             std::ptr::copy_nonoverlapping(self.sin[p * half..].as_ptr() as *const u8, pf.sinb_ptr.add(i * half * 4), half * 4);
@@ -1442,53 +1452,59 @@ impl VkModel {
             dv.cmd_dispatch(cmd, gx, gy, 1);
         };
         let c64 = |x: usize| ((x + 63) / 64) as u32;
+        let rm = real_m as u32;
+        // Weight-stationary matvec: one workgroup per output column (W row); the
+        // dequantized weight is reused across all real_m activation rows. Reads f32
+        // activations directly (no f16 staging). Uniform: [M, N, K, nb/0, gx_grid].
+        let mvq4 = |w: vk::Buffer, x: vk::Buffer, out: vk::Buffer, n: usize, k: usize| {
+            let gx = (n as u32).min(65535);
+            let set = mkset(pf.p_bmq4.2, &[w, x, out], uni5([rm, n as u32, k as u32, (k / 256) as u32, gx]));
+            disp(pf.p_bmq4, set, gx, (n as u32).div_ceil(gx));
+        };
+        let mvf16 = |w: vk::Buffer, x: vk::Buffer, out: vk::Buffer, n: usize, k: usize| {
+            let gx = (n as u32).min(65535);
+            let set = mkset(pf.p_bmf16.2, &[w, x, out], uni5([rm, n as u32, k as u32, 0, gx]));
+            disp(pf.p_bmf16, set, gx, (n as u32).div_ceil(gx));
+        };
         let u_eps = uni([n_embd as u32, self.eps.to_bits(), 0, 0]);
         let kvoff = (pos * kv_dim * 4) as u64;
         let kvsz = (real_m * kv_dim * 4) as u64;
 
         for l in &pf.w {
-            disp(pf.p_bn, mkset(pf.p_bn.2, &[pf.x32, l.attn_norm, pf.n32], u_eps), m as u32, 1); bar();
-            disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.n32, pf.n16], uni([(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
-            // QKV: Q -> pf.q, K -> pf.o32 (scratch), V -> pf.ffn32 (scratch).
-            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.n16, l.wq, pf.q], uni([m as u32, n_embd as u32, n_embd as u32, (n_embd / 256) as u32])), (n_embd / 128) as u32, (m / 128) as u32);
-            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.n16, l.wk, pf.o32], uni([m as u32, kv_dim as u32, n_embd as u32, (n_embd / 256) as u32])), (kv_dim / 128).max(1) as u32, (m / 128) as u32);
-            disp(pf.p_f16, mkset(pf.p_f16.2, &[pf.n16, l.wv_f16, pf.ffn32], uni([m as u32, kv_dim as u32, n_embd as u32, 0])), (kv_dim / 64) as u32, (m / 64) as u32); bar();
+            disp(pf.p_bn, mkset(pf.p_bn.2, &[pf.x32, l.attn_norm, pf.n32], u_eps), rm, 1); bar();
+            // QKV via small-M matvec: Q -> pf.q, K -> pf.o32, V -> pf.ffn32.
+            mvq4(l.wq, pf.n32, pf.q, n_embd, n_embd);
+            mvq4(l.wk, pf.n32, pf.o32, kv_dim, n_embd);
+            mvf16(l.wv_f16, pf.n32, pf.ffn32, kv_dim, n_embd); bar();
             // RoPE q (pf.q), k (pf.o32 scratch).
-            disp(pf.p_br, mkset(pf.p_br.2, &[pf.q, pf.cosb, pf.sinb], uni([n_head as u32, hd as u32, m as u32, 0])), c64(m * n_head * half), 1);
-            disp(pf.p_br, mkset(pf.p_br.2, &[pf.o32, pf.cosb, pf.sinb], uni([n_kv as u32, hd as u32, m as u32, 0])), c64(m * n_kv * half), 1); bar();
+            disp(pf.p_br, mkset(pf.p_br.2, &[pf.q, pf.cosb, pf.sinb], uni([n_head as u32, hd as u32, rm, 0])), c64(real_m * n_head * half), 1);
+            disp(pf.p_br, mkset(pf.p_br.2, &[pf.o32, pf.cosb, pf.sinb], uni([n_kv as u32, hd as u32, rm, 0])), c64(real_m * n_kv * half), 1); bar();
             // Copy the real K/V into the resident cache at position `pos`.
             bar_c2t();
             dv.cmd_copy_buffer(cmd, pf.o32, l.kc, &[vk::BufferCopy::default().size(kvsz).dst_offset(kvoff)]);
             dv.cmd_copy_buffer(cmd, pf.ffn32, l.vc, &[vk::BufferCopy::default().size(kvsz).dst_offset(kvoff)]);
             bar_t2c();
             // Decode SDPA over the resident cache (row i attends 0..=pos+i).
-            disp(pf.p_bsd, mkset(pf.p_bsd.2, &[pf.q, l.kc, l.vc, pf.attn32], uni5([n_head as u32, n_kv as u32, hd as u32, real_m as u32, pos as u32])), c64(real_m * n_head), 1); bar();
+            disp(pf.p_bsd, mkset(pf.p_bsd.2, &[pf.q, l.kc, l.vc, pf.attn32], uni5([n_head as u32, n_kv as u32, hd as u32, rm, pos as u32])), c64(real_m * n_head), 1); bar();
             // Wo + residual.
-            disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.attn32, pf.attn16], uni([(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
-            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.attn16, l.wo, pf.o32], uni([m as u32, n_embd as u32, n_embd as u32, (n_embd / 256) as u32])), (n_embd / 128) as u32, (m / 128) as u32); bar();
-            disp(pf.p_add, mkset(pf.p_add.2, &[pf.x32, pf.o32], uni([(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
+            mvq4(l.wo, pf.attn32, pf.o32, n_embd, n_embd); bar();
+            disp(pf.p_add, mkset(pf.p_add.2, &[pf.x32, pf.o32], uni([(real_m * n_embd) as u32, 0, 0, 0])), c64(real_m * n_embd), 1); bar();
             // FFN.
-            disp(pf.p_bn, mkset(pf.p_bn.2, &[pf.x32, l.ffn_norm, pf.n32], u_eps), m as u32, 1); bar();
-            disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.n32, pf.n16], uni([(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
-            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.n16, l.w13, pf.gu], uni([m as u32, (2 * n_inter) as u32, n_embd as u32, (n_embd / 256) as u32])), ((2 * n_inter) / 128) as u32, (m / 128) as u32); bar();
-            disp(pf.p_bsi, mkset(pf.p_bsi.2, &[pf.gu, pf.h32], uni([n_inter as u32, m as u32, 0, 0])), c64(m * n_inter), 1); bar();
-            disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.h32, pf.h16], uni([(m * n_inter) as u32, 0, 0, 0])), c64(m * n_inter), 1); bar();
-            disp(pf.p_f16, mkset(pf.p_f16.2, &[pf.h16, l.w2_f16, pf.ffn32], uni([m as u32, n_embd as u32, n_inter as u32, 0])), (n_embd / 64) as u32, (m / 64) as u32); bar();
-            disp(pf.p_add, mkset(pf.p_add.2, &[pf.x32, pf.ffn32], uni([(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
+            disp(pf.p_bn, mkset(pf.p_bn.2, &[pf.x32, l.ffn_norm, pf.n32], u_eps), rm, 1); bar();
+            mvq4(l.w13, pf.n32, pf.gu, 2 * n_inter, n_embd); bar();
+            disp(pf.p_bsi, mkset(pf.p_bsi.2, &[pf.gu, pf.h32], uni([n_inter as u32, rm, 0, 0])), c64(real_m * n_inter), 1); bar();
+            mvf16(l.w2_f16, pf.h32, pf.ffn32, n_embd, n_inter); bar();
+            disp(pf.p_add, mkset(pf.p_add.2, &[pf.x32, pf.ffn32], uni([(real_m * n_embd) as u32, 0, 0, 0])), c64(real_m * n_embd), 1); bar();
         }
-        // Final norm; per-position LM head (Q6 matvec) + argmax for each real token.
-        disp(pf.p_bn, mkset(pf.p_bn.2, &[pf.x32, pf.final_norm, pf.n32], u_eps), m as u32, 1); bar();
+        // Final norm; ONE batched Q6 LM head over all real_m rows (weight streamed
+        // once, not real_m times) -> vlogits[real_m, vocab]; then per-row argmax.
+        disp(pf.p_bn, mkset(pf.p_bn.2, &[pf.x32, pf.final_norm, pf.n32], u_eps), rm, 1); bar();
         let gx = (vocab as u32).min(65535);
+        let lm_set = mkset(pf.p_bmq6.2, &[pf.lm_ql, pf.lm_qh, pf.lm_scl, pf.lm_dd, pf.n32, pf.vlogits], uni([vocab as u32, lm_nb as u32, gx, rm]));
+        disp(pf.p_bmq6, lm_set, gx, (vocab as u32).div_ceil(gx)); bar();
         for i in 0..real_m {
-            let n_off = (i * n_embd * 4) as u64;
-            let ulm = uni([vocab as u32, lm_nb as u32, gx, 0]);
-            let lm_set = vk_alloc_set_off(dv, pool, pf.p_q6k.2, &[
-                (pf.lm_ql, 0, vk::WHOLE_SIZE), (pf.lm_qh, 0, vk::WHOLE_SIZE), (pf.lm_scl, 0, vk::WHOLE_SIZE),
-                (pf.lm_dd, 0, vk::WHOLE_SIZE), (pf.n32, n_off, (n_embd * 4) as u64), (pf.logits, 0, vk::WHOLE_SIZE),
-            ], ulm);
-            disp(pf.p_q6k, lm_set, gx, (vocab as u32).div_ceil(gx)); bar();
             let uarg = uni([vocab as u32, 0, 0, 0]);
-            let arg_set = vk_alloc_set_off(dv, pool, self.p_argmax.2, &[(pf.logits, 0, vk::WHOLE_SIZE), (varg, (i * 4) as u64, 4)], uarg);
+            let arg_set = vk_alloc_set_off(dv, pool, self.p_argmax.2, &[(pf.vlogits, (i * vocab * 4) as u64, (vocab * 4) as u64), (varg, (i * 4) as u64, 4)], uarg);
             disp(self.p_argmax, arg_set, 1, 1); bar();
         }
         dv.end_command_buffer(cmd).unwrap();
@@ -1952,17 +1968,23 @@ mod tests {
         eprintln!("VkModel PLD: {} tokens in {forwards} forwards = {:.2} tok/forward, bit-identical ✓", produced.len(), produced.len() as f64 / forwards.max(1) as f64);
         eprintln!("  wall-clock: greedy {g_tps:.0} -> PLD {p_tps:.0} tok/s = {:.2}x (coopmat path)", p_tps / g_tps);
 
-        // Cost probe — why coopmat-PLD loses: verify_forward pays the full 128-row
-        // coopmat tile (BM=128 in coopmat_q4k_gemm.comp) no matter how few rows are
-        // real. PLD only wins when verify_cost < (accepted+1)*greedy_cost. Here
-        // verify(8 tokens) ~= 11 greedy tokens, so even 4 tok/forward can't beat it.
-        // The real lever is a small-M (BM<=32) batched matmul, not allocation/record-once.
+        // Cost probe — coopmat-PLD status. Small-M weight-stationary matvecs replaced
+        // the 128-row coopmat tile (verify_inner now runs at real_m, no padding), which
+        // is why PLD rose 0.58x -> ~0.8x. But the M-scaling below shows the remaining
+        // wall is a ~38ms M-INDEPENDENT fixed cost: verify(1) ~= 6x a greedy token even
+        // though greedy runs the SAME model in ~6.6ms. The gap is structural — greedy is
+        // record-once + fused megakernels, verify is ~110 unfused dispatches re-recorded
+        // every call. PLD wins only when verify_cost < (accepted+1)*greedy_cost (~4
+        // tokens); the fixed ~38ms alone exceeds that, so the next lever is fusing the
+        // verify forward + record-once (match the decode path), not more matvec tuning.
         let vinp = [next, 264, 265, 266, 267, 268, 264, 265];
-        let _ = model.verify_forward(&vinp, prompt.len()); // warm up
         let n = 20;
-        let tv = Instant::now(); for _ in 0..n { let _ = model.verify_forward(&vinp, prompt.len()); } let v_ms = tv.elapsed().as_secs_f64() * 1e3 / n as f64;
         let tg1 = Instant::now(); for i in 0..n { let _ = model.forward_argmax(next, prompt.len() + i % 4); } let g_ms = tg1.elapsed().as_secs_f64() * 1e3 / n as f64;
-        eprintln!("  probe: verify(8)={v_ms:.2}ms  greedy_tok={g_ms:.2}ms  -> verify ~= {:.1} greedy tokens (win needs < accepted+1)", v_ms / g_ms);
+        for mm in [1usize, 2, 4, 8] {
+            let _ = model.verify_forward(&vinp[..mm], prompt.len()); // warm up (builds for this M)
+            let tv = Instant::now(); for _ in 0..n { let _ = model.verify_forward(&vinp[..mm], prompt.len()); } let v_ms = tv.elapsed().as_secs_f64() * 1e3 / n as f64;
+            eprintln!("  probe: verify({mm})={v_ms:.2}ms = {:.1} greedy tokens (greedy_tok={g_ms:.2}ms; win at M needs < accepted+1)", v_ms / g_ms);
+        }
     }
 
     /// greedy decode matches candle CPU token-for-token (the engine the server

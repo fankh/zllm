@@ -1,0 +1,67 @@
+// Small-M weight-stationary Q4_K matvec: C[M,N] = A[M,K] * dequant(W)[N,K].
+// One workgroup (64 threads) per output column (row of W); each weight value is
+// dequantized ONCE and applied to all M activation rows (M<=8 accumulators per
+// thread). This is the spec-decode verify path's GEMM: M is the draft window (~8),
+// so the 128-row coopmat tile would waste 16x the compute — here weight bandwidth
+// (the bound) is streamed once and shared across the M rows. A is f32 (no f16
+// staging needed). Structure mirrors decode_matvec_q4k.comp (M=1) extended to M.
+// Compile: glslangValidator --target-env vulkan1.3 -V batched_matvec_q4k.comp -o batched_matvec_q4k.spv
+#version 450 core
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer WQ { uint  wq[];   };  // Q4_K weights [N,K]
+layout(binding = 1) readonly  buffer X_ { float x[];    };  // activations [M,K]
+layout(binding = 2) writeonly buffer O_ { float outp[]; };  // [M,N]
+layout(binding = 3) uniform   P_ { uint M; uint N; uint K; uint nb; uint gx; } p;
+
+const uint MAXM = 8u;
+shared float partial[MAXM][64];
+
+void main() {
+    uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * p.gx;   // output column n
+    uint t = gl_LocalInvocationID.x;                          // 0..63
+    if (row >= p.N) { for (uint m = 0u; m < MAXM; m++) partial[m][t] = 0.0; return; }
+    float acc[MAXM];
+    for (uint m = 0u; m < MAXM; m++) acc[m] = 0.0;
+    uint total_sub = p.nb * 8u;
+    uint g = t;
+    while (g < total_sub) {
+        uint b = g / 8u; uint sub = g % 8u;
+        uint blk = (row * p.nb + b) * 36u;
+        vec2 dd = unpackHalf2x16(wq[blk]); float d = dd.x; float dmin = dd.y;
+        uint u0 = wq[blk + 1u]; uint u1 = wq[blk + 2u]; uint u2 = wq[blk + 3u];
+        uint u3 = ((u2 >> 4u) & 0x0f0f0f0fu) | (((u1 >> 6u) & 0x03030303u) << 4u);
+        uint uaux = u1 & 0x3f3f3f3fu;
+        u1 = (u2 & 0x0f0f0f0fu) | (((u0 >> 6u) & 0x03030303u) << 4u);
+        u2 = uaux; u0 = u0 & 0x3f3f3f3fu;
+        float sc; float mn;
+        if (sub < 4u) { sc = float((u0 >> (sub * 8u)) & 0xffu); mn = float((u2 >> (sub * 8u)) & 0xffu); }
+        else          { sc = float((u1 >> ((sub - 4u) * 8u)) & 0xffu); mn = float((u3 >> ((sub - 4u) * 8u)) & 0xffu); }
+        uint pair = sub / 2u;
+        bool hi = (sub & 1u) == 1u;
+        uint qs0 = blk + 4u + pair * 8u;
+        uint xb = b * 256u + sub * 32u;
+        float dsc = d * sc; float ddmn = dmin * mn;
+        for (uint w = 0u; w < 8u; w = w + 1u) {
+            uint word = wq[qs0 + w];
+            for (uint bsel = 0u; bsel < 4u; bsel = bsel + 1u) {
+                uint byte = (word >> (bsel * 8u)) & 0xffu;
+                float qf = float(hi ? (byte >> 4u) : (byte & 0x0fu));
+                float wgt = dsc * qf - ddmn;          // dequantized weight value
+                uint xi = xb + w * 4u + bsel;
+                for (uint m = 0u; m < p.M; m++) {
+                    acc[m] += wgt * x[m * p.K + xi];
+                }
+            }
+        }
+        g += 64u;
+    }
+    for (uint m = 0u; m < p.M; m++) partial[m][t] = acc[m];
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (t < s) { for (uint m = 0u; m < p.M; m++) partial[m][t] += partial[m][t + s]; }
+        barrier();
+    }
+    if (t == 0u) { for (uint m = 0u; m < p.M; m++) outp[m * p.N + row] = partial[m][0]; }
+}
