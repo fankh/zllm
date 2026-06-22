@@ -1278,6 +1278,7 @@ impl VkModel {
         let uni = |d: [u32; 4]| -> vk::Buffer {
             let (b, mm, p) = self.ctx.uma_buffer(16).unwrap(); std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, p, 16); ub.borrow_mut().push((b, mm)); b
         };
+        let _t_rec = std::time::Instant::now(); // VK_PFTIME: split CPU record vs GPU exec
         let pool = dv.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets((self.n_layers * 20 + 8) as u32).pool_sizes(&[
             vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count((self.n_layers * 80 + 16) as u32),
             vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count((self.n_layers * 20 + 8) as u32),
@@ -1351,8 +1352,11 @@ impl VkModel {
 
         let fence = dv.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
         let cmds = [cmd];
+        let rec_ms = _t_rec.elapsed().as_secs_f64() * 1e3; // CPU: alloc pool/cmd + record + per-dispatch uniform/set alloc
+        let t_gpu = std::time::Instant::now();
         dv.queue_submit(self.ctx.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence).unwrap();
         dv.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+        if std::env::var("VK_PFTIME").is_ok() { eprintln!("prefill 128-row: CPU-record {rec_ms:.1}ms | GPU-exec {:.1}ms", t_gpu.elapsed().as_secs_f64() * 1e3); }
         let out = std::slice::from_raw_parts(pf.logits_ptr as *const f32, vocab).to_vec();
         dv.destroy_fence(fence, None);
         dv.destroy_command_pool(cmd_pool, None);
