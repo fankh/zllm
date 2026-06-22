@@ -1,0 +1,83 @@
+// Small-M Q4_K coopmat GEMM: C[M,N] = A[M,K] * dequant(W)[N,K], M<=16 (one tile-row).
+// The spec-decode verify GEMM: a 16x128 output tile per workgroup, 8 wave32 subgroups
+// each owning one 16x16 N-fragment. A (16x16) + dequantized W (16x128) are staged in
+// LDS once per K-chunk, so the activation is read once PER TILE — fixing the x-reread
+// explosion of the weight-stationary matvec (which re-read x per output column). Same
+// Q4_K unpack as coopmat_q4k_gemm.comp; A is f16, fp32 accumulate. N mult of 128, K
+// mult of 256. Rows M..15 read A=0 (caller pads/ignores).
+// Compile: glslangValidator --target-env vulkan1.3 -V coopmat_q4k_gemm_m16.comp -o coopmat_q4k_gemm_m16.spv
+#version 450 core
+#extension GL_KHR_cooperative_matrix          : require
+#extension GL_KHR_memory_scope_semantics      : require
+#extension GL_KHR_shader_subgroup_basic       : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#pragma use_vulkan_memory_model
+
+layout(local_size_x = 256) in;   // 8 subgroups of 32 (wave32)
+
+layout(binding = 0) readonly  buffer A_  { float16_t A[];  };  // activations [M,K]
+layout(binding = 1) readonly  buffer WQ_ { uint      wq[]; };  // raw Q4_K weights [N,K]
+layout(binding = 2) writeonly buffer C_  { float     C[];  };  // [M,N]
+layout(binding = 3) uniform   P_ { uint M; uint N; uint K; uint nb; } p;
+
+const uint BM = 16u;
+const uint BN = 128u;
+const uint BK = 16u;
+shared float16_t As[BM * BK];   // 16x16
+shared float16_t Bs[BK * BN];   // 16x128
+shared float dscLDS[BN];
+shared float dmnLDS[BN];
+
+void main() {
+    uint tileN = gl_WorkGroupID.x * BN;
+    uint sg = gl_SubgroupID;       // 0..7 → N-cols [sg*16 ..]
+    uint tid = gl_LocalInvocationID.x;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint k0 = 0u; k0 < p.K; k0 += BK) {
+        uint b = k0 / 256u;
+        uint sub = (k0 / 32u) % 8u;
+        uint lo = k0 % 32u;
+        for (uint i = tid; i < BM * BK; i += 256u) {
+            uint r = i / BK; uint c = i % BK;
+            As[i] = (r < p.M) ? A[r * p.K + k0 + c] : float16_t(0.0);
+        }
+        for (uint i = tid; i < BN; i += 256u) {
+            uint n = tileN + i;
+            uint blk = (n * p.nb + b) * 36u;
+            vec2 dd = unpackHalf2x16(wq[blk]);
+            uint u0 = wq[blk + 1u]; uint u1 = wq[blk + 2u]; uint u2 = wq[blk + 3u];
+            uint u3 = ((u2 >> 4u) & 0x0f0f0f0fu) | (((u1 >> 6u) & 0x03030303u) << 4u);
+            uint uaux = u1 & 0x3f3f3f3fu;
+            u1 = (u2 & 0x0f0f0f0fu) | (((u0 >> 6u) & 0x03030303u) << 4u);
+            u2 = uaux; u0 = u0 & 0x3f3f3f3fu;
+            float scf; float mnf;
+            if (sub < 4u) { scf = float((u0 >> (sub * 8u)) & 0xffu); mnf = float((u2 >> (sub * 8u)) & 0xffu); }
+            else          { scf = float((u1 >> ((sub - 4u) * 8u)) & 0xffu); mnf = float((u3 >> ((sub - 4u) * 8u)) & 0xffu); }
+            dscLDS[i] = dd.x * scf;
+            dmnLDS[i] = dd.y * mnf;
+        }
+        barrier();
+        for (uint i = tid; i < BK * BN; i += 256u) {
+            uint kk = i / BN; uint nn = i % BN;
+            uint blk = ((tileN + nn) * p.nb + b) * 36u;
+            uint local = lo + kk;
+            uint qs0 = blk + 4u + (sub / 2u) * 8u;
+            uint word = wq[qs0 + local / 4u];
+            uint byte = (word >> ((local % 4u) * 8u)) & 0xffu;
+            uint q = ((sub & 1u) == 1u) ? (byte >> 4u) : (byte & 0x0fu);
+            Bs[i] = float16_t(dscLDS[nn] * float(q) - dmnLDS[nn]);
+        }
+        barrier();
+
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> af;
+        coopMatLoad(af, As, 0, BK, gl_CooperativeMatrixLayoutRowMajor);
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bf;
+        coopMatLoad(bf, Bs, sg * 16u, BN, gl_CooperativeMatrixLayoutRowMajor);
+        acc = coopMatMulAdd(af, bf, acc);
+        barrier();
+    }
+    coopMatStore(acc, C, tileN + sg * 16u, p.N, gl_CooperativeMatrixLayoutRowMajor);
+}

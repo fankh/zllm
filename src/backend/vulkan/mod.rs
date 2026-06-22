@@ -14,6 +14,7 @@ use std::ffi::CStr;
 const COOPMAT_MATMUL_SPV: &[u8] = include_bytes!("shaders/coopmat_matmul.spv");
 const COOPMAT_GEMM_SPV: &[u8] = include_bytes!("shaders/coopmat_gemm.spv");
 const COOPMAT_Q4K_GEMM_SPV: &[u8] = include_bytes!("shaders/coopmat_q4k_gemm.spv");
+const COOPMAT_Q4K_GEMM_M16_SPV: &[u8] = include_bytes!("shaders/coopmat_q4k_gemm_m16.spv");
 const DECODE_MATVEC_Q4K_SPV: &[u8] = include_bytes!("shaders/decode_matvec_q4k.spv");
 const DECODE_MATVEC_DOWN_Q4K_SPV: &[u8] = include_bytes!("shaders/decode_matvec_down_q4k.spv");
 const DECODE_MATVEC_Q4K_ROPE_SPV: &[u8] = include_bytes!("shaders/decode_matvec_q4k_rope.spv");
@@ -531,21 +532,28 @@ impl VkContext {
     /// The weight is dequantized into the fp16 LDS tile before the coopmat
     /// multiply. Returns C[M,N] (last run) + total GPU ms over `iters`.
     /// This is the kernel that replaces the wgpu f32 Q4_K GEMM in prefill.
+    /// Small-M (M<=16) Q4_K coopmat GEMM — one 16x128 tile/workgroup, x read once
+    /// per tile (fixes the weight-stationary x-reread). Output buffer holds 16 rows.
+    pub fn coopmat_q4k_gemm_m16(&self, weight_bytes: &[u8], n: usize, nb: usize, x: &[f32], m: usize, iters: u32) -> Result<(Vec<f32>, f64), String> {
+        assert!(m <= 16 && n % 128 == 0 && (nb * 256) % 256 == 0);
+        unsafe { self.coopmat_q4k_gemm_dispatch(weight_bytes, n, nb, x, m, iters, true) }
+    }
     pub fn coopmat_q4k_gemm(&self, weight_bytes: &[u8], n: usize, nb: usize, x: &[f32], m: usize, iters: u32) -> Result<(Vec<f32>, f64), String> {
         let k = nb * 256;
         assert_eq!(weight_bytes.len(), n * nb * 144);
         assert_eq!(x.len(), m * k);
         assert!(m % 128 == 0 && n % 128 == 0, "register-blocked GEMM tile is 128x128");
-        unsafe { self.coopmat_q4k_gemm_inner(weight_bytes, n, nb, x, m, iters) }
+        unsafe { self.coopmat_q4k_gemm_dispatch(weight_bytes, n, nb, x, m, iters, false) }
     }
 
-    unsafe fn coopmat_q4k_gemm_inner(&self, weight_bytes: &[u8], n: usize, nb: usize, x: &[f32], m: usize, iters: u32) -> Result<(Vec<f32>, f64), String> {
+    unsafe fn coopmat_q4k_gemm_dispatch(&self, weight_bytes: &[u8], n: usize, nb: usize, x: &[f32], m: usize, iters: u32, m16: bool) -> Result<(Vec<f32>, f64), String> {
         use std::time::Instant;
         let dev = &self.device;
         let k = nb * 256;
+        let crows = if m16 { 16 } else { m }; // the M16 kernel always writes a 16-row tile
         let (a_buf, a_mem, a_ptr) = self.uma_buffer((m * k * 2) as u64)?;
         let (w_buf, w_mem, w_ptr) = self.uma_buffer(weight_bytes.len() as u64)?;
-        let (c_buf, c_mem, c_ptr) = self.uma_buffer((m * n * 4) as u64)?;
+        let (c_buf, c_mem, c_ptr) = self.uma_buffer((crows * n * 4) as u64)?;
         let (p_buf, p_mem, p_ptr) = self.uma_buffer(16)?;
         let a16: Vec<u16> = x.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect();
         std::ptr::copy_nonoverlapping(a16.as_ptr() as *const u8, a_ptr, m * k * 2);
@@ -553,7 +561,7 @@ impl VkContext {
         let dims = [m as u32, n as u32, k as u32, nb as u32];
         std::ptr::copy_nonoverlapping(dims.as_ptr() as *const u8, p_ptr, 16);
 
-        let spv = ash::util::read_spv(&mut std::io::Cursor::new(COOPMAT_Q4K_GEMM_SPV)).map_err(|e| format!("read_spv: {e}"))?;
+        let spv = ash::util::read_spv(&mut std::io::Cursor::new(if m16 { COOPMAT_Q4K_GEMM_M16_SPV } else { COOPMAT_Q4K_GEMM_SPV })).map_err(|e| format!("read_spv: {e}"))?;
         let module = dev.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spv), None).map_err(|e| format!("module: {e}"))?;
 
         let mut bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..3)
@@ -589,7 +597,7 @@ impl VkContext {
 
         let cmd_pool = dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(self.queue_family), None).map_err(|e| format!("cmdpool: {e}"))?;
         let cmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).map_err(|e| format!("cmdbuf: {e}"))?[0];
-        let gx = (n / 128) as u32; let gy = (m / 128) as u32;
+        let gx = (n / 128) as u32; let gy = if m16 { 1 } else { (m / 128) as u32 };
         dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).map_err(|e| format!("begin: {e}"))?;
         dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
         dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, pipeline_layout, 0, &[set], &[]);
@@ -1751,6 +1759,50 @@ mod tests {
             eprintln!("coopmat Q4_K GEMM M={m:>4} N={n} K={k}: {per:6.3} ms/iter, {gflops:6.0} GFLOP/s");
         }
         eprintln!("  vs wgpu f32 Q4_K GEMM: M=256 2.09ms (~1030 GFLOP/s), M=512 3.74ms (~1150)");
+    }
+
+    /// BM=16 small-M coopmat Q4_K GEMM (spec-decode verify): correctness vs candle +
+    /// bandwidth at M=8. The weight-stationary matvec hit ~27 GB/s (x-reread); this
+    /// tiles so x is read once per 16x128 tile — should approach the ~200 GB/s wall.
+    /// `cargo test --release --features vulkan --lib vk_coopmat_m16 -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_coopmat_q4k_gemm_m16() {
+        use candle_core::{Device, Tensor};
+        use candle_core::quantized::{QTensor, GgmlDType};
+        let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan ({e}); skipping"); return; } };
+        let (n, nb, m) = (2048usize, 8usize, 8usize); // a wq-shaped layer matvec, verify window M=8
+        let k = nb * 256;
+        let mut w = vec![0f32; n * k];
+        for i in 0..w.len() { w[i] = (((i as i64).wrapping_mul(2654435761) & 0xFFFF) as f32 / 32768.0 - 1.0) * 0.5; }
+        let qt = QTensor::quantize(&Tensor::from_vec(w, (n, k), &Device::Cpu).unwrap(), GgmlDType::Q4K).unwrap();
+        let bytes = qt.data().unwrap();
+        let deq: Vec<f32> = qt.dequantize(&Device::Cpu).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let x: Vec<f32> = (0..m * k).map(|i| ((i % 31) as f32 - 15.0) * 0.02).collect();
+        let (gpu, _) = ctx.coopmat_q4k_gemm_m16(&bytes, n, nb, &x, m, 1).expect("m16 gemm");
+        let (mut dot, mut ng, mut nc) = (0f64, 0f64, 0f64);
+        for mm in 0..m { for nn in 0..n {
+            let mut acc = 0f64;
+            for kk in 0..k { acc += (x[mm * k + kk] as f64) * (deq[nn * k + kk] as f64); }
+            let g = gpu[mm * n + nn] as f64;
+            dot += g * acc; ng += g * g; nc += acc * acc;
+        } }
+        let cos = dot / (ng.sqrt() * nc.sqrt());
+        eprintln!("BM=16 coopmat Q4_K GEMM (M={m}) vs candle: cosine = {cos:.5}");
+        assert!(cos > 0.99, "BM=16 GEMM wrong: cosine {cos}");
+        // Bandwidth sweep over N (utilization scales with N/128 workgroups).
+        for &nn in &[2048usize, 16384, 65536] {
+            let mut w = vec![0f32; nn * k];
+            for i in 0..w.len() { w[i] = (((i as i64).wrapping_mul(2654435761) & 0xFFFF) as f32 / 32768.0 - 1.0) * 0.5; }
+            let b = QTensor::quantize(&Tensor::from_vec(w, (nn, k), &Device::Cpu).unwrap(), GgmlDType::Q4K).unwrap().data().unwrap().to_vec();
+            let _ = ctx.coopmat_q4k_gemm_m16(&b, nn, nb, &x, m, 4).expect("warm");
+            let iters = 100u32;
+            let (_, ms) = ctx.coopmat_q4k_gemm_m16(&b, nn, nb, &x, m, iters).expect("bench");
+            let per = ms / iters as f64;
+            let gbs = (nn * nb * 144) as f64 / (per / 1e3) / 1e9;
+            eprintln!("  N={nn:>6} ({} workgroups): {per:.3} ms/iter, {gbs:.1} GB/s", nn / 128);
+        }
+        eprintln!("  (weight-stationary matvec was ~27 GB/s; M=1 decode kernel ~208)");
     }
 
     /// END-TO-END PROJECTION: measure the coopmat Q4_K GEMM time for a full
