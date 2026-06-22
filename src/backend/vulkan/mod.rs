@@ -44,6 +44,7 @@ const BNORM_SPV: &[u8] = include_bytes!("shaders/bnorm.spv");
 const BROPE_SPV: &[u8] = include_bytes!("shaders/brope.spv");
 const BSDPA_SPV: &[u8] = include_bytes!("shaders/bsdpa.spv");
 const BSDPA_DECODE_SPV: &[u8] = include_bytes!("shaders/bsdpa_decode.spv");
+const BSDPA_SLOT_SPV: &[u8] = include_bytes!("shaders/bsdpa_slot.spv");
 const BSILU_SPV: &[u8] = include_bytes!("shaders/bsilu.spv");
 const TO_F16_SPV: &[u8] = include_bytes!("shaders/to_f16.spv");
 const BMV_Q4K_SPV: &[u8] = include_bytes!("shaders/batched_matvec_q4k.spv");
@@ -2111,6 +2112,73 @@ mod tests {
         let agree = vk_gen.iter().zip(&cand_gen).take_while(|(a, b)| a == b).count();
         eprintln!("VkModel/candle agree on first {agree}/{n_gen} tokens");
         assert!(agree >= 8, "VkModel diverges from candle too early ({agree}); kernel/wiring bug");
+    }
+
+    /// SLOT-INDIRECTED DECODE SDPA (step 2 of the coopmat batched decoder): each of
+    /// the m query rows attends its OWN KV slot at its OWN position. Validated against
+    /// a CPU softmax-attention reference.
+    /// `cargo test --release --features vulkan --lib vk_bsdpa_slot -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_bsdpa_slot_correctness() {
+        use ash::vk;
+        let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan ({e}); skipping"); return; } };
+        let dev = &ctx.device;
+        let (n_head, n_kv, hd) = (32usize, 8usize, 64usize);
+        let (m_rows, n_slots, max_seq) = (4usize, 4usize, 48usize);
+        let attn_dim = n_head * hd; // 2048
+        let kv_dim = n_kv * hd;     // 512
+        let q: Vec<f32> = (0..m_rows * attn_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+        let kc: Vec<f32> = (0..n_slots * max_seq * kv_dim).map(|i| ((i % 13) as f32 - 6.0) * 0.04).collect();
+        let vc: Vec<f32> = (0..n_slots * max_seq * kv_dim).map(|i| ((i % 11) as f32 - 5.0) * 0.03).collect();
+        let sp: Vec<u32> = vec![0, 5, 1, 12, 2, 20, 3, 30]; // (slot, pos) per row
+        // CPU reference.
+        let mut cpu = vec![0f32; m_rows * attn_dim];
+        let scale = 1.0 / (hd as f32).sqrt();
+        for m in 0..m_rows {
+            let (slot, pos) = (sp[m * 2] as usize, sp[m * 2 + 1] as usize);
+            for h in 0..n_head {
+                let kvh = h / (n_head / n_kv);
+                let qb = m * attn_dim + h * hd;
+                let mut sc = vec![0f32; pos + 1];
+                for t in 0..=pos { let kb = (slot * max_seq + t) * kv_dim + kvh * hd;
+                    let mut s = 0.0; for d in 0..hd { s += q[qb + d] * kc[kb + d]; } sc[t] = s * scale; }
+                let mx = sc.iter().cloned().fold(f32::MIN, f32::max);
+                let mut sum = 0.0; for s in sc.iter_mut() { *s = (*s - mx).exp(); sum += *s; }
+                for d in 0..hd { let mut a = 0.0; for t in 0..=pos { let kb = (slot * max_seq + t) * kv_dim + kvh * hd; a += sc[t] * vc[kb + d]; } cpu[qb + d] = a / sum; }
+            }
+        }
+        // GPU.
+        unsafe {
+            let mut bufs: Vec<(vk::Buffer, vk::DeviceMemory)> = Vec::new();
+            let upf = |bufs: &mut Vec<_>, d: &[f32]| { let (b, mm, p) = ctx.uma_buffer((d.len() * 4) as u64).unwrap(); std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, p, d.len() * 4); bufs.push((b, mm)); b };
+            let qb_ = upf(&mut bufs, &q); let kcb = upf(&mut bufs, &kc); let vcb = upf(&mut bufs, &vc);
+            let (ob, om, op) = ctx.uma_buffer((m_rows * attn_dim * 4) as u64).unwrap(); bufs.push((ob, om));
+            let (spb, sm, spp) = ctx.uma_buffer((sp.len() * 4) as u64).unwrap(); std::ptr::copy_nonoverlapping(sp.as_ptr() as *const u8, spp, sp.len() * 4); bufs.push((spb, sm));
+            let (ub, um, up) = ctx.uma_buffer(20).unwrap(); std::ptr::copy_nonoverlapping([n_head as u32, n_kv as u32, hd as u32, m_rows as u32, max_seq as u32].as_ptr() as *const u8, up, 20); bufs.push((ub, um));
+            let (p, l, sl, module) = ctx.make_pipeline_raw(BSDPA_SLOT_SPV, 5);
+            let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&[
+                vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(5),
+                vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(1)]), None).unwrap();
+            let set = vk_alloc_set(dev, pool, sl, &[qb_, kcb, vcb, ob, spb], ub);
+            let cmd_pool = dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family), None).unwrap();
+            let cmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).unwrap()[0];
+            dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+            dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p);
+            dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, l, 0, &[set], &[]);
+            dev.cmd_dispatch(cmd, ((m_rows * n_head) as u32).div_ceil(64), 1, 1);
+            dev.end_command_buffer(cmd).unwrap();
+            let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+            dev.queue_submit(ctx.queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence).unwrap();
+            dev.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+            let gpu = std::slice::from_raw_parts(op as *const f32, m_rows * attn_dim);
+            let max_err = cpu.iter().zip(gpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            eprintln!("bsdpa_slot vs CPU softmax-attention: max_abs_err = {max_err:.2e} over {} streams (slots {:?})", m_rows, sp);
+            assert!(max_err < 1e-4, "bsdpa_slot wrong: max_err {max_err}");
+            dev.destroy_fence(fence, None); dev.destroy_command_pool(cmd_pool, None); dev.destroy_descriptor_pool(pool, None);
+            dev.destroy_pipeline(p, None); dev.destroy_pipeline_layout(l, None); dev.destroy_descriptor_set_layout(sl, None); dev.destroy_shader_module(module, None);
+            for (b, mm) in bufs { dev.unmap_memory(mm); dev.destroy_buffer(b, None); dev.free_memory(mm, None); }
+        }
     }
 
     /// COOPMAT BATCHED-FORWARD THROUGHPUT PROBE: the batched coopmat forward is

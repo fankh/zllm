@@ -1,0 +1,38 @@
+// Slot-indirected batched-DECODE SDPA: each of the m query rows belongs to its own
+// stream with its own KV slot and position. Row r reads sp[2r]=slot, sp[2r+1]=pos and
+// attends that slot's resident KV cache 0..=pos. Generalizes bsdpa_decode (one slot,
+// staggered positions) to M independent streams — the SDPA for a coopmat batched
+// SERVING decoder. KV cache is [n_slots, max_seq, n_kv*hd] (slot s at s*max_seq).
+// Compile: glslangValidator --target-env vulkan1.3 -V bsdpa_slot.comp -o bsdpa_slot.spv
+#version 450 core
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly  buffer Q_  { float q[];    };  // [m, n_head*hd]
+layout(binding = 1) readonly  buffer KC_ { float kc[];   };  // [n_slots, max_seq, n_kv*hd]
+layout(binding = 2) readonly  buffer VC_ { float vc[];   };
+layout(binding = 3) writeonly buffer O_  { float outp[]; };  // [m, n_head*hd]
+layout(binding = 4) readonly  buffer SP_ { uint  sp[];   };  // [m*2]: (slot, pos) per row
+layout(binding = 5) uniform   P_ { uint n_head; uint n_kv; uint hd; uint m_rows; uint max_seq; } p;
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.m_rows * p.n_head) { return; }
+    uint m = idx / p.n_head; uint h = idx % p.n_head;
+    uint hd = p.hd; uint kvh = h / (p.n_head / p.n_kv);
+    uint slot = sp[m * 2u]; uint pos = sp[m * 2u + 1u];
+    uint seq_len = pos + 1u;                       // attends 0..=pos in this slot
+    uint slot_base = slot * p.max_seq * (p.n_kv * hd);
+    float scale = 1.0 / sqrt(float(hd));
+    uint qb = m * (p.n_head * hd) + h * hd;
+    float av[128]; for (uint d = 0u; d < hd; d++) { av[d] = 0.0; }
+    float mx = -1e30; float l = 0.0;
+    for (uint t = 0u; t < seq_len; t++) {
+        uint kb = slot_base + (t * p.n_kv + kvh) * hd;
+        float s = 0.0; for (uint d = 0u; d < hd; d++) { s += q[qb + d] * kc[kb + d]; }
+        s *= scale;
+        float mn = max(mx, s); float corr = exp(mx - mn); float pe = exp(s - mn);
+        l = l * corr + pe;
+        for (uint d = 0u; d < hd; d++) { av[d] = av[d] * corr + pe * vc[kb + d]; }
+        mx = mn;
+    }
+    float inv = 1.0 / l;
+    for (uint d = 0u; d < hd; d++) { outp[qb + d] = av[d] * inv; }
+}
