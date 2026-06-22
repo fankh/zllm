@@ -2081,6 +2081,70 @@ mod tests {
         assert!(agree >= 8, "VkModel diverges from candle too early ({agree}); kernel/wiring bug");
     }
 
+    /// HETEROGENEOUS SERVING PROBE: decode on the iGPU (VkModel) and the CPU
+    /// (candle) ALONE, then BOTH concurrently, to test whether the shared memory
+    /// bus has headroom (iGPU decode ~136 GB/s of 256 → ~53%). If aggregate-
+    /// concurrent > iGPU-alone, routing some streams to the idle CPU adds real
+    /// serving throughput. If they contend badly, the strategy is dead.
+    /// `cargo test --release --features vulkan --lib vk_cpu_concurrent -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_cpu_concurrent_serving() {
+        use std::time::{Duration, Instant};
+        use std::thread;
+        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() { eprintln!("model not found; skipping"); return; }
+        let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan ({e}); skipping"); return; } };
+        let vk = VkModel::load(path, ctx).expect("vk load");
+        use crate::backend::candle::backend::CandleCpuBackend;
+        use crate::backend::traits::{Backend, QuantConfig};
+        let mut cb = CandleCpuBackend::new();
+        cb.load_model(std::path::Path::new(path), &QuantConfig { method: "gguf".into(), bits: 4 }).expect("candle load");
+        let am = |v: &[f32]| -> u32 { let mut bi = 0u32; let mut bv = f32::MIN; for (i, &x) in v.iter().enumerate() { if x > bv { bv = x; bi = i as u32; } } bi };
+
+        // Prime both engines (short prompt; we only measure decode rate).
+        let prompt: Vec<u32> = vec![128000, 791, 6864, 315, 9822, 374];
+        let mut vk_next = 0u32; for (i, &t) in prompt.iter().enumerate() { vk_next = vk.forward_argmax(t, i); }
+        let mut vk_pos = prompt.len();
+        let mut cb_next = am(&cb.forward_logits(&prompt).unwrap());
+
+        // Decode loops run for a fixed wall-clock window so concurrency overlaps fully.
+        fn dec_vk(m: &VkModel, mut next: u32, mut pos: usize, dur: Duration) -> (usize, u32, usize) {
+            let t = Instant::now(); let mut n = 0usize;
+            while t.elapsed() < dur { next = m.forward_argmax(next, pos); pos += 1; n += 1; }
+            (n, next, pos)
+        }
+        fn dec_cb(m: &mut CandleCpuBackend, mut next: u32, dur: Duration) -> (usize, u32) {
+            use crate::backend::traits::Backend;
+            let am = |v: &[f32]| -> u32 { let mut bi = 0u32; let mut bv = f32::MIN; for (i, &x) in v.iter().enumerate() { if x > bv { bv = x; bi = i as u32; } } bi };
+            let t = Instant::now(); let mut n = 0usize;
+            while t.elapsed() < dur { next = am(&m.forward_logits(&[next]).unwrap()); n += 1; }
+            (n, next)
+        }
+        let dur = Duration::from_secs(3);
+
+        // 1. iGPU alone.
+        let (a_vk, vn, vp) = dec_vk(&vk, vk_next, vk_pos, dur); vk_next = vn; vk_pos = vp;
+        let vk_alone = a_vk as f64 / dur.as_secs_f64();
+        // 2. CPU alone.
+        let (a_cb, cn) = dec_cb(&mut cb, cb_next, dur); cb_next = cn;
+        let cpu_alone = a_cb as f64 / dur.as_secs_f64();
+        // 3. Both concurrently (separate threads → real shared-bus contention).
+        let h_vk = thread::spawn(move || dec_vk(&vk, vk_next, vk_pos, dur));
+        let h_cb = thread::spawn(move || dec_cb(&mut cb, cb_next, dur));
+        let (c_vk, _, _) = h_vk.join().unwrap();
+        let (c_cb, _) = h_cb.join().unwrap();
+        let vk_conc = c_vk as f64 / dur.as_secs_f64();
+        let cpu_conc = c_cb as f64 / dur.as_secs_f64();
+
+        eprintln!("ALONE:       iGPU {vk_alone:.0} tok/s | CPU {cpu_alone:.0} tok/s");
+        eprintln!("CONCURRENT:  iGPU {vk_conc:.0} tok/s | CPU {cpu_conc:.0} tok/s  (iGPU kept {:.0}%, CPU kept {:.0}%)",
+            vk_conc / vk_alone * 100.0, cpu_conc / cpu_alone * 100.0);
+        let agg = vk_conc + cpu_conc;
+        eprintln!("VERDICT: heterogeneous aggregate {agg:.0} tok/s  vs iGPU-alone {vk_alone:.0}  =  {:.2}x  ({})",
+            agg / vk_alone, if agg > vk_alone * 1.05 { "WIN — bus has headroom, CPU adds throughput" } else { "no win — bus contention cancels it out" });
+    }
+
     /// BATCHED PREFILL vs candle: prefill a multi-token prompt through the GEMM
     /// path, check the last-token logits (cosine + argmax) match candle, then a
     /// few decode steps continue correctly from pos=M. Validates the whole
