@@ -3550,6 +3550,55 @@ impl<'a> ContinuousBatcher<'a> {
         out
     }
 
+    /// Like `step()` but with prompt-lookup speculative decode IN the batch: every
+    /// active sequence proposes an n-gram draft (from its own history), all drafts
+    /// concatenate into ONE `step_slotted` forward (each row attends its sequence's
+    /// slot at its position), and each sequence commits the tokens its own argmax
+    /// agrees with. >1 token/stream/forward on echo-heavy workloads. GREEDY only —
+    /// the verify is argmax, so output is bit-identical to `step()`; sequences with
+    /// `temp>0` would diverge from sampling, so route those through `step()` instead.
+    /// Assumes the full KV pool (a draft writes up to `draft_k+1` positions/step).
+    pub fn step_pld(&mut self, lookup_len: usize, draft_k: usize) -> Vec<(u64, u32, bool)> {
+        let mut out = Vec::new();
+        if !self.active.is_empty() {
+            self.make_room();
+            let (mut rows, mut positions, mut slots) = (Vec::new(), Vec::new(), Vec::new());
+            let mut layout: Vec<(usize, usize, Vec<u32>)> = Vec::new(); // (active_idx, start, draft)
+            for (i, s) in self.active.iter().enumerate() {
+                let k = draft_k.min(s.max_tokens.saturating_sub(s.gen_index()));
+                let draft = if k >= 1 {
+                    crate::engine::spec_decode::lookup_draft_best(&s.tokens, &s.tokens, lookup_len, k).unwrap_or_default()
+                } else { Vec::new() };
+                let start = rows.len();
+                rows.push(s.next()); rows.extend_from_slice(&draft);
+                let p0 = s.pos();
+                for j in 0..=draft.len() { positions.push(p0 + j as u32); slots.push(s.slot); }
+                layout.push((i, start, draft));
+            }
+            let outs = self.dec.step_slotted(&rows, &positions, &slots);
+            for (i, start, draft) in &layout {
+                let so = &outs[*start..*start + 1 + draft.len()];
+                let mut acc = 0usize; while acc < draft.len() && so[acc] == draft[acc] { acc += 1; }
+                let s = &mut self.active[*i];
+                for &tok in so.iter().take(acc + 1) {
+                    s.tokens.push(tok);
+                    let done = tok == s.eos || s.gen_index() >= s.max_tokens;
+                    out.push((s.id, tok, done));
+                    if done { break; }
+                }
+            }
+            let (free, dec) = (&mut self.free, &self.dec);
+            self.active.retain(|s| {
+                let done = s.next() == s.eos || s.gen_index() >= s.max_tokens;
+                if done { dec.free_slot(s.slot); free.push(s.slot); }
+                !done
+            });
+        }
+        self.advance_prefill(&mut out);
+        self.reschedule(&mut out);
+        out
+    }
+
     /// Preempt the most-recently-admitted active sequence (LIFO), queuing it for
     /// recompute. Returns false if there are no active sequences.
     fn preempt_last_active(&mut self) -> bool {
@@ -5273,6 +5322,40 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let toks = produced.len();
         eprintln!("PLD: {toks} tokens in {forwards} forwards = {:.2} tokens/forward; output bit-identical to greedy ✓", toks as f64 / forwards.max(1) as f64);
         eprintln!("  wall-clock: greedy {g_tps:.0} tok/s -> PLD {p_tps:.0} tok/s = {:.2}x faster (same wgpu kernels)", p_tps / g_tps);
+    }
+
+    /// ContinuousBatcher::step_pld productized: drive the real batcher with batched
+    /// spec-decode and confirm bit-identical output to plain step() in fewer forwards.
+    /// `cargo test --release --features gpu --lib gpu_cb_pld -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gpu_cb_pld() {
+        use std::collections::HashMap;
+        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() { eprintln!("model not found; skipping"); return; }
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU: {e}"); return; } };
+        let model = GpuModel::load(path, ctx).expect("load");
+        let (ms, max_new, eos) = (8usize, 40usize, u32::MAX);
+        let mut prompt = vec![128000u32]; for _ in 0..10 { prompt.extend_from_slice(&[264, 265, 266, 267, 268]); }
+        let run = |pld: bool| -> (HashMap<u64, Vec<u32>>, usize) {
+            let mut cb = ContinuousBatcher::new(&model, ms * 8, 512);
+            let mut got: HashMap<u64, Vec<u32>> = HashMap::new();
+            for s in 0..ms { let (t, _) = cb.admit(s as u64, &prompt, max_new, eos).unwrap(); got.entry(s as u64).or_default().push(t); }
+            let mut steps = 0usize;
+            while cb.active_len() > 0 {
+                let res = if pld { cb.step_pld(3, 7) } else { cb.step() };
+                for (id, t, _) in res { got.get_mut(&id).unwrap().push(t); }
+                steps += 1;
+            }
+            (got, steps)
+        };
+        let (ref_out, ref_steps) = run(false);
+        let (pld_out, pld_steps) = run(true);
+        let mut ok = true;
+        for s in 0..ms { if pld_out[&(s as u64)] != ref_out[&(s as u64)] { ok = false; } }
+        eprintln!("CB step_pld: {ms} streams x {} tok, {pld_steps} forwards vs plain step() {ref_steps} ({:.1}x fewer), bit-identical {}",
+            ref_out[&0].len(), ref_steps as f64 / pld_steps as f64, if ok { "✓" } else { "✗ DIVERGED" });
+        assert!(ok, "step_pld diverged from step()");
     }
 
     /// BATCHED PLD: speculative decode INSIDE the continuous batch — every stream
