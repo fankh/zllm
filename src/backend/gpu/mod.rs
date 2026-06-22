@@ -5275,6 +5275,71 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         eprintln!("  wall-clock: greedy {g_tps:.0} tok/s -> PLD {p_tps:.0} tok/s = {:.2}x faster (same wgpu kernels)", p_tps / g_tps);
     }
 
+    /// BATCHED PLD: speculative decode INSIDE the continuous batch — every stream
+    /// proposes an n-gram draft, all drafts verify in ONE batched forward (step_slotted
+    /// over each stream's slot), accept per stream. The serving frontier llama-server
+    /// doesn't do. Bit-identical to per-stream greedy; >1 tok/forward/stream on echo text.
+    /// `cargo test --release --features gpu --lib gpu_batched_pld -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gpu_batched_pld() {
+        use std::time::Instant;
+        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() { eprintln!("model not found; skipping"); return; }
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU: {e}"); return; } };
+        let model = GpuModel::load(path, ctx).expect("load");
+        let (ms, draft_k, lookup, max_new, eos) = (8usize, 7usize, 3usize, 48usize, u32::MAX);
+        let mut prompt = vec![128000u32]; for _ in 0..10 { prompt.extend_from_slice(&[264, 265, 266, 267, 268]); }
+
+        // Single-stream greedy reference (model's own resident KV).
+        let mut gn = 0u32; for (i, &t) in prompt.iter().enumerate() { gn = model.forward_argmax(t, i); }
+        let mut greedy = vec![gn]; let mut gp = prompt.len();
+        while greedy.len() < max_new && gn != eos { gn = model.forward_argmax(gn, gp); greedy.push(gn); gp += 1; }
+
+        // Batched PLD over `ms` identical streams (each its own slot).
+        let dec = model.batched_decoder(ms * (draft_k + 1), 512);
+        let mut hist = vec![prompt.clone(); ms];
+        let mut next = vec![0u32; ms]; let mut pos = vec![prompt.len(); ms];
+        let mut produced: Vec<Vec<u32>> = vec![Vec::new(); ms];
+        for s in 0..ms { let n = dec.prefill_slot(&prompt, s as u32); next[s] = n; hist[s].push(n); produced[s].push(n); }
+        let mut done = vec![false; ms];
+        let mut forwards = 0usize;
+        let t0 = Instant::now();
+        while !done.iter().all(|&d| d) {
+            let (mut rows, mut positions, mut slots) = (Vec::new(), Vec::new(), Vec::new());
+            let mut layout: Vec<(usize, usize, Vec<u32>)> = Vec::new(); // (stream, start, draft)
+            for s in 0..ms {
+                if done[s] { continue; }
+                let k = draft_k.min(max_new - produced[s].len());
+                let draft = crate::engine::spec_decode::lookup_draft_best(&hist[s], &hist[s], lookup, k).unwrap_or_default();
+                let start = rows.len();
+                rows.push(next[s]); rows.extend_from_slice(&draft);
+                for i in 0..=draft.len() { positions.push((pos[s] + i) as u32); slots.push(s as u32); }
+                layout.push((s, start, draft));
+            }
+            if rows.is_empty() { break; }
+            let outs = dec.step_slotted(&rows, &positions, &slots);
+            forwards += 1;
+            for (s, start, draft) in &layout {
+                let so = &outs[*start..*start + 1 + draft.len()];
+                let mut acc = 0usize; while acc < draft.len() && so[acc] == draft[acc] { acc += 1; }
+                for &tok in so.iter().take(acc + 1) {
+                    produced[*s].push(tok); hist[*s].push(tok); next[*s] = tok;
+                    if tok == eos || produced[*s].len() >= max_new { done[*s] = true; break; }
+                }
+                pos[*s] += acc + 1;
+            }
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        let total: usize = produced.iter().map(|p| p.len()).sum();
+        let mut bit_ok = true;
+        for s in 0..ms { let n = greedy.len().min(produced[s].len()); if produced[s][..n] != greedy[..n] { bit_ok = false; } }
+        eprintln!("batched PLD: {ms} streams x {} tok, {forwards} forwards = {:.2} tok/forward, bit-identical-to-greedy {}",
+            produced[0].len(), total as f64 / forwards as f64, if bit_ok { "✓" } else { "✗ DIVERGED" });
+        eprintln!("  aggregate {:.0} tok/s on echo text  (plain batched M=8 was ~104; llama batched M=8 = 710)", total as f64 / dt);
+        assert!(bit_ok, "batched PLD diverged from per-stream greedy");
+    }
+
     /// HETEROGENEOUS BATCHED: iGPU in BATCHED mode is compute-bound (~11 GB/s, ~4%
     /// of the bus) — unlike single-stream (bandwidth-bound). So the CPU should add
     /// throughput from the idle bandwidth here even though it couldn't single-stream.
