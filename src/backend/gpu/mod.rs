@@ -5275,6 +5275,57 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         eprintln!("  wall-clock: greedy {g_tps:.0} tok/s -> PLD {p_tps:.0} tok/s = {:.2}x faster (same wgpu kernels)", p_tps / g_tps);
     }
 
+    /// HETEROGENEOUS BATCHED: iGPU in BATCHED mode is compute-bound (~11 GB/s, ~4%
+    /// of the bus) — unlike single-stream (bandwidth-bound). So the CPU should add
+    /// throughput from the idle bandwidth here even though it couldn't single-stream.
+    /// `cargo test --release --features gpu --lib gpu_cpu_heterogeneous -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gpu_cpu_heterogeneous_batched() {
+        use std::time::{Duration, Instant};
+        use std::thread;
+        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() { eprintln!("model not found; skipping"); return; }
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU: {e}"); return; } };
+        let model = GpuModel::load(path, ctx).expect("load");
+        use crate::backend::candle::backend::CandleCpuBackend;
+        use crate::backend::traits::{Backend, QuantConfig};
+        let mut cb = CandleCpuBackend::new();
+        cb.load_model(std::path::Path::new(path), &QuantConfig { method: "gguf".into(), bits: 4 }).expect("candle load");
+        let am = |v: &[f32]| -> u32 { let mut bi = 0u32; let mut bv = f32::MIN; for (i, &x) in v.iter().enumerate() { if x > bv { bv = x; bi = i as u32; } } bi };
+        let m = 8usize;
+        let dec = model.batched_decoder(m, 1024);
+        let mut bt = vec![128000u32; m]; let mut bp = vec![0u32; m];
+        let mut cn = am(&cb.forward_logits(&[128000]).unwrap());
+        let batched = |dec: &BatchedDecoder, mut bt: Vec<u32>, mut bp: Vec<u32>, dur: Duration| -> (usize, Vec<u32>, Vec<u32>) {
+            let t = Instant::now(); let mut n = 0usize;
+            while t.elapsed() < dur { let nx = dec.step(&bt, &bp); n += nx.len(); bt = nx; for p in bp.iter_mut() { *p += 1; } }
+            (n, bt, bp)
+        };
+        fn cpu(mut mdl: CandleCpuBackend, mut next: u32, dur: Duration) -> (usize, CandleCpuBackend, u32) {
+            use crate::backend::traits::Backend;
+            let am = |v: &[f32]| -> u32 { let mut bi = 0u32; let mut bv = f32::MIN; for (i, &x) in v.iter().enumerate() { if x > bv { bv = x; bi = i as u32; } } bi };
+            let t = Instant::now(); let mut n = 0usize;
+            while t.elapsed() < dur { next = am(&mdl.forward_logits(&[next]).unwrap()); n += 1; }
+            (n, mdl, next)
+        }
+        let dur = Duration::from_secs(3);
+        let (b_alone, bt2, bp2) = batched(&dec, bt, bp, dur); bt = bt2; bp = bp2;
+        let bps_alone = b_alone as f64 / dur.as_secs_f64();
+        let (c_alone, cb2, cn2) = cpu(cb, cn, dur); cb = cb2; cn = cn2;
+        let cps_alone = c_alone as f64 / dur.as_secs_f64();
+        let h = thread::spawn(move || cpu(cb, cn, dur));
+        let (b_conc, _, _) = batched(&dec, bt, bp, dur);
+        let (c_conc, _, _) = h.join().unwrap();
+        let bps_conc = b_conc as f64 / dur.as_secs_f64();
+        let cps_conc = c_conc as f64 / dur.as_secs_f64();
+        eprintln!("ALONE:       iGPU-batched(M={m}) {bps_alone:.0} tok/s | CPU {cps_alone:.0} tok/s");
+        eprintln!("CONCURRENT:  iGPU-batched {bps_conc:.0} ({:.0}%) | CPU {cps_conc:.0} ({:.0}%)", bps_conc / bps_alone * 100.0, cps_conc / cps_alone * 100.0);
+        let agg = bps_conc + cps_conc;
+        eprintln!("VERDICT: aggregate {agg:.0} vs iGPU-batched-alone {bps_alone:.0} = {:.2}x ({})",
+            agg / bps_alone, if agg > bps_alone * 1.05 { "WIN — batched iGPU leaves bus headroom for CPU" } else { "no win" });
+    }
+
     #[test]
     #[ignore]
     fn gpu_batched_decode_throughput() {
