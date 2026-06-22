@@ -1,0 +1,19 @@
+// Slot-indirected KV write: each of the m rows (streams) writes its new roped K (or V)
+// vector into its own slot of the resident cache at its own position. Row r reads
+// sp[2r]=slot, sp[2r+1]=pos and writes dst[(slot*max_seq + pos)*kv_dim + i] = src[r*kv_dim + i].
+// Cache layout [n_slots, max_seq, kv_dim]. The decode counterpart of kv_write, for the
+// coopmat batched serving decoder (companion to bsdpa_slot).
+// Compile: glslangValidator --target-env vulkan1.3 -V kvwrite_slot.comp -o kvwrite_slot.spv
+#version 450 core
+layout(local_size_x = 64) in;
+layout(binding = 0)          buffer DST_ { float dst[]; };   // [n_slots, max_seq, kv_dim]
+layout(binding = 1) readonly buffer SRC_ { float src[]; };   // [m, kv_dim]
+layout(binding = 2) readonly buffer SP_  { uint  sp[];  };   // [m*2]: (slot, pos)
+layout(binding = 3) uniform  P_ { uint kv_dim; uint max_seq; uint m_rows; uint pad; } p;
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.m_rows * p.kv_dim) { return; }
+    uint r = idx / p.kv_dim; uint i = idx % p.kv_dim;
+    uint slot = sp[r * 2u]; uint pos = sp[r * 2u + 1u];
+    dst[(slot * p.max_seq + pos) * p.kv_dim + i] = src[r * p.kv_dim + i];
+}

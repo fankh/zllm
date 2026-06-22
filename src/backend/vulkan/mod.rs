@@ -45,6 +45,7 @@ const BROPE_SPV: &[u8] = include_bytes!("shaders/brope.spv");
 const BSDPA_SPV: &[u8] = include_bytes!("shaders/bsdpa.spv");
 const BSDPA_DECODE_SPV: &[u8] = include_bytes!("shaders/bsdpa_decode.spv");
 const BSDPA_SLOT_SPV: &[u8] = include_bytes!("shaders/bsdpa_slot.spv");
+const KVWRITE_SLOT_SPV: &[u8] = include_bytes!("shaders/kvwrite_slot.spv");
 const BSILU_SPV: &[u8] = include_bytes!("shaders/bsilu.spv");
 const TO_F16_SPV: &[u8] = include_bytes!("shaders/to_f16.spv");
 const BMV_Q4K_SPV: &[u8] = include_bytes!("shaders/batched_matvec_q4k.spv");
@@ -2112,6 +2113,53 @@ mod tests {
         let agree = vk_gen.iter().zip(&cand_gen).take_while(|(a, b)| a == b).count();
         eprintln!("VkModel/candle agree on first {agree}/{n_gen} tokens");
         assert!(agree >= 8, "VkModel diverges from candle too early ({agree}); kernel/wiring bug");
+    }
+
+    /// SLOT KV-WRITE scatter (step 3a): each stream writes its roped K/V into its own
+    /// slot at its own position. Validated by reading the cache back.
+    /// `cargo test --release --features vulkan --lib vk_kvwrite_slot -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_kvwrite_slot_correctness() {
+        use ash::vk;
+        let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan ({e}); skipping"); return; } };
+        let dev = &ctx.device;
+        let (kv_dim, max_seq, m_rows, n_slots) = (512usize, 48usize, 4usize, 4usize);
+        let src: Vec<f32> = (0..m_rows * kv_dim).map(|i| (i as f32) * 0.001 + 1.0).collect();
+        let sp: Vec<u32> = vec![0, 5, 1, 12, 2, 20, 3, 30];
+        unsafe {
+            let mut bufs: Vec<(vk::Buffer, vk::DeviceMemory)> = Vec::new();
+            let (dst, dm, dp) = ctx.uma_buffer((n_slots * max_seq * kv_dim * 4) as u64).unwrap(); std::ptr::write_bytes(dp, 0, n_slots * max_seq * kv_dim * 4); bufs.push((dst, dm));
+            let (sb, sm, srp) = ctx.uma_buffer((src.len() * 4) as u64).unwrap(); std::ptr::copy_nonoverlapping(src.as_ptr() as *const u8, srp, src.len() * 4); bufs.push((sb, sm));
+            let (spb, spm, spp) = ctx.uma_buffer((sp.len() * 4) as u64).unwrap(); std::ptr::copy_nonoverlapping(sp.as_ptr() as *const u8, spp, sp.len() * 4); bufs.push((spb, spm));
+            let (ub, um, up) = ctx.uma_buffer(16).unwrap(); std::ptr::copy_nonoverlapping([kv_dim as u32, max_seq as u32, m_rows as u32, 0u32].as_ptr() as *const u8, up, 16); bufs.push((ub, um));
+            let (p, l, sl, module) = ctx.make_pipeline_raw(KVWRITE_SLOT_SPV, 3);
+            let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&[
+                vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(3),
+                vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(1)]), None).unwrap();
+            let set = vk_alloc_set(dev, pool, sl, &[dst, sb, spb], ub);
+            let cmd_pool = dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family), None).unwrap();
+            let cmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).unwrap()[0];
+            dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+            dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p);
+            dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, l, 0, &[set], &[]);
+            dev.cmd_dispatch(cmd, ((m_rows * kv_dim) as u32).div_ceil(64), 1, 1);
+            dev.end_command_buffer(cmd).unwrap();
+            let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+            dev.queue_submit(ctx.queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence).unwrap();
+            dev.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+            let cache = std::slice::from_raw_parts(dp as *const f32, n_slots * max_seq * kv_dim);
+            let mut ok = true;
+            for r in 0..m_rows {
+                let (slot, pos) = (sp[r * 2] as usize, sp[r * 2 + 1] as usize);
+                for i in 0..kv_dim { if (cache[(slot * max_seq + pos) * kv_dim + i] - src[r * kv_dim + i]).abs() > 1e-9 { ok = false; } }
+            }
+            eprintln!("kvwrite_slot: {} streams scattered to their (slot,pos) {}", m_rows, if ok { "✓ exact" } else { "WRONG" });
+            assert!(ok, "kvwrite_slot scatter wrong");
+            dev.destroy_fence(fence, None); dev.destroy_command_pool(cmd_pool, None); dev.destroy_descriptor_pool(pool, None);
+            dev.destroy_pipeline(p, None); dev.destroy_pipeline_layout(l, None); dev.destroy_descriptor_set_layout(sl, None); dev.destroy_shader_module(module, None);
+            for (b, mm) in bufs { dev.unmap_memory(mm); dev.destroy_buffer(b, None); dev.free_memory(mm, None); }
+        }
     }
 
     /// SLOT-INDIRECTED DECODE SDPA (step 2 of the coopmat batched decoder): each of
