@@ -5331,6 +5331,39 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         eprintln!("  wall-clock: greedy {g_tps:.0} tok/s -> PLD {p_tps:.0} tok/s = {:.2}x faster (same wgpu kernels)", p_tps / g_tps);
     }
 
+    /// PLD ACCEPTANCE SENSITIVITY: batched PLD's net win is workload-dependent — the
+    /// PLD forward is bigger (M*(draft_k+1) rows), so on LOW-acceptance (open-ended)
+    /// text it should LOSE to plain step(). Measures net wall-clock for both on echo
+    /// vs open-ended, to find when ZLLM_CB_PLD should actually be enabled.
+    /// `cargo test --release --features gpu --lib gpu_pld_acceptance -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gpu_pld_acceptance() {
+        use std::time::Instant;
+        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() { eprintln!("model not found; skipping"); return; }
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU: {e}"); return; } };
+        let model = GpuModel::load(path, ctx).expect("load");
+        let (ms, max_new, eos) = (8usize, 48usize, u32::MAX);
+        let mut echo = vec![128000u32]; for _ in 0..10 { echo.extend_from_slice(&[264, 265, 266, 267, 268]); }
+        let open = vec![128000u32, 791, 6864, 315, 9822, 374]; // "The capital of France is" → open-ended
+        for (name, prompt) in [("echo", &echo), ("open-ended", &open)] {
+            let run = |pld: bool| -> (f64, usize, usize) {
+                let mut cb = ContinuousBatcher::new(&model, ms * 8, 1024);
+                let mut total = 0usize;
+                for s in 0..ms { if cb.admit(s as u64, prompt, max_new, eos).is_some() { total += 1; } }
+                let t0 = Instant::now(); let mut fwds = 0usize;
+                while cb.active_len() > 0 { let r = if pld { cb.step_pld(3, 7) } else { cb.step() }; total += r.len(); fwds += 1; }
+                (total as f64 / t0.elapsed().as_secs_f64(), fwds, total)
+            };
+            let (plain, pf, _) = run(false);
+            let (pldv, pldf, toks) = run(true);
+            let tpf = toks as f64 / pldf as f64;
+            eprintln!("{name:>11}: plain {plain:>4.0} tok/s ({pf} fwds) | PLD {pldv:>4.0} tok/s ({pldf} fwds, {tpf:.1} tok/fwd) = {:.2}x  [{}]",
+                pldv / plain, if pldv > plain * 1.05 { "PLD wins" } else if pldv < plain * 0.95 { "PLD HURTS" } else { "~neutral" });
+        }
+    }
+
     /// ContinuousBatcher::step_pld productized: drive the real batcher with batched
     /// spec-decode and confirm bit-identical output to plain step() in fewer forwards.
     /// `cargo test --release --features gpu --lib gpu_cb_pld -- --ignored --nocapture`
