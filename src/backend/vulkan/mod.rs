@@ -2081,6 +2081,35 @@ mod tests {
         assert!(agree >= 8, "VkModel diverges from candle too early ({agree}); kernel/wiring bug");
     }
 
+    /// COOPMAT BATCHED-FORWARD THROUGHPUT PROBE: the batched coopmat forward is
+    /// fixed at 128 rows (PREFILL_MAX_M), so aggregate tok/s for M concurrent decode
+    /// streams ≈ M / time(128-row forward). Tells us whether a coopmat batched
+    /// decoder beats llama (M=32: 1458 tok/s) before building the slot-indirected stack.
+    /// `cargo test --release --features vulkan --lib vk_coopmat_batched_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_coopmat_batched_probe() {
+        use std::time::Instant;
+        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() { eprintln!("model not found; skipping"); return; }
+        let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan ({e}); skipping"); return; } };
+        let model = VkModel::load(path, ctx).expect("load");
+        // 128-token prompt → one full 128-row coopmat forward (no padding waste).
+        let prompt: Vec<u32> = (0..128).map(|i| ((i * 37 + 1) % 30000) as u32).collect();
+        let _ = model.prefill_forward(&prompt); // warm
+        let iters = 10;
+        let t = Instant::now();
+        for _ in 0..iters { let _ = model.prefill_forward(&prompt); }
+        let t128 = t.elapsed().as_secs_f64() / iters as f64;
+        eprintln!("coopmat batched forward (128 rows): {:.1} ms", t128 * 1e3);
+        eprintln!("  => aggregate decode tok/s if M streams share this forward (GEMM proxy; SDPA extra):");
+        for m in [8usize, 16, 32, 64, 128] {
+            let tps = m as f64 / t128;
+            let vs = if m == 32 { format!("  vs llama M=32: 1458 ({})", if tps > 1458.0 { "WIN" } else { "below" }) } else { String::new() };
+            eprintln!("    M={m:>3}: {tps:>5.0} tok/s{vs}");
+        }
+    }
+
     /// HETEROGENEOUS SERVING PROBE: decode on the iGPU (VkModel) and the CPU
     /// (candle) ALONE, then BOTH concurrently, to test whether the shared memory
     /// bus has headroom (iGPU decode ~136 GB/s of 256 → ~53%). If aggregate-
