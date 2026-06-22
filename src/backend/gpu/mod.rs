@@ -3419,6 +3419,9 @@ impl<'a> ContinuousBatcher<'a> {
     }
     pub fn has_free(&self) -> bool { !self.free.is_empty() }
     pub fn active_len(&self) -> usize { self.active.len() }
+    /// True if every active sequence is greedy (temp 0, no top-k) — the precondition
+    /// for step_pld (whose argmax verify is bit-identical to greedy step()).
+    pub fn all_greedy(&self) -> bool { self.active.iter().all(|s| !s.params.needs_topk() && s.params.temp == 0.0) }
 
     /// Cancel a sequence by id (e.g. its client disconnected): remove it from
     /// wherever it is — decoding, prefilling, or preempted — and free its KV slot
@@ -3770,6 +3773,7 @@ impl GpuBatchServer {
     fn serve(mut model: GpuModel, rx: std::sync::mpsc::Receiver<CbMsg>, m_max: usize, max_seq: usize) {
         use std::sync::mpsc::TryRecvError;
         let mut next_id: u64 = 0;
+        let pld = std::env::var("ZLLM_CB_PLD").is_ok(); // batched spec-decode for greedy batches
         loop { // one iteration per loaded model
             let mut cb = ContinuousBatcher::new(&model, m_max, max_seq);
             let mut chans: std::collections::HashMap<u64, tokio::sync::mpsc::UnboundedSender<Option<u32>>> = Default::default();
@@ -3794,8 +3798,11 @@ impl GpuBatchServer {
                     }
                 }
                 if cb.active_len() + cb.prefilling_len() + cb.preempted_len() == 0 { continue; }
-                // One scheduler step; stream + retire.
-                for (id, tok, done) in cb.step() {
+                // One scheduler step; stream + retire. ZLLM_CB_PLD turns on batched
+                // prompt-lookup spec-decode when the whole active batch is greedy
+                // (bit-identical to step(), fewer forwards on echo/RAG/code).
+                let res = if pld && cb.all_greedy() { cb.step_pld(3, 7) } else { cb.step() };
+                for (id, tok, done) in res {
                     if let Some(ch) = chans.get(&id) { let _ = ch.send(Some(tok)); }
                     if done { if let Some(ch) = chans.remove(&id) { let _ = ch.send(None); } }
                 }
