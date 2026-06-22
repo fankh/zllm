@@ -52,6 +52,31 @@ pub fn lookup_draft(
     None
 }
 
+/// Multi-length prompt lookup: try the longest n-gram first (most context
+/// matched → most confident draft), falling back to shorter ones for coverage.
+/// Tries `len` from `max_len` down to `min_len.max(2)` and returns the first
+/// (longest) match's continuation. min<2 is avoided: a 1-gram match drafts off a
+/// single repeated token — low confidence, so a wasted multi-token verify on
+/// reject (the verify forward costs the same whether or not drafts are accepted).
+///
+/// Raises the accept rate vs a single fixed `lookup_len`: on realistic echo
+/// (paraphrased summaries, edited code) a 3-gram often misses where a 2-gram
+/// still pins the continuation. Multiplies tokens/forward wherever PLD runs.
+pub fn lookup_draft_best(
+    haystack: &[u32],
+    recent: &[u32],
+    max_len: usize,
+    k: usize,
+) -> Option<Vec<u32>> {
+    let min_len = 2;
+    for len in (min_len..=max_len.max(min_len)).rev() {
+        if let Some(d) = lookup_draft(haystack, recent, len, k) {
+            return Some(d);
+        }
+    }
+    None
+}
+
 /// Given main-model logits at K+1 positions (one per input token)
 /// and the K drafts that occupied positions 1..K+1, return:
 ///   - the number of drafts the main model agrees with (greedy
@@ -217,6 +242,28 @@ mod tests {
         let draft = lookup_draft(&h, &recent, 2, 5).unwrap();
         // Most recent "10, 20" is at index 6; what follows is 70, 80.
         assert_eq!(draft, vec![70, 80]);
+    }
+
+    #[test]
+    fn lookup_best_falls_back_to_shorter_ngram() {
+        // recent [5,2,3]: the 3-gram [5,2,3] never appears in the haystack, but the
+        // 2-gram [2,3] does (idx 2-3, preceded by 1 not 5) → followed by 70,80.
+        let h: Vec<u32> = vec![99, 1, 2, 3, 70, 80];
+        let recent = vec![5, 2, 3];
+        // Fixed 3-gram [5,2,3] never recurs → no draft.
+        assert!(lookup_draft(&h, &recent, 3, 5).is_none());
+        // Best: tries 3 (miss) then 2 ([2,3] at idx 2 → follows 70,80).
+        assert_eq!(lookup_draft_best(&h, &recent, 3, 5).unwrap(), vec![70, 80]);
+    }
+
+    #[test]
+    fn lookup_best_prefers_longest_match() {
+        // Both a 3-gram and 2-gram match; the 3-gram (more context) wins.
+        let h: Vec<u32> = vec![10, 20, 30, 40, 7, 20, 30, 99, 10, 20, 30, 55];
+        let recent = vec![10, 20, 30];
+        // 3-gram [10,20,30] last at idx 8 → follows 55; 2-gram would also match but
+        // best returns the longest (3-gram) result.
+        assert_eq!(lookup_draft_best(&h, &recent, 3, 5).unwrap(), vec![55]);
     }
 
     #[test]

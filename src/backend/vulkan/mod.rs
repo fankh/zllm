@@ -1389,7 +1389,7 @@ impl VkModel {
         let mut forwards = 0usize;
         while produced.len() < max_new && next != eos {
             let k = draft_k.min(max_new - produced.len());
-            match crate::engine::spec_decode::lookup_draft(&hist, &hist, lookup_len, k) {
+            match crate::engine::spec_decode::lookup_draft_best(&hist, &hist, lookup_len, k) {
                 Some(d) => {
                     let mut inp = Vec::with_capacity(d.len() + 1);
                     inp.push(next);
