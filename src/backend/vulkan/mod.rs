@@ -1360,6 +1360,9 @@ impl VkModel {
         let uni = |d: [u32; 4]| -> vk::Buffer {
             let (b, mm, p) = self.ctx.uma_buffer(16).unwrap(); std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, p, 16); ub.borrow_mut().push((b, mm)); b
         };
+        let uni5 = |d: [u32; 5]| -> vk::Buffer {
+            let (b, mm, p) = self.ctx.uma_buffer(20).unwrap(); std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, p, 20); ub.borrow_mut().push((b, mm)); b
+        };
         let pool = dv.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets((self.n_layers * 20 + 8) as u32).pool_sizes(&[
             vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count((self.n_layers * 80 + 16) as u32),
             vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count((self.n_layers * 20 + 8) as u32),
@@ -1413,11 +1416,27 @@ impl VkModel {
             if !skip_gemm { disp(pf.p_f16, mkset(pf.p_f16.2, &[pf.h16, l.w2_f16, pf.ffn32], uni([m as u32, n_embd as u32, n_inter as u32, 0])), (n_embd / 64) as u32, (m / 64) as u32); } bar();
             disp(pf.p_add, mkset(pf.p_add.2, &[pf.x32, pf.ffn32], uni([(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); bar();
         }
-        // final rmsnorm -> n32; LM head (Q6 matvec) on the last real token's row.
+        // final rmsnorm -> n32; LM head on the last real token's row. Q4-LM-head (all-Q4 model)
+        // must use the Q4 matvec, NOT Q6 — reading the Q4 weight as Q6 gives garbage logits.
         disp(pf.p_bn, mkset(pf.p_bn.2, &[pf.x32, pf.final_norm, pf.n32], u_eps), m as u32, 1); bar();
-        let lm_set = {
+        let off = ((real_m - 1) * n_embd * 4) as u64;
+        let gx = (vocab as u32).min(65535);
+        if self.lm_q4 {
+            // Q4 LM head: batched matvec, M=1 on the last token's normed row. p_bmq4 bindings: WQ, X, out.
+            let set = dv.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(std::slice::from_ref(&pf.p_bmq4.2))).unwrap()[0];
+            let infos = [
+                (0u32, [vk::DescriptorBufferInfo::default().buffer(pf.lm_ql).range(vk::WHOLE_SIZE)]),
+                (1, [vk::DescriptorBufferInfo::default().buffer(pf.n32).offset(off).range((n_embd * 4) as u64)]),
+                (2, [vk::DescriptorBufferInfo::default().buffer(pf.logits).range(vk::WHOLE_SIZE)]),
+            ];
+            let uq4 = uni5([1, vocab as u32, n_embd as u32, lm_nb as u32, gx]);
+            let uinfo = [vk::DescriptorBufferInfo::default().buffer(uq4).range(vk::WHOLE_SIZE)];
+            let mut w: Vec<vk::WriteDescriptorSet> = infos.iter().map(|(b, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*b).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(info)).collect();
+            w.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(3).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&uinfo));
+            dv.update_descriptor_sets(&w, &[]);
+            disp(pf.p_bmq4, set, gx, (vocab as u32).div_ceil(gx));
+        } else {
             let set = dv.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(std::slice::from_ref(&pf.p_q6k.2))).unwrap()[0];
-            let off = ((real_m - 1) * n_embd * 4) as u64;
             let infos = [
                 (0u32, [vk::DescriptorBufferInfo::default().buffer(pf.lm_ql).range(vk::WHOLE_SIZE)]),
                 (1, [vk::DescriptorBufferInfo::default().buffer(pf.lm_qh).range(vk::WHOLE_SIZE)]),
@@ -1426,15 +1445,13 @@ impl VkModel {
                 (4, [vk::DescriptorBufferInfo::default().buffer(pf.n32).offset(off).range((n_embd * 4) as u64)]),
                 (5, [vk::DescriptorBufferInfo::default().buffer(pf.logits).range(vk::WHOLE_SIZE)]),
             ];
-            let ulm = uni([vocab as u32, lm_nb as u32, (vocab as u32).min(65535), 0]);
+            let ulm = uni([vocab as u32, lm_nb as u32, gx, 0]);
             let uinfo = [vk::DescriptorBufferInfo::default().buffer(ulm).range(vk::WHOLE_SIZE)];
             let mut w: Vec<vk::WriteDescriptorSet> = infos.iter().map(|(b, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*b).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(info)).collect();
             w.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(6).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&uinfo));
             dv.update_descriptor_sets(&w, &[]);
-            set
-        };
-        let gx = (vocab as u32).min(65535);
-        disp(pf.p_q6k, lm_set, gx, (vocab as u32).div_ceil(gx));
+            disp(pf.p_q6k, set, gx, (vocab as u32).div_ceil(gx));
+        }
         dv.end_command_buffer(cmd).unwrap();
         let fence = dv.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
         *self.prefill_rec.borrow_mut() = Some((real_m, PfRec { cmd, pool, cmd_pool, fence, unis: ub.into_inner() }));
@@ -2472,7 +2489,9 @@ mod tests {
         let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan ({e}); skipping"); return; } };
         let model = VkModel::load(path, ctx).expect("load");
         let argmax = |v: &[f32]| -> u32 { let mut bi = 0u32; let mut bv = f32::MIN; for (i, &x) in v.iter().enumerate() { if x > bv { bv = x; bi = i as u32; } } bi };
-        let prompt: Vec<u32> = vec![128000, 791, 6864, 315, 9822, 374]; // "The capital of France is"
+        let plen: usize = std::env::var("ZLLM_PLEN").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
+        let prompt: Vec<u32> = if plen <= 6 { vec![128000, 791, 6864, 315, 9822, 374] }
+            else { let mut p = vec![128000u32]; for i in 1..plen { p.push(((100 + i * 13) % 28000) as u32); } p };
         let n_gen = 12usize;
 
         // VkModel: batched prefill + decode.
