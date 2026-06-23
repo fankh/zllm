@@ -1,37 +1,59 @@
-// Decode GQA SDPA, parallel: ONE workgroup per query head (was one thread per
-// head — 1 CU, with a float[128] register array that spilled to scratch). Each
-// of hd threads owns one head-dimension: q·k is a shared-mem reduction across
-// threads, the online (flash) softmax runs once per cached position, and thread
-// d carries a single accumulator av (no spill). Uses n_head CUs instead of 1.
+// Decode GQA SDPA (v2, barrier-lean). The previous version did a shared-mem tree
+// reduction for q·k at EVERY cached position (~8 barriers * seq_len) — it was
+// barrier-bound, not bandwidth/compute-bound (ctx64 moves ~256KB, ~0.26 MFLOP).
+// This version: Phase 1 each thread computes full q·k dots (hd in registers) for
+// its strided positions with NO per-position barrier; one max-reduce; one exp+sum;
+// Phase 4 thread t owns head-dim t (single-float accumulator, no register-array
+// spill) and walks the cached V. Total barriers ~= 4 + 2*log2(64), independent of
+// seq_len. One workgroup per query head. seq_len must be <= MAXSEQ (caller gates
+// this with FLASH_MIN_SEQ; longer context uses the flash partial/combine path).
+// Compile: glslangValidator --target-env vulkan1.3 -V sdpa_decode.comp -o sdpa_decode.spv
 #version 450 core
-layout(local_size_x = 64) in;        // one thread per head-dim (hd <= 64)
+layout(local_size_x = 64) in;        // threads double as positions (P1/P3) and head-dims (P4); hd <= 64
 layout(binding = 0) readonly  buffer Q_  { float q[];    };  // [n_head*hd]
 layout(binding = 1) readonly  buffer KC_ { float kc[];   };  // [seq, n_kv*hd]
 layout(binding = 2) readonly  buffer VC_ { float vc[];   };
 layout(binding = 3) writeonly buffer O_  { float outp[]; };  // [n_head*hd]
 layout(binding = 4) uniform   P_ { uint n_head; uint n_kv; uint hd; uint seq_len; } p;
-shared float red[64];
-shared float s_score;
+const uint MAXSEQ = 512u;
+shared float sc[MAXSEQ];   // scores, then reused for probs
+shared float qsh[64];      // this head's query vector
+shared float red[64];      // reduction scratch
 void main() {
     uint h = gl_WorkGroupID.x;                 // one workgroup per head
-    uint d = gl_LocalInvocationID.x;           // head-dimension index
+    uint t = gl_LocalInvocationID.x;           // 0..63
+    uint hd = p.hd;
     uint kvh = h / (p.n_head / p.n_kv);
-    float scale = 1.0 / sqrt(float(p.hd));
-    float qd = (d < p.hd) ? q[h * p.hd + d] : 0.0;
-    float av = 0.0; float mx = -1e30; float l = 0.0;
-    for (uint t = 0u; t < p.seq_len; t++) {
-        uint kb = (t * p.n_kv + kvh) * p.hd;
-        red[d] = (d < p.hd) ? qd * kc[kb + d] : 0.0;
-        barrier();
-        for (uint st = 32u; st > 0u; st >>= 1u) { if (d < st) { red[d] += red[d + st]; } barrier(); }
-        if (d == 0u) { s_score = red[0] * scale; }
-        barrier();
-        float s = s_score;
-        float mn = max(mx, s); float corr = exp(mx - mn); float pe = exp(s - mn);
-        l = l * corr + pe;
-        if (d < p.hd) { av = av * corr + pe * vc[kb + d]; }
-        mx = mn;
-        barrier();
+    float scale = 1.0 / sqrt(float(hd));
+    if (t < hd) { qsh[t] = q[h * hd + t]; }
+    barrier();
+    // Phase 1: scores — each thread owns positions {t, t+64, ...}, full dot in registers.
+    for (uint pos = t; pos < p.seq_len; pos += 64u) {
+        uint kb = (pos * p.n_kv + kvh) * hd;
+        float s = 0.0;
+        for (uint d = 0u; d < hd; d++) { s += qsh[d] * kc[kb + d]; }
+        sc[pos] = s * scale;
     }
-    if (d < p.hd) { outp[h * p.hd + d] = av / l; }
+    barrier();
+    // Phase 2: max over scores.
+    float m = -1e30;
+    for (uint pos = t; pos < p.seq_len; pos += 64u) { m = max(m, sc[pos]); }
+    red[t] = m; barrier();
+    for (uint st = 32u; st > 0u; st >>= 1u) { if (t < st) { red[t] = max(red[t], red[t + st]); } barrier(); }
+    float mx = red[0]; barrier();
+    // Phase 3: exp + running sum (overwrite scores with probs).
+    float lsum = 0.0;
+    for (uint pos = t; pos < p.seq_len; pos += 64u) { float e = exp(sc[pos] - mx); sc[pos] = e; lsum += e; }
+    red[t] = lsum; barrier();
+    for (uint st = 32u; st > 0u; st >>= 1u) { if (t < st) { red[t] += red[t + st]; } barrier(); }
+    float l = red[0]; barrier();
+    // Phase 4: output — thread t owns head-dim t, walks cached V (single accumulator).
+    if (t < hd) {
+        float av = 0.0;
+        for (uint pos = 0u; pos < p.seq_len; pos++) {
+            uint kb = (pos * p.n_kv + kvh) * hd;
+            av += sc[pos] * vc[kb + t];
+        }
+        outp[h * hd + t] = av / l;
+    }
 }

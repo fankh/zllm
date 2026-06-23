@@ -24,6 +24,10 @@ const SDPA_DECODE_SPV: &[u8] = include_bytes!("shaders/sdpa_decode.spv");
 const SDPA_FLASH_PARTIAL_SPV: &[u8] = include_bytes!("shaders/sdpa_flash_partial.spv");
 const SDPA_FLASH_COMBINE_SPV: &[u8] = include_bytes!("shaders/sdpa_flash_combine.spv");
 const SDPA_FLASH_BLOCK: usize = 32; // must match BLOCK in the flash shaders
+// Use the barrier-lean single-pass decode SDPA up to this depth (must stay < sdpa_decode's
+// MAXSEQ=512); only beyond it does the flash partial/combine path's extra parallelism pay
+// for its 2 dispatches + combine. The single-pass tree-reduces once, not per position.
+const FLASH_MIN_SEQ: usize = 256;
 const SILU_MUL_SPV: &[u8] = include_bytes!("shaders/silu_mul.spv");
 const DECODE_MATVEC_Q6K_SPV: &[u8] = include_bytes!("shaders/decode_matvec_q6k.spv");
 #[cfg(test)]
@@ -1583,7 +1587,7 @@ impl VkModel {
 
         // Record-once: only re-record when the SDPA grid (single-pass vs flash
         // n_blocks) or the lm/argmax tail changes; otherwise reuse self.cmd.
-        let sdpa_key = if (seq_len as usize) > SDPA_FLASH_BLOCK { (seq_len as usize).div_ceil(SDPA_FLASH_BLOCK) as i64 } else { 0 };
+        let sdpa_key = if (seq_len as usize) > FLASH_MIN_SEQ { (seq_len as usize).div_ceil(SDPA_FLASH_BLOCK) as i64 } else { 0 };
         let rec_key = sdpa_key | ((lm as i64) << 20) | ((argmax as i64) << 21);
         let need_record = self.last_rec.get() != rec_key;
         let cmd = self.cmd;
@@ -1614,7 +1618,7 @@ impl VkModel {
             if !skip_attn {
             if !skip_extra { disp(self.p_kvw, l.kvw_k, (kv_dim as u32).div_ceil(64), 1);
             disp(self.p_kvw, l.kvw_v, (kv_dim as u32).div_ceil(64), 1); bar(); }       // append K,V to cache
-            if seq_len as usize > SDPA_FLASH_BLOCK {
+            if seq_len as usize > FLASH_MIN_SEQ {
                 let nblk = (seq_len as usize).div_ceil(SDPA_FLASH_BLOCK) as u32;
                 disp(self.p_fp, l.fp, n_head as u32, nblk); bar();
                 disp(self.p_fc, l.fc, n_head as u32, 1); bar();
@@ -2099,9 +2103,9 @@ mod tests {
         eprintln!("VkModel loaded in {:.2}s (vocab {})", t.elapsed().as_secs_f64(), model.vocab);
         let argmax = |v: &[f32]| -> u32 { let mut bi = 0u32; let mut bv = f32::MIN; for (i, &x) in v.iter().enumerate() { if x > bv { bv = x; bi = i as u32; } } bi };
         let prompt: Vec<u32> = vec![128000]; // BOS
-        let n_gen = 24usize;
+        let n_gen: usize = std::env::var("ZLLM_NGEN").ok().and_then(|s| s.parse().ok()).unwrap_or(24);
         let _ = &argmax;
-        let n_time = 128usize; // match llama-bench tg128 (avg ctx ~64) for a fair rate
+        let n_time: usize = std::env::var("ZLLM_NTIME").ok().and_then(|s| s.parse().ok()).unwrap_or(128); // match llama-bench tg128
         // ZLLM_REPS>1 re-runs the 128-tok decode back-to-back (ctx reset to ~0 each rep) so the
         // iGPU heats up like `llama-bench -r N` — fair sustained-throughput comparison, not a burst.
         let reps: usize = std::env::var("ZLLM_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
@@ -2487,6 +2491,7 @@ unsafe fn sdpa_correctness_inner(ctx: &VkContext) {
     // Exercise both paths: single-pass (short ctx) and flash 2-pass (long ctx,
     // multiple KV blocks), each vs a CPU softmax-attention reference.
     sdpa_case(ctx, 32, false);
+    sdpa_case(ctx, 200, false); // deep single-pass (barrier-lean kernel), within MAXSEQ
     sdpa_case(ctx, 520, true); // > SDPA_FLASH_BLOCK and not a block multiple
 }
 
