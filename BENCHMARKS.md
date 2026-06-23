@@ -5,16 +5,35 @@ llama.cpp on the same model and hardware.
 
 ## Setup
 
-- **Model:** Llama-3.2-1B-Instruct **Q4_K_M** GGUF (762 MiB, 1.24 B params, 16 layers, vocab 128256)
+- **Model:** Llama-3.2-1B-Instruct, **all-Q4** GGUF for the headline GPU numbers
+  (`llama-quantize --pure --token-embedding-type q4_K --output-tensor-type q4_K ... Q4_K_S`,
+  663 MiB — every tensor Q4_K; removes the Q6 LM-head/attn_v/ffn_down drag). Same file fed to both
+  engines, so the comparison is fair. Earlier wgpu numbers used Q4_K_M.
 - **Hardware:** AMD Ryzen AI MAX+ 395 "Strix Halo" — Zen 5, 16C/32T, AVX-512 (incl. VNNI/BF16),
-  ~96 GB unified LPDDR5X (~256 GB/s, **shared** by CPU + iGPU), Radeon 8060S iGPU (RDNA 3.5, 40 CUs)
+  ~96 GB unified LPDDR5X (~256 GB/s, **shared** by CPU + iGPU), Radeon 8060S iGPU (RDNA 3.5, 40 CUs,
+  fp16 cooperative-matrix peak ~59 TFLOP/s)
 - **OS:** Windows 11 / MSVC
-- **Measured:** 2026-06-17
-- **llama.cpp:** build `3980e04d5` (9050), Vulkan backend (reports `matrix cores: KHR_coopmat`, `fp16: 1`)
-- **zllm:** `--features gpu` (wgpu → Vulkan, pure-Rust WGSL via naga). GPU outputs are validated
-  **bit-exact** against the candle CPU forward (greedy output token-identical).
+- **Measured:** 2026-06-17 (Phase 1 wgpu) and **2026-06-23** (Phase 2 raw-Vulkan VkModel)
+- **llama.cpp:** Vulkan backend (`matrix cores: KHR_coopmat`, `fp16: 1`). Decode `llama-bench -n 128`,
+  prefill `-p <N>`, batched `llama-batched-bench`. Sustained = `-r 30` (GPU hot, the fair regime).
+- **zllm:** headline GPU path is `--features vulkan` (raw Vulkan/ash, GLSL→SPIR-V, `ZLLM_VK=1`);
+  earlier results are `--features gpu` (wgpu/WGSL). GPU outputs validated **bit-exact** vs the candle
+  CPU forward. Reproduce decode: `ZLLM_VK=1 zllm generate -m <all-Q4>.gguf -t tokenizer.json -p "..."`.
 
 All numbers are tok/s. Bigger is better.
+
+## Frontier map — where zllm stands vs llama.cpp (Strix Halo iGPU, all-Q4)
+
+| frontier | zllm vs llama | status | the binding constraint |
+|---|---|---|---|
+| **Single-stream decode** | **1.12× short-ctx (WINS)**, 0.94–0.96× long-ctx | **shipped + guarded** | decode is bandwidth-bound; zllm wins on small-op/SDPA efficiency + lower throttling. Matvecs near-optimal (84% of peak BW). |
+| **Prefill / TTFT** | 0.38–0.49× (was 0.25×; **2×** improved) | real win, not parity | coopmat GEMM at 18% of the 59 TFLOP/s WMMA peak (llama ~25%). A pipelining gap, **not a wall** — but a hard, uncertain kernel fight. |
+| **Aggregate / batched throughput** | 0.15–0.68× | measured wall | batched decode is small-M (8); the skinny Q4 GEMM is **LDS-bandwidth bound** (a hardware limit). A working 3.8× skinny GEMM still lands < llama. |
+
+**The decisive, shipped win is single-stream decode** — a from-scratch Rust engine beating tuned
+llama.cpp Vulkan, reproducible via `ZLLM_VK=1 zllm generate -m <all-Q4>.gguf` (see §1). Batched
+throughput is a measured hardware wall; prefill is a real 2× gain but not yet parity. The
+differentiated serving value is the complete vLLM-style stack (§3), not raw batched speed.
 
 ## 1. Single-stream decode
 
@@ -42,42 +61,50 @@ bound at ~84% of peak (near-optimal — not the lever).
 
 ## 2. Prefill (TTFT / batched-compute)
 
-| | zllm | llama.cpp |
-|---|---:|---:|
-| iGPU prefill (pp512) | ~492–527 (peak) | **5747** |
-| CPU prefill (pp512)  | (candle, lower) | 2791 |
+Raw-Vulkan **VkModel** batched prefill (coopmat Q4 GEMM), all-Q4 model, vs llama.cpp:
 
-zllm batched prefill by prompt length M (iGPU):
+| prompt | zllm | llama.cpp (pp) | zllm / llama |
+|---|---:|---:|---:|
+| 128 tok | **2085** | 5435 | 0.38× |
+| 256 tok | **2798** | ~5700 | 0.49× |
 
-| M | tok/s | ms |
-|---:|---:|---:|
-| 12  | 249 | 48 |
-| 32  | 527 | 61 |
-| 128 | 500 | 256 |
-| 256 | 492 | 520 |
+**Progression this engine (1363 → 2798, ~2×; all bit-correct, cosine 0.99946 vs candle):**
+- **Barrier-lean prefill SDPA** — the old `bsdpa.comp` ran 1 thread/(query,head) with a `float[128]`
+  accumulator that **spilled to scratch** (65 GFLOP/s, 33% of the forward). Rewrote it like the decode
+  SDPA (workgroup/(query,head), one-thread-per-head-dim, no spill): prefill **1363 → 1928 tok/s (1.4×)**.
+- **Dynamic prefill tile** — the coopmat GEMM at the M=128 tile ran at 4.4 TFLOP/s (M=256 8.1, M=512 10.2
+  — M=256 does 2× the work in ~the same wall time; the M=128 tile leaves the GPU half-idle). Pad to the
+  next 128-multiple (cap 256): ≤128 prompts stay M=128 (no regression), 129–256 get M=256 → **PP=256
+  2798 (1.34×)**.
 
-llama.cpp's prefill is **11.7×** faster, using the iGPU's cooperative-matrix cores.
+**Why it still loses (honest):** the coopmat Q4 GEMM is the bottleneck (84% of the forward) at only **18%
+of the iGPU's ~59 TFLOP/s WMMA peak** (f16 GEMM is the same 18% — the dequant is NOT the bottleneck).
+llama runs at ~25% (14.6 TFLOP/s effective). So this is a GEMM-pipelining gap, **not a hardware wall** —
+but the first lever tried (BK=16→32, halving the K-loop barriers) gained +8% on the *cached* GEMM bench
+and **0% on the cold-streamed prefill** (the bench mispredicts the deployment), so the remaining gain
+needs careful WMMA double-buffering measured on the real prefill. Prefill is winnable but a hard,
+uncertain kernel fight; the 2× TTFT win above is banked.
 
 ## 3. Aggregate serving throughput (parallel decode)
 
-Total generation tok/s across M concurrent streams (iGPU):
+Aggregate decode tok/s across M concurrent streams. llama.cpp (all-Q4, `llama-batched-bench`)
+peaks ~1008 @ M=8. zllm has the full vLLM-style stack (in-flight batching, paged KV, prefix
+cache, batched spec-decode) but **loses on raw batched throughput at every M (0.15–0.68×)**.
 
-| concurrency M | zllm aggregate | llama.cpp aggregate | zllm / llama |
-|---:|---:|---:|---:|
-| 1  | 16¹ | 203  | — |
-| 2  | 30  | 369  | 0.08× |
-| 4  | 60  | 627  | 0.10× |
-| 8  | 116 | 727  | 0.16× |
-| 16 | 213 | 1011 | 0.21× |
-| 32 | **327** | **1458** | 0.22× |
+**The wall — the batched matvec at small M.** Batched decode runs the weights once for M tokens,
+so the matvec becomes a skinny GEMM (M=8). Three designs failed; a 4th (`skinny_gemm_q4k.comp`:
+64-thread column tiling, activation in LDS, scalar dequant to dodge the glslang miscompile, +
+a block-major weight repack to coalesce W) finally **works and is correct** — **3.8× the prior
+best at M=8** — but plateaus at **30 GB/s, LDS-bandwidth bound** (the GEMM reads A from LDS
+N·M·K times ≈ 1.8 TB/s ≈ the iGPU's LDS ceiling). Extrapolates ~420 tok/s vs llama's 1008. This
+is a **hardware limit at small M**, distinct from the prefill GEMM (large M, where coopmat works).
 
-¹ zllm's M=1 batched path carries per-step overhead (uncached bind groups + K/V scatter); the
-optimized single-stream path is 82 tok/s. zllm's batched decode scales **6.4×** from M=1→32
-(validated bit-identical to single-stream), confirming the compute-bound amortization works — it's
-just ~4.5× below llama.cpp's coopmat-backed batched throughput at M=32.
+The differentiated value here is the **complete serving stack** (§5), not raw speed:
+batched spec-decode (`ZLLM_CB_PLD`, 4.3× fewer forwards), paged KV (4× less memory), prefix
+cache, preemption — features llama-server's batched path doesn't combine.
 
-The sections above are the **Phase 1 (wgpu/WGSL)** results. Phase 2 below builds a raw-Vulkan
-cooperative-matrix path that closes most of the prefill gap — see the corrected analysis.
+The sections above are the **Phase 2 (raw-Vulkan VkModel)** results. §4 below documents the
+earlier Phase 1 (wgpu/WGSL) coopmat-path build-up.
 
 ## 4. Phase 2 — raw-Vulkan cooperative-matrix path (`--features vulkan`)
 
