@@ -919,6 +919,7 @@ pub struct VkModel {
     layers: Vec<VkLayerOps>,
     s_rope_q: ash::vk::DescriptorSet, s_rope_k: ash::vk::DescriptorSet, s_silu: ash::vk::DescriptorSet,
     s_final_norm: ash::vk::DescriptorSet, s_lm: ash::vk::DescriptorSet, s_argmax: ash::vk::DescriptorSet,
+    lm_q4: bool, // tied LM head is Q4_K (all-Q4 model) → Q4 matvec instead of Q6 (decode path)
     argmax_ptr: *mut u8,
     // Record-once cache: the command buffer only changes when the flash-attn
     // grid (n_blocks) or the lm/argmax tail changes — reuse it otherwise and
@@ -1025,9 +1026,13 @@ impl VkModel {
         let embed: Vec<f32> = embed_qt.dequantize(&dev).map_err(|e| e.to_string())?.flatten_all().map_err(|e| e.to_string())?.to_vec1().map_err(|e| e.to_string())?;
         let lm_bytes = embed_qt.data().map_err(|e| e.to_string())?;
         let lm_nb = n_embd / 256;
+        let lm_q4 = embed_qt.dtype() == GgmlDType::Q4K;
         let (lm_ql, lm_qh, lm_scl, lm_dd) = match embed_qt.dtype() {
             GgmlDType::Q6K => vk_up_q6k(&ctx, &mut bufs, &lm_bytes, vocab * lm_nb),
-            d => return Err(format!("LM head (token_embd.weight) dtype {d:?} not supported (need Q6_K)")),
+            // all-Q4 model: one Q4_K buffer; lm_ql is the weight, the other three alias
+            // it (unused by the Q4 decode LM head; prefill/verify stay Q6-only).
+            GgmlDType::Q4K => { let q4 = vk_up_bytes(&ctx, &mut bufs, &lm_bytes); (q4, q4, q4, q4) }
+            d => return Err(format!("LM head (token_embd.weight) dtype {d:?} not supported (need Q4_K or Q6_K)")),
         };
         let final_norm = load_norm(&mut bufs, &mut file, "output_norm.weight")?;
         let n_inter = ct.tensor(&mut file, "blk.0.ffn_gate.weight", &dev).map_err(|e| e.to_string())?.shape().dims()[0];
@@ -1125,7 +1130,12 @@ impl VkModel {
         let s_rope_q = mkset(rope_sl, &[q, cos_buf, sin_buf], u_rope_q);
         let s_rope_k = mkset(rope_sl, &[k_buf, cos_buf, sin_buf], u_rope_k);
         let s_final_norm = mkset(rms_sl, &[x_buf, final_norm, normed], u_norm);
-        let s_lm = mkset(q6k_sl, &[lm_ql, lm_qh, lm_scl, lm_dd, normed, logits], u_lm);
+        let s_lm = if lm_q4 {
+            let (u, _) = vk_uni(&ctx, &mut bufs, [vocab as u32, n_embd as u32, lm_nb as u32, (vocab as u32).min(65535)]);
+            mkset(mv_sl, &[lm_ql, normed, logits], u) // Q4 matvec: [weight, x, logits]
+        } else {
+            mkset(q6k_sl, &[lm_ql, lm_qh, lm_scl, lm_dd, normed, logits], u_lm)
+        };
         let (argmax_out, argmax_ptr) = vk_zeros(&ctx, &mut bufs, 1);
         let (u_argmax, _) = vk_uni(&ctx, &mut bufs, [vocab as u32, 0, 0, 0]);
         let s_argmax = mkset(argmax_sl, &[logits, argmax_out], u_argmax);
@@ -1245,7 +1255,7 @@ impl VkModel {
         Ok(Self {
             n_embd, n_head, n_kv, hd, n_inter, vocab, n_layers, kv_dim, half, max_seq, eps, embed, cos, sin, lm_nb,
             x_ptr, cos_ptr, sin_ptr, base_ptr, seq_ptr, logits_ptr,
-            layers, s_rope_q, s_rope_k, s_silu, s_final_norm, s_lm, s_argmax, argmax_ptr,
+            layers, s_rope_q, s_rope_k, s_silu, s_final_norm, s_lm, s_argmax, argmax_ptr, lm_q4,
             p_rms: (rms_p, rms_l), p_mv: (mv_p, mv_l), p_rope: (rope_p, rope_l), p_kvw: (kvw_p, kvw_l),
             p_sdpa: (sdpa_p, sdpa_l), p_fp: (fp_p, fp_l), p_fc: (fc_p, fc_l), p_silu: (silu_p, silu_l),
             p_add: (add_p, add_l), p_q6k: (q6k_p, q6k_l), p_argmax: (argmax_p, argmax_l, argmax_sl), p_mvrope: (mvr_p, mvr_l),
@@ -1620,7 +1630,7 @@ impl VkModel {
         }
         if lm {
             if !skip_norm { disp(self.p_rms, self.s_final_norm, 1, 1); bar(); }        // final norm
-            disp(self.p_q6k, self.s_lm, gxof(self.vocab), (self.vocab as u32).div_ceil(gxof(self.vocab))); // LM head
+            disp(if self.lm_q4 { self.p_mv } else { self.p_q6k }, self.s_lm, gxof(self.vocab), (self.vocab as u32).div_ceil(gxof(self.vocab))); // LM head (Q4 or Q6)
             if argmax { bar(); disp((self.p_argmax.0, self.p_argmax.1), self.s_argmax, 1, 1); }  // GPU argmax (4-byte readback)
         }
         let _ = attn_dim;
@@ -2080,7 +2090,8 @@ mod tests {
     #[ignore]
     fn vk_model_vs_candle() {
         use std::time::Instant;
-        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        let path = std::env::var("ZLLM_MODEL").unwrap_or_else(|_| "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf".to_string());
+        let path = path.as_str();
         if !std::path::Path::new(path).exists() { eprintln!("model not found at {path}; skipping"); return; }
         let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan device ({e}); skipping"); return; } };
         let t = Instant::now();
