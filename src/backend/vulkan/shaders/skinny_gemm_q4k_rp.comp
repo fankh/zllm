@@ -1,0 +1,64 @@
+// Skinny batched Q4_K GEMM, REPACKED weights — coalesced-W variant of skinny_gemm_q4k. The
+// plain version had each thread read its column's Q4_K block (36 u32) at stride nb*36 → the 64
+// column-threads issue strided (uncoalesced) loads (23 GB/s). Here W is pre-repacked to a
+// block-major-transposed layout: for super-block b and column-tile ct(=workgroup), the 36 u32
+// of the block are stored column-innermost — [((b*n_tiles + ct)*36 + j)*64 + col]. So at a given
+// j the 64 threads read 64 CONSECUTIVE u32 → coalesced. Everything else mirrors skinny_gemm_q4k.
+// Grid: dispatch(n_tiles=ceil(N/64), 1, 1). gx field carries n_tiles.
+// Compile: glslangValidator --target-env vulkan1.3 -V skinny_gemm_q4k_rp.comp -o skinny_gemm_q4k_rp.spv
+#version 450 core
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly  buffer WQ { uint  wq[];   };  // repacked Q4_K
+layout(binding = 1) readonly  buffer X_ { float x[];    };  // A [M,K]
+layout(binding = 2) writeonly buffer O_ { float outp[]; };  // C [M,N]
+layout(binding = 3) uniform   P_ { uint M; uint N; uint K; uint nb; uint gx; } p;
+const uint MAXM = 8u;
+const uint TILE = 256u;
+const uint PAD = 257u;             // row stride coprime with 32 LDS banks → no M-way bank conflict
+shared float xs[MAXM * PAD];
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint ct = gl_WorkGroupID.x;                 // column-tile = workgroup
+    uint col = ct * 64u + t;
+    uint n_tiles = p.gx;                        // ceil(N/64)
+    float acc[MAXM];
+    for (uint m = 0u; m < MAXM; m++) { acc[m] = 0.0; }
+    for (uint b = 0u; b < p.nb; b++) {
+        for (uint idx = t; idx < p.M * TILE; idx += 64u) {
+            uint m = idx / TILE; uint kk = idx % TILE;
+            xs[m * PAD + kk] = x[m * p.K + b * TILE + kk];
+        }
+        barrier();
+        if (col < p.N) {
+            uint base = ((b * n_tiles + ct) * 36u) * 64u + t;   // j-th u32 at base + j*64
+            vec2 dd = unpackHalf2x16(wq[base]); float d = dd.x; float dmin = dd.y;
+            uint u0 = wq[base + 64u]; uint u1 = wq[base + 128u]; uint u2 = wq[base + 192u];
+            uint u3 = ((u2 >> 4u) & 0x0f0f0f0fu) | (((u1 >> 6u) & 0x03030303u) << 4u);
+            uint uaux = u1 & 0x3f3f3f3fu;
+            u1 = (u2 & 0x0f0f0f0fu) | (((u0 >> 6u) & 0x03030303u) << 4u);
+            u2 = uaux; u0 = u0 & 0x3f3f3f3fu;
+            for (uint sub = 0u; sub < 8u; sub++) {
+                float sc; float mn;
+                if (sub < 4u) { sc = float((u0 >> (sub * 8u)) & 0xffu); mn = float((u2 >> (sub * 8u)) & 0xffu); }
+                else          { sc = float((u1 >> ((sub - 4u) * 8u)) & 0xffu); mn = float((u3 >> ((sub - 4u) * 8u)) & 0xffu); }
+                float coef = d * sc; float coefmn = dmin * mn;
+                uint qbase = base + (4u + (sub / 2u) * 8u) * 64u;   // (4 + pair*8 + w)-th u32
+                bool hi = (sub & 1u) == 1u;
+                for (uint w = 0u; w < 8u; w++) {
+                    uint word = wq[qbase + w * 64u];
+                    for (uint bsel = 0u; bsel < 4u; bsel++) {
+                        uint byte = (word >> (bsel * 8u)) & 0xffu;
+                        uint q = hi ? (byte >> 4u) : (byte & 0x0fu);
+                        float wval = coef * float(q) - coefmn;
+                        uint kpos = sub * 32u + w * 4u + bsel;
+                        for (uint m = 0u; m < p.M; m++) { acc[m] += wval * xs[m * PAD + kpos]; }
+                    }
+                }
+            }
+        }
+        barrier();
+    }
+    if (col < p.N) {
+        for (uint m = 0u; m < p.M; m++) { outp[m * p.N + col] = acc[m]; }
+    }
+}

@@ -1,0 +1,68 @@
+// Skinny batched Q4_K GEMM: C[M,N] = A[M,K] · dequant(W)[N,K], M<=8. The continuous-batching
+// matvec. Three prior designs failed: weight-stationary re-read A across N workgroups (L2
+// thrashed by the weight stream → 27 GB/s); coopmat-BM16 was tile-staging-overhead bound at
+// small M; register-blocked miscompiled (6 concurrent register arrays). This one:
+//   * Workgroup = 64 threads = 64 OUTPUT COLUMNS (one column per thread).
+//   * A[M, 256-chunk] is staged into shared memory ONCE per K-chunk and REUSED by all 64
+//     columns — so A streams from DRAM N/64 times, not N times (kills the x-reread).
+//   * Each thread fully reduces ITS column's K with the Q4_K dequant inline — no cross-thread
+//     reduction, no coopmat tile.
+//   * acc[M] is the ONLY register array; the dequant folds to a SCALAR wval = d*sc*q - dmin*mn
+//     (avoids the multi-array glslang scratch-aliasing miscompile).
+// Grid: dispatch(ceil(N/64), 1, 1). K tiled at 256 (one Q4_K super-block). Block layout (36
+// u32/super-block, d/dmin half2 + packed 6-bit scales + nibble quants) mirrors decode_matvec_q4k.
+// Compile: glslangValidator --target-env vulkan1.3 -V skinny_gemm_q4k.comp -o skinny_gemm_q4k.spv
+#version 450 core
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly  buffer WQ { uint  wq[];   };  // Q4_K weights [N,K]
+layout(binding = 1) readonly  buffer X_ { float x[];    };  // activations A [M,K]
+layout(binding = 2) writeonly buffer O_ { float outp[]; };  // C [M,N]
+layout(binding = 3) uniform   P_ { uint M; uint N; uint K; uint nb; uint gx; } p;
+const uint MAXM = 8u;
+const uint TILE = 256u;            // K-chunk = one Q4_K super-block
+shared float xs[MAXM * TILE];      // A[M, chunk] = 8KB, shared across the 64 columns
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint col = gl_WorkGroupID.x * 64u + t;     // output column owned by this thread
+    float acc[MAXM];
+    for (uint m = 0u; m < MAXM; m++) { acc[m] = 0.0; }
+    for (uint b = 0u; b < p.nb; b++) {
+        // Stage A[0..M, b*256 .. b*256+256] into LDS (64 threads, coalesced).
+        for (uint idx = t; idx < p.M * TILE; idx += 64u) {
+            uint m = idx / TILE; uint kk = idx % TILE;
+            xs[idx] = x[m * p.K + b * TILE + kk];
+        }
+        barrier();
+        if (col < p.N) {
+            uint blk = (col * p.nb + b) * 36u;
+            vec2 dd = unpackHalf2x16(wq[blk]); float d = dd.x; float dmin = dd.y;
+            uint u0 = wq[blk + 1u]; uint u1 = wq[blk + 2u]; uint u2 = wq[blk + 3u];
+            uint u3 = ((u2 >> 4u) & 0x0f0f0f0fu) | (((u1 >> 6u) & 0x03030303u) << 4u);
+            uint uaux = u1 & 0x3f3f3f3fu;
+            u1 = (u2 & 0x0f0f0f0fu) | (((u0 >> 6u) & 0x03030303u) << 4u);
+            u2 = uaux; u0 = u0 & 0x3f3f3f3fu;
+            for (uint sub = 0u; sub < 8u; sub++) {
+                float sc; float mn;
+                if (sub < 4u) { sc = float((u0 >> (sub * 8u)) & 0xffu); mn = float((u2 >> (sub * 8u)) & 0xffu); }
+                else          { sc = float((u1 >> ((sub - 4u) * 8u)) & 0xffu); mn = float((u3 >> ((sub - 4u) * 8u)) & 0xffu); }
+                float coef = d * sc; float coefmn = dmin * mn;
+                uint qs0 = blk + 4u + (sub / 2u) * 8u;
+                bool hi = (sub & 1u) == 1u;
+                for (uint w = 0u; w < 8u; w++) {
+                    uint word = wq[qs0 + w];
+                    for (uint bsel = 0u; bsel < 4u; bsel++) {
+                        uint byte = (word >> (bsel * 8u)) & 0xffu;
+                        uint q = hi ? (byte >> 4u) : (byte & 0x0fu);
+                        float wval = coef * float(q) - coefmn;   // dequantized weight (scalar)
+                        uint kpos = sub * 32u + w * 4u + bsel;
+                        for (uint m = 0u; m < p.M; m++) { acc[m] += wval * xs[m * TILE + kpos]; }
+                    }
+                }
+            }
+        }
+        barrier();
+    }
+    if (col < p.N) {
+        for (uint m = 0u; m < p.M; m++) { outp[m * p.N + col] = acc[m]; }
+    }
+}

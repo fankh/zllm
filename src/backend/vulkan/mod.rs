@@ -59,6 +59,8 @@ const KVWRITE_SLOT_SPV: &[u8] = include_bytes!("shaders/kvwrite_slot.spv");
 const BSILU_SPV: &[u8] = include_bytes!("shaders/bsilu.spv");
 const TO_F16_SPV: &[u8] = include_bytes!("shaders/to_f16.spv");
 const BMV_Q4K_SPV: &[u8] = include_bytes!("shaders/batched_matvec_q4k.spv");
+const SKINNY_GEMM_Q4K_SPV: &[u8] = include_bytes!("shaders/skinny_gemm_q4k.spv");
+const SKINNY_GEMM_Q4K_RP_SPV: &[u8] = include_bytes!("shaders/skinny_gemm_q4k_rp.spv");
 const BMV_F16_SPV: &[u8] = include_bytes!("shaders/batched_matvec_f16.spv");
 const BMV_Q6K_SPV: &[u8] = include_bytes!("shaders/batched_matvec_q6k.spv");
 
@@ -2620,11 +2622,23 @@ unsafe fn bmv_scaling_inner(ctx: &VkContext) {
         QTensor::quantize(&Tensor::from_vec(w, (n, k), &Device::Cpu).unwrap(), GgmlDType::Q4K).unwrap().data().unwrap().to_vec()
     };
     let (mv_p, mv_l, mv_sl, _) = ctx.make_pipeline_raw(BMV_Q4K_SPV, 3);
+    let (sk_p, sk_l, sk_sl, _) = ctx.make_pipeline_raw(SKINNY_GEMM_Q4K_SPV, 3);
+    let (rp_p, rp_l, rp_sl, _) = ctx.make_pipeline_raw(SKINNY_GEMM_Q4K_RP_SPV, 3);
     let wb = { let (b, _m, p) = ctx.uma_buffer(wbytes.len() as u64).unwrap(); std::ptr::copy_nonoverlapping(wbytes.as_ptr(), p, wbytes.len()); b };
+    // Block-major-transposed repack for the coalesced-W variant: [b][col-tile][j][col-in-tile].
+    let n_tiles = (n + 63) / 64;
+    let nb_sb = k / 256;
+    let wsrc = std::slice::from_raw_parts(wbytes.as_ptr() as *const u32, wbytes.len() / 4);
+    let mut rsrc = vec![0u32; nb_sb * n_tiles * 36 * 64];
+    for c in 0..n {
+        let (ctt, cin) = (c / 64, c % 64);
+        for b in 0..nb_sb { for j in 0..36 { rsrc[((b * n_tiles + ctt) * 36 + j) * 64 + cin] = wsrc[(c * nb_sb + b) * 36 + j]; } }
+    }
+    let rwb = { let bytes = rsrc.len() * 4; let (b, _m, p) = ctx.uma_buffer(bytes as u64).unwrap(); std::ptr::copy_nonoverlapping(rsrc.as_ptr() as *const u8, p, bytes); b };
     let cmd_pool = dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family), None).unwrap();
-    let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(8).pool_sizes(&[
-        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(24),
-        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(8)]), None).unwrap();
+    let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(24).pool_sizes(&[
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(80),
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(24)]), None).unwrap();
     let cs = vk::PipelineStageFlags::COMPUTE_SHADER;
     let barr = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
     let gxof = (n as u32).min(65535);
@@ -2633,33 +2647,54 @@ unsafe fn bmv_scaling_inner(ctx: &VkContext) {
     for m in [1usize, 2, 4, 8] {
         let (xb, _mx, xp) = ctx.uma_buffer((m * k * 4) as u64).unwrap();
         for i in 0..m * k { *((xp as *mut f32).add(i)) = ((i % 17) as f32 - 8.0) * 0.1; }
-        let (ob, _mo, _) = ctx.uma_buffer((m * n * 4) as u64).unwrap();
+        let (ob, _mo, obp) = ctx.uma_buffer((m * n * 4) as u64).unwrap();
+        let (obs, _mos, obsp) = ctx.uma_buffer((m * n * 4) as u64).unwrap();
+        let (obr, _mor, obrp) = ctx.uma_buffer((m * n * 4) as u64).unwrap();
         let (ub, _mu, up) = ctx.uma_buffer(20).unwrap();
         std::ptr::copy_nonoverlapping([m as u32, n as u32, k as u32, (k / 256) as u32, gxof].as_ptr() as *const u8, up, 20);
-        let set = dev.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&[mv_sl])).unwrap()[0];
-        let infos: Vec<[vk::DescriptorBufferInfo; 1]> = [wb, xb, ob].iter().map(|&b| [vk::DescriptorBufferInfo::default().buffer(b).range(vk::WHOLE_SIZE)]).collect();
-        let ui = [vk::DescriptorBufferInfo::default().buffer(ub).range(vk::WHOLE_SIZE)];
-        let mut w: Vec<vk::WriteDescriptorSet> = infos.iter().enumerate().map(|(i, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(i as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(info)).collect();
-        w.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(3).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&ui));
-        dev.update_descriptor_sets(&w, &[]);
+        let (ub_rp, _mur, upr) = ctx.uma_buffer(20).unwrap();
+        std::ptr::copy_nonoverlapping([m as u32, n as u32, k as u32, (k / 256) as u32, n_tiles as u32].as_ptr() as *const u8, upr, 20);
+        let mkset3 = |sl: vk::DescriptorSetLayout, wbuf: vk::Buffer, out_b: vk::Buffer, ub_: vk::Buffer| -> vk::DescriptorSet {
+            let set = dev.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&[sl])).unwrap()[0];
+            let infos: Vec<[vk::DescriptorBufferInfo; 1]> = [wbuf, xb, out_b].iter().map(|&b| [vk::DescriptorBufferInfo::default().buffer(b).range(vk::WHOLE_SIZE)]).collect();
+            let uiv = [vk::DescriptorBufferInfo::default().buffer(ub_).range(vk::WHOLE_SIZE)];
+            let mut w: Vec<vk::WriteDescriptorSet> = infos.iter().enumerate().map(|(i, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(i as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(info)).collect();
+            w.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(3).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&uiv));
+            dev.update_descriptor_sets(&w, &[]); set
+        };
+        let set_bmv = mkset3(mv_sl, wb, ob, ub);
+        let set_sk = mkset3(sk_sl, wb, obs, ub);
+        let set_rp = mkset3(rp_sl, rwb, obr, ub_rp);
         let iters = 200u32;
-        let cmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).unwrap()[0];
-        dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
-        for _ in 0..iters {
-            dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, mv_p);
-            dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, mv_l, 0, &[set], &[]);
-            dev.cmd_dispatch(cmd, gxof, (n as u32).div_ceil(gxof), 1);
-            dev.cmd_pipeline_barrier(cmd, cs, cs, vk::DependencyFlags::empty(), &[barr], &[], &[]);
-        }
-        dev.end_command_buffer(cmd).unwrap();
-        let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None).unwrap(); let cmds = [cmd];
-        for _ in 0..2 { dev.reset_fences(&[fence]).unwrap(); dev.queue_submit(ctx.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence).unwrap(); dev.wait_for_fences(&[fence], true, u64::MAX).unwrap(); }
-        let t0 = std::time::Instant::now();
-        dev.reset_fences(&[fence]).unwrap(); dev.queue_submit(ctx.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence).unwrap(); dev.wait_for_fences(&[fence], true, u64::MAX).unwrap();
-        let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        // (pipeline, layout, set, grid_x, grid_y)
+        let time_k = |p: vk::Pipeline, l: vk::PipelineLayout, s: vk::DescriptorSet, gx: u32, gy: u32| -> f64 {
+            let cmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).unwrap()[0];
+            dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+            for _ in 0..iters {
+                dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p);
+                dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, l, 0, &[s], &[]);
+                dev.cmd_dispatch(cmd, gx, gy, 1);
+                dev.cmd_pipeline_barrier(cmd, cs, cs, vk::DependencyFlags::empty(), &[barr], &[], &[]);
+            }
+            dev.end_command_buffer(cmd).unwrap();
+            let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None).unwrap(); let cmds = [cmd];
+            for _ in 0..2 { dev.reset_fences(&[fence]).unwrap(); dev.queue_submit(ctx.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence).unwrap(); dev.wait_for_fences(&[fence], true, u64::MAX).unwrap(); }
+            let t0 = std::time::Instant::now();
+            dev.reset_fences(&[fence]).unwrap(); dev.queue_submit(ctx.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence).unwrap(); dev.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+            let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64; dev.destroy_fence(fence, None); us
+        };
+        let us = time_k(mv_p, mv_l, set_bmv, gxof, (n as u32).div_ceil(gxof));
+        let us_sk = time_k(sk_p, sk_l, set_sk, (n as u32).div_ceil(64), 1);
+        let us_rp = time_k(rp_p, rp_l, set_rp, n_tiles as u32, 1);
+        let a = std::slice::from_raw_parts(obp as *const f32, m * n);
+        let bb = std::slice::from_raw_parts(obsp as *const f32, m * n);
+        let cc = std::slice::from_raw_parts(obrp as *const f32, m * n);
+        let maxd = a.iter().zip(bb).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let maxd_rp = a.iter().zip(cc).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
         if m == 1 { t1 = us; }
-        eprintln!("  M={}: {:>6.1}us/forward  {:>4.1}x throughput vs M=1  ({:.2}x time)", m, us, (m as f64) * t1 / us, us / t1);
-        dev.destroy_fence(fence, None);
+        let gbps = |us: f64| n as f64 * k as f64 * 0.5625 / us / 1e3;
+        eprintln!("  M={}: bmv {:>6.1}us ({:>4.0}GB/s) | skinny {:>6.1}us ({:>4.0}GB/s, {:.1}x) | skinny+repack {:>6.1}us ({:>4.0}GB/s, {:.1}x vs M=1)  maxdiff sk={:.1e} rp={:.1e}",
+            m, us, gbps(us), us_sk, gbps(us_sk), us / us_sk, us_rp, gbps(us_rp), (m as f64) * t1 / us_rp, maxd, maxd_rp);
     }
 }
 
