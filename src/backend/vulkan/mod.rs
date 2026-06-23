@@ -821,7 +821,8 @@ struct PrefillW {
     kc: ash::vk::Buffer, vc: ash::vk::Buffer,                                            // shared decode KV cache
 }
 
-const PREFILL_MAX_M: usize = 128; // fast-lane prompt cap; M padded to this
+const PREFILL_MAX_M: usize = 256; // fast-lane prompt cap; M padded to this. 256 (vs 128) keeps the
+// coopmat GEMM's M-tiles busy (M=128 ran at 4.4 TFLOP/s, M=256 at 8.1 for ~the same wall time).
 const VERIFY_MAX_M: usize = 8;    // spec-decode verify window cap (matvec MAXM)
 
 // Resources for the batched prefill forward (built once at load).
@@ -1334,7 +1335,9 @@ impl VkModel {
             (self.n_embd, self.n_head, self.n_kv, self.hd, self.n_inter, self.kv_dim, self.half, self.vocab);
         let lm_nb = self.lm_nb;
         let real_m = prompt.len().min(PREFILL_MAX_M);
-        let m = PREFILL_MAX_M;
+        // Pad to the next 128-multiple (cap PREFILL_MAX_M), NOT always to the max: short prompts
+        // stay M=128 (no padding waste), longer ones get the GEMM-efficient larger tile.
+        let m = (real_m.div_ceil(128) * 128).min(PREFILL_MAX_M);
 
         // Inputs: x = embeddings (padding rows zero), cos/sin for positions 0..m.
         std::ptr::write_bytes(pf.x32_ptr, 0, m * n_embd * 4);
@@ -1858,7 +1861,7 @@ mod tests {
         let mut w = vec![0f32; n * k];
         for i in 0..w.len() { w[i] = (((i as i64).wrapping_mul(2654435761) & 0xFFFF) as f32 / 32768.0 - 1.0) * 0.5; }
         let bytes = QTensor::quantize(&Tensor::from_vec(w, (n, k), &Device::Cpu).unwrap(), GgmlDType::Q4K).unwrap().data().unwrap().to_vec();
-        for &m in &[256usize, 512, 2048] {
+        for &m in &[128usize, 256, 512, 2048] {
             let x: Vec<f32> = (0..m * k).map(|i| ((i % 31) as f32 - 15.0) * 0.01).collect();
             let _ = ctx.coopmat_q4k_gemm(&bytes, n, nb, &x, m, 2).expect("warm");
             let iters = 30u32;
@@ -2370,8 +2373,9 @@ mod tests {
         if !std::path::Path::new(path).exists() { eprintln!("model not found; skipping"); return; }
         let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan ({e}); skipping"); return; } };
         let model = VkModel::load(path, ctx).expect("load");
-        // 128-token prompt → one full 128-row coopmat forward (no padding waste).
-        let prompt: Vec<u32> = (0..128).map(|i| ((i * 37 + 1) % 30000) as u32).collect();
+        // ZLLM_PP-token prompt → one coopmat prefill forward (default = PREFILL_MAX_M, full chunk).
+        let pp: usize = std::env::var("ZLLM_PP").ok().and_then(|s| s.parse().ok()).unwrap_or(PREFILL_MAX_M);
+        let prompt: Vec<u32> = (0..pp).map(|i| ((i * 37 + 1) % 30000) as u32).collect();
         let _ = model.prefill_forward(&prompt); // warm
         let iters = 10;
         let t = Instant::now();
