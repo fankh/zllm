@@ -2877,8 +2877,9 @@ impl<'a> BatchedDecoder<'a> {
         let a = |len: usize| ctx.alloc_activation(len, false);
         let asrc = |len: usize| ctx.alloc_activation(len, true); // COPY_SRC: cache scatter / readback
         // Shared KV block pool: n_blocks × (block_size positions) × kv_dim, per layer.
-        let k_pool = (0..model.layers.len()).map(|_| a(n_blocks * block_size * kv_dim)).collect();
-        let v_pool = (0..model.layers.len()).map(|_| a(n_blocks * block_size * kv_dim)).collect();
+        // COPY_SRC (asrc) so blocks can be copied out to host for swap-to-host preemption.
+        let k_pool = (0..model.layers.len()).map(|_| asrc(n_blocks * block_size * kv_dim)).collect();
+        let v_pool = (0..model.layers.len()).map(|_| asrc(n_blocks * block_size * kv_dim)).collect();
         let blocks = BlockState {
             free: (0..n_blocks as u32).rev().collect(),
             slot_blocks: vec![Vec::new(); m_max],
@@ -2970,6 +2971,88 @@ impl<'a> BatchedDecoder<'a> {
     fn upload_block_table(&self) {
         let bs = self.blocks.borrow();
         self.model.ctx.queue.write_buffer(&self.block_table_buf, 0, bytemuck::cast_slice(&bs.table_host));
+    }
+
+    /// SWAP-OUT (swap-to-host preemption): copy `slot`'s KV for positions
+    /// `0..n_pos` from the GPU block pool into a host blob, then free the slot's
+    /// blocks. The classic vLLM alternative to recompute-preemption (restore the
+    /// KV instead of re-running the forward). Restored bit-exactly by `swap_in`.
+    /// NOTE: measured SLOWER than recompute on this box (see `gpu_swap_preemption`)
+    /// — it's a discrete-GPU lever (small VRAM pool + large separate host RAM over
+    /// PCIe); on UMA host==device memory, so it saves nothing a bigger pool wouldn't
+    /// and only adds scatter/gather + mapped-readback overhead. Default-off
+    /// (`ZLLM_SWAP`); kept for VRAM-constrained (non-UMA) deployments.
+    fn swap_out(&self, slot: u32, n_pos: usize) -> HostKv {
+        let kv_dim = self.model.n_kv_head * self.model.head_dim;
+        let nb = n_pos.div_ceil(self.block_size);           // logical blocks holding the KV
+        let blk = self.block_size * kv_dim;                 // f32 per block
+        let blkb = (blk * 4) as u64;                        // bytes per block
+        let nl = self.model.layers.len();
+        let phys: Vec<u32> = { let bs = self.blocks.borrow(); bs.slot_blocks[slot as usize][..nb].to_vec() };
+        let half = nl * nb * blk;                           // f32 in the K (or V) half
+        let ctx = &self.model.ctx;
+        // One MAP_READ staging buffer; gather scattered pool blocks into it (K then V).
+        let stage = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("kv-swap-out"), size: (half * 2 * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        for li in 0..nl {
+            for (lb, &pb) in phys.iter().enumerate() {
+                let src = pb as u64 * blkb;
+                let dst = ((li * nb + lb) * blk) as u64 * 4;
+                enc.copy_buffer_to_buffer(&self.k_pool[li], src, &stage, dst, blkb);
+                enc.copy_buffer_to_buffer(&self.v_pool[li], src, &stage, (half * 4) as u64 + dst, blkb);
+            }
+        }
+        ctx.queue.submit([enc.finish()]);
+        let slice = stage.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        ctx.device.poll(wgpu::Maintain::Wait);
+        let all: Vec<f32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
+        stage.unmap();
+        let (k, v) = (all[..half].to_vec(), all[half..].to_vec());
+        self.free_slot(slot);                               // release the blocks for others
+        HostKv { n_pos, nb, k, v }
+    }
+
+    /// SWAP-IN: allocate fresh blocks for `slot` and write `host`'s saved KV back
+    /// into them (host→device via the queue). The KV bytes are identical to before
+    /// swap-out, so a subsequent decode step is bit-exact to never preempting.
+    /// Returns false if the pool can't supply the blocks (caller checks `can_fit`).
+    fn swap_in(&self, slot: u32, host: &HostKv) -> bool {
+        if !self.ensure_blocks(slot, host.n_pos) { return false; }
+        let kv_dim = self.model.n_kv_head * self.model.head_dim;
+        let blk = self.block_size * kv_dim;
+        let blkb = (blk * 4) as u64;
+        let nl = self.model.layers.len();
+        let nb = host.nb;
+        let half = nl * nb * blk;
+        let phys: Vec<u32> = { let bs = self.blocks.borrow(); bs.slot_blocks[slot as usize][..nb].to_vec() };
+        let ctx = &self.model.ctx;
+        // Upload the whole packed blob ONCE via a mapped staging buffer (no per-block
+        // write_buffer — that costs a staging-belt write each call), then scatter to
+        // the pool blocks with GPU-side copies in one submit.
+        let stage = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("kv-swap-in"), size: (half * 2 * 4) as u64,
+            usage: wgpu::BufferUsages::COPY_SRC, mapped_at_creation: true });
+        {
+            let mut mapped = stage.slice(..).get_mapped_range_mut();
+            let f: &mut [f32] = bytemuck::cast_slice_mut(&mut mapped);
+            f[..half].copy_from_slice(&host.k);
+            f[half..].copy_from_slice(&host.v);
+        }
+        stage.unmap();
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        for li in 0..nl {
+            for (lb, &pb) in phys.iter().enumerate() {
+                let soff = ((li * nb + lb) * blk) as u64 * 4;
+                let dst = pb as u64 * blkb;
+                enc.copy_buffer_to_buffer(&stage, soff, &self.k_pool[li], dst, blkb);
+                enc.copy_buffer_to_buffer(&stage, (half * 4) as u64 + soff, &self.v_pool[li], dst, blkb);
+            }
+        }
+        ctx.queue.submit([enc.finish()]);
+        true
     }
 
     /// One batched step over the active streams 0..m (cache slots 0..m).
@@ -3347,11 +3430,19 @@ impl CbSeq {
     fn gen_index(&self) -> usize { self.tokens.len() - self.prompt_len }
 }
 
-/// A sequence evicted under KV-pool pressure (recompute preemption). Its KV was
-/// freed; on reschedule it re-prefills `tokens` (prompt ++ produced) — the prefix
-/// cache reuses the prompt's blocks — and continues. Output is bit-identical to
-/// never preempting (KV at p depends only on tokens[0..=p]; same seed index).
-struct PreemptedSeq { id: u64, tokens: Vec<u32>, prompt_len: usize, max_tokens: usize, eos: u32, params: SamplingParams, base_seed: u32 }
+/// A sequence's KV cache copied out to host RAM (swap-to-host preemption),
+/// `nb = ceil(n_pos/block_size)` logical blocks per layer, K then V packed in
+/// logical-block order `[layer*nb + lb][block_size*kv_dim]`.
+struct HostKv { n_pos: usize, nb: usize, k: Vec<f32>, v: Vec<f32> }
+
+/// A sequence evicted under KV-pool pressure. On reschedule it either:
+/// - `kv = None` (recompute): re-prefills `tokens` (prompt ++ produced); the
+///   prefix cache reuses the prompt's blocks. Or
+/// - `kv = Some(blob)` (swap-to-host): restores the saved KV and runs one decode
+///   step — no recompute.
+/// Both are bit-identical to never preempting (KV at p depends only on
+/// tokens[0..=p]; same seed index).
+struct PreemptedSeq { id: u64, tokens: Vec<u32>, prompt_len: usize, max_tokens: usize, eos: u32, params: SamplingParams, base_seed: u32, kv: Option<HostKv> }
 
 /// A sequence mid-prefill. Its prompt is prefilled one chunk per scheduler step
 /// (interleaved with decode of the active batch, so a long prompt doesn't stall
@@ -3426,11 +3517,16 @@ pub struct ContinuousBatcher<'a> {
     /// Sequences mid-prefill (one chunk advanced per step, interleaved with decode).
     prefilling: std::collections::VecDeque<PrefillingSeq>,
     preemptions: u64,
+    /// Preempt active sequences by SWAP-TO-HOST (copy KV out, restore on resume)
+    /// instead of recompute. Set from `ZLLM_SWAP`; tests flip it directly. Default
+    /// OFF: measured slower than recompute on this UMA box (see `gpu_swap_preemption`)
+    /// — it's a discrete-GPU lever. Recompute is the right default here.
+    swap_mode: bool,
 }
 
 impl<'a> ContinuousBatcher<'a> {
     pub fn new(model: &'a GpuModel, m_max: usize, max_seq: usize) -> Self {
-        Self { dec: model.batched_decoder(m_max, max_seq), free: (0..m_max as u32).rev().collect(), active: Vec::new(), preempted: Default::default(), prefilling: Default::default(), preemptions: 0 }
+        Self { dec: model.batched_decoder(m_max, max_seq), free: (0..m_max as u32).rev().collect(), active: Vec::new(), preempted: Default::default(), prefilling: Default::default(), preemptions: 0, swap_mode: std::env::var("ZLLM_SWAP").is_ok() }
     }
 
     /// Continuous batcher over a paged KV pool of `n_blocks` blocks shared by all
@@ -3439,7 +3535,7 @@ impl<'a> ContinuousBatcher<'a> {
     /// could not. Admission is optimistic; if a running sequence can't grow, a
     /// victim is preempted (its KV freed) and recomputed later.
     pub fn with_pool(model: &'a GpuModel, m_max: usize, max_seq: usize, n_blocks: usize) -> Self {
-        Self { dec: model.batched_decoder_paged(m_max, max_seq, n_blocks), free: (0..m_max as u32).rev().collect(), active: Vec::new(), preempted: Default::default(), prefilling: Default::default(), preemptions: 0 }
+        Self { dec: model.batched_decoder_paged(m_max, max_seq, n_blocks), free: (0..m_max as u32).rev().collect(), active: Vec::new(), preempted: Default::default(), prefilling: Default::default(), preemptions: 0, swap_mode: std::env::var("ZLLM_SWAP").is_ok() }
     }
     pub fn has_free(&self) -> bool { !self.free.is_empty() }
     pub fn active_len(&self) -> usize { self.active.len() }
@@ -3630,12 +3726,20 @@ impl<'a> ContinuousBatcher<'a> {
     /// recompute. Returns false if there are no active sequences.
     fn preempt_last_active(&mut self) -> bool {
         let Some(victim) = self.active.pop() else { return false };
-        self.dec.free_slot(victim.slot);
-        self.free.push(victim.slot);
         self.preemptions += 1;
+        // Swap-to-host: copy KV out (frees the blocks) so resume skips recompute.
+        // Recompute: just free the blocks; `kv = None` re-prefills on resume.
+        // Valid KV covers positions 0..tokens.len()-1 (the last token isn't fed yet).
+        let kv = if self.swap_mode {
+            Some(self.dec.swap_out(victim.slot, victim.tokens.len() - 1))
+        } else {
+            self.dec.free_slot(victim.slot);
+            None
+        };
+        self.free.push(victim.slot);
         self.preempted.push_back(PreemptedSeq {
             id: victim.id, tokens: victim.tokens, prompt_len: victim.prompt_len,
-            max_tokens: victim.max_tokens, eos: victim.eos, params: victim.params, base_seed: victim.base_seed,
+            max_tokens: victim.max_tokens, eos: victim.eos, params: victim.params, base_seed: victim.base_seed, kv,
         });
         true
     }
@@ -3651,7 +3755,7 @@ impl<'a> ContinuousBatcher<'a> {
         self.preemptions += 1;
         self.preempted.push_back(PreemptedSeq {
             id: pf.id, tokens: pf.prompt, prompt_len: pf.prompt_len,
-            max_tokens: pf.max_tokens, eos: pf.eos, params: pf.params, base_seed: pf.base_seed,
+            max_tokens: pf.max_tokens, eos: pf.eos, params: pf.params, base_seed: pf.base_seed, kv: None,
         });
         true
     }
@@ -3701,9 +3805,24 @@ impl<'a> ContinuousBatcher<'a> {
         }
     }
 
+    /// One single-row decode step (`tok` at `pos` in `slot`), dispatching on the
+    /// sequence's sampling params, returning the next token. Used to resume a
+    /// swap-to-host sequence after its KV is restored.
+    fn decode_one(&self, tok: u32, pos: u32, slot: u32, params: SamplingParams, seed: u32) -> u32 {
+        let (t, p, s, sd) = ([tok], [pos], [slot], [seed]);
+        if params.needs_topk() {
+            self.dec.step_slotted_topk(&t, &p, &s, &[params], &sd)[0]
+        } else if params.temp > 0.0 {
+            self.dec.step_slotted_sample(&t, &p, &s, &[params.temp], &sd)[0]
+        } else {
+            self.dec.step_slotted(&t, &p, &s)[0]
+        }
+    }
+
     /// Resume preempted sequences (FIFO) while a slot is free and the pool can
-    /// re-prefill them. Recompute: re-prefill prompt ++ produced (prefix cache
-    /// reuses the prompt), producing the exact next token they'd have produced.
+    /// hold them. Swap-to-host: restore the saved KV + one decode step. Recompute
+    /// (`kv = None`): re-prefill prompt ++ produced (prefix cache reuses the
+    /// prompt). Either way, produces the exact next token they'd have produced.
     fn reschedule(&mut self, out: &mut Vec<(u64, u32, bool)>) {
         while !self.preempted.is_empty() && !self.free.is_empty() {
             let len = self.preempted.front().unwrap().tokens.len();
@@ -3711,8 +3830,15 @@ impl<'a> ContinuousBatcher<'a> {
             let p = self.preempted.pop_front().unwrap();
             let slot = self.free.pop().unwrap();
             let gen_idx = (p.tokens.len() - p.prompt_len) as u32;
-            let samp = if p.params.temp > 0.0 { Some((p.params.temp, step_seed(p.base_seed, gen_idx))) } else { None };
-            let (g, _) = self.dec.prefill_slot_cached(&p.tokens, slot, samp);
+            let seed = step_seed(p.base_seed, gen_idx);
+            let g = if let Some(kv) = &p.kv {
+                self.dec.swap_in(slot, kv); // write KV back into fresh blocks…
+                let next = *p.tokens.last().unwrap();
+                self.decode_one(next, (p.tokens.len() - 1) as u32, slot, p.params, seed) // …then one step
+            } else {
+                let samp = if p.params.temp > 0.0 { Some((p.params.temp, seed)) } else { None };
+                self.dec.prefill_slot_cached(&p.tokens, slot, samp).0
+            };
             let mut tokens = p.tokens;
             tokens.push(g);
             let done = g == p.eos || (tokens.len() - p.prompt_len) >= p.max_tokens;
@@ -5295,6 +5421,99 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         assert!(cb.preemption_count() > 0, "test did not actually trigger preemption (pool too large?)");
         eprintln!("preemption: {} preemptions over {} steps; both sequences bit-identical to no-preemption ✓", cb.preemption_count(), steps);
+    }
+
+    /// Swap-to-host preemption: on eviction copy the victim's KV out to host and
+    /// restore it on resume (one decode step), instead of recomputing the whole
+    /// history. Verifies bit-identical to BOTH no-preemption and recompute, and
+    /// times each policy's resume cost.
+    /// FINDING: swap-to-host is SLOWER than recompute here (~0.9x, worse with
+    /// length) — UMA means host==device memory, so swap saves nothing a bigger
+    /// pool wouldn't and only adds scatter/gather + mapped-readback overhead while
+    /// recompute is a fast batched prefill. Recompute stays the default; swap is a
+    /// discrete-GPU (VRAM-constrained) lever, validated correct and kept default-off.
+    /// `cargo test --release --features gpu --lib gpu_swap_preemption -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gpu_swap_preemption() {
+        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() { eprintln!("model not found; skipping"); return; }
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU ({e}); skipping"); return; } };
+        let model = GpuModel::load(path, ctx).expect("load");
+        // Long-ish sequences (k=80) in a tight 10-block pool so each preempted seq
+        // has a big history → recompute is expensive, swap-to-host should pay off.
+        let (max_seq, n_blocks, k, eos) = (128usize, 10usize, 80usize, u32::MAX);
+        let prompts: Vec<Vec<u32>> = vec![
+            vec![128000, 791, 6864, 315, 9822, 374],
+            vec![128000, 15724, 374, 264, 1296, 1473],
+        ];
+
+        // Reference: each sequence alone, full pool, no preemption.
+        let mut refs: Vec<Vec<u32>> = Vec::new();
+        for p in &prompts {
+            let mut cb = ContinuousBatcher::new(&model, 1, max_seq);
+            let mut t = vec![cb.admit(0, p, k, eos).unwrap().0];
+            while cb.active_len() > 0 { for (_, x, _) in cb.step() { t.push(x); } }
+            refs.push(t);
+        }
+
+        // Forced preemption in the tight pool under each policy.
+        let run = |swap: bool| -> (std::collections::HashMap<u64, Vec<u32>>, u64, std::time::Duration) {
+            let mut cb = ContinuousBatcher::with_pool(&model, 2, max_seq, n_blocks);
+            cb.swap_mode = swap;
+            let mut got: std::collections::HashMap<u64, Vec<u32>> = Default::default();
+            for (i, p) in prompts.iter().enumerate() {
+                let g = cb.admit(i as u64, p, k, eos).expect("admit").0;
+                got.entry(i as u64).or_default().push(g);
+            }
+            let t0 = std::time::Instant::now();
+            let mut steps = 0;
+            while cb.active_len() > 0 || cb.preempted_len() > 0 {
+                for (id, x, _) in cb.step() { got.get_mut(&id).unwrap().push(x); }
+                steps += 1;
+                assert!(steps < 4000, "preemption loop made no progress");
+            }
+            (got, cb.preemption_count(), t0.elapsed())
+        };
+
+        let (recompute, rc_pre, rc_t) = run(false);
+        let (swapped, sw_pre, sw_t) = run(true);
+
+        for (i, r) in refs.iter().enumerate() {
+            assert_eq!(&recompute[&(i as u64)], r, "recompute: sequence {i} diverged");
+            assert_eq!(&swapped[&(i as u64)], r, "swap-to-host: sequence {i} diverged from no-preemption");
+        }
+        assert!(rc_pre > 0 && sw_pre > 0, "both modes must actually preempt (rc {rc_pre}, sw {sw_pre})");
+        let _ = (rc_t, sw_t); // whole-run wall is decode-dominated; isolate resume cost below.
+
+        // Isolated resume cost across history lengths: one preempt→resume cycle.
+        // Recompute re-prefills the whole history (O(L) compute); swap-to-host copies
+        // KV out+back (O(L) bytes) + one decode step. Both yield the next token.
+        let dec = model.batched_decoder_paged(2, 1024, 80);
+        fn min5(mut f: impl FnMut() -> std::time::Duration) -> std::time::Duration {
+            (0..5).map(|_| f()).min().unwrap()
+        }
+        for &l in &[80usize, 256, 768] {
+            let tokens: Vec<u32> = (0..l as u32).map(|i| 1000 + (i % 64)).collect(); // synthetic history
+            let last = *tokens.last().unwrap();
+            dec.prefill_slot_cached(&tokens, 0, None); dec.free_slot(0); // warmup this length
+            let recompute_resume = min5(|| {
+                let t = std::time::Instant::now();
+                dec.prefill_slot_cached(&tokens, 0, None);
+                let d = t.elapsed(); dec.free_slot(0); d
+            });
+            let swap_resume = min5(|| {
+                dec.prefill_slot_cached(&tokens, 0, None);            // make resident (untimed)
+                let t = std::time::Instant::now();
+                let kv = dec.swap_out(0, l - 1);                      // copy KV out, free blocks
+                dec.swap_in(1, &kv);                                 // restore into a fresh slot
+                let _ = dec.step_slotted(&[last], &[(l - 1) as u32], &[1]); // one decode step
+                let d = t.elapsed(); dec.free_slot(1); d
+            });
+            eprintln!("isolated resume @ {l:>4} tok: recompute {recompute_resume:>10.2?} vs swap-to-host {swap_resume:>10.2?}  ({:.2}x)",
+                recompute_resume.as_secs_f64() / swap_resume.as_secs_f64());
+        }
+        eprintln!("swap-to-host preemption bit-identical to no-preemption AND recompute ✓");
     }
 
     /// Chunked prefill: a long prompt prefills one chunk per step (interleaved
