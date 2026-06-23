@@ -1579,6 +1579,11 @@ impl VkModel {
         // but ~parity end-to-end: verify_forward's ~40ms fixed overhead — re-record + ~200 barriers
         // — swamps it; needs a record-once batched forward to pay off). bmv is the validated default.
         let use_skinny = std::env::var("ZLLM_VERIFY_SKINNY").is_ok();
+        // Diagnostic decomposition of the verify forward (mirror forward_inner's VK_MVONLY).
+        let v_mvonly = std::env::var("VK_V_MVONLY").is_ok();              // keep only matvecs
+        let v_skip_norm = v_mvonly || std::env::var("VK_V_NONORM").is_ok();
+        let v_skip_attn = v_mvonly || std::env::var("VK_V_NOSDPA").is_ok(); // skip rope+kvcopy+sdpa
+        let v_skip_extra = v_mvonly;                                       // skip silu+residual adds
         let mvq4 = |w: vk::Buffer, x: vk::Buffer, out: vk::Buffer, n: usize, k: usize| {
             if use_skinny { // grid = ceil(N/64) workgroups (64 columns each)
                 let set = mkset(pf.p_skinny.2, &[w, x, out], uni5([rm, n as u32, k as u32, (k / 256) as u32, 0]));
@@ -1599,30 +1604,32 @@ impl VkModel {
         let kvsz = (real_m * kv_dim * 4) as u64;
 
         for l in &pf.w {
-            disp(pf.p_bn, mkset(pf.p_bn.2, &[pf.x32, l.attn_norm, pf.n32], u_eps), rm, 1); bar();
+            if !v_skip_norm { disp(pf.p_bn, mkset(pf.p_bn.2, &[pf.x32, l.attn_norm, pf.n32], u_eps), rm, 1); bar(); }
             // QKV via small-M matvec: Q -> pf.q, K -> pf.o32, V -> pf.ffn32.
             mvq4(l.wq, pf.n32, pf.q, n_embd, n_embd);
             mvq4(l.wk, pf.n32, pf.o32, kv_dim, n_embd);
             mvf16(l.wv_f16, pf.n32, pf.ffn32, kv_dim, n_embd); bar();
-            // RoPE q (pf.q), k (pf.o32 scratch).
-            disp(pf.p_br, mkset(pf.p_br.2, &[pf.q, pf.cosb, pf.sinb], uni([n_head as u32, hd as u32, rm, 0])), c64(real_m * n_head * half), 1);
-            disp(pf.p_br, mkset(pf.p_br.2, &[pf.o32, pf.cosb, pf.sinb], uni([n_kv as u32, hd as u32, rm, 0])), c64(real_m * n_kv * half), 1); bar();
-            // Copy the real K/V into the resident cache at position `pos`.
-            bar_c2t();
-            dv.cmd_copy_buffer(cmd, pf.o32, l.kc, &[vk::BufferCopy::default().size(kvsz).dst_offset(kvoff)]);
-            dv.cmd_copy_buffer(cmd, pf.ffn32, l.vc, &[vk::BufferCopy::default().size(kvsz).dst_offset(kvoff)]);
-            bar_t2c();
-            // Decode SDPA over the resident cache (row i attends 0..=pos+i).
-            disp(pf.p_bsd, mkset(pf.p_bsd.2, &[pf.q, l.kc, l.vc, pf.attn32], uni5([n_head as u32, n_kv as u32, hd as u32, rm, pos as u32])), c64(real_m * n_head), 1); bar();
+            if !v_skip_attn {
+                // RoPE q (pf.q), k (pf.o32 scratch).
+                disp(pf.p_br, mkset(pf.p_br.2, &[pf.q, pf.cosb, pf.sinb], uni([n_head as u32, hd as u32, rm, 0])), c64(real_m * n_head * half), 1);
+                disp(pf.p_br, mkset(pf.p_br.2, &[pf.o32, pf.cosb, pf.sinb], uni([n_kv as u32, hd as u32, rm, 0])), c64(real_m * n_kv * half), 1); bar();
+                // Copy the real K/V into the resident cache at position `pos`.
+                bar_c2t();
+                dv.cmd_copy_buffer(cmd, pf.o32, l.kc, &[vk::BufferCopy::default().size(kvsz).dst_offset(kvoff)]);
+                dv.cmd_copy_buffer(cmd, pf.ffn32, l.vc, &[vk::BufferCopy::default().size(kvsz).dst_offset(kvoff)]);
+                bar_t2c();
+                // Decode SDPA over the resident cache (row i attends 0..=pos+i).
+                disp(pf.p_bsd, mkset(pf.p_bsd.2, &[pf.q, l.kc, l.vc, pf.attn32], uni5([n_head as u32, n_kv as u32, hd as u32, rm, pos as u32])), c64(real_m * n_head), 1); bar();
+            }
             // Wo + residual.
             mvq4(l.wo, pf.attn32, pf.o32, n_embd, n_embd); bar();
-            disp(pf.p_add, mkset(pf.p_add.2, &[pf.x32, pf.o32], uni([(real_m * n_embd) as u32, 0, 0, 0])), c64(real_m * n_embd), 1); bar();
+            if !v_skip_extra { disp(pf.p_add, mkset(pf.p_add.2, &[pf.x32, pf.o32], uni([(real_m * n_embd) as u32, 0, 0, 0])), c64(real_m * n_embd), 1); bar(); }
             // FFN.
-            disp(pf.p_bn, mkset(pf.p_bn.2, &[pf.x32, l.ffn_norm, pf.n32], u_eps), rm, 1); bar();
+            if !v_skip_norm { disp(pf.p_bn, mkset(pf.p_bn.2, &[pf.x32, l.ffn_norm, pf.n32], u_eps), rm, 1); bar(); }
             mvq4(l.w13, pf.n32, pf.gu, 2 * n_inter, n_embd); bar();
-            disp(pf.p_bsi, mkset(pf.p_bsi.2, &[pf.gu, pf.h32], uni([n_inter as u32, rm, 0, 0])), c64(real_m * n_inter), 1); bar();
+            if !v_skip_extra { disp(pf.p_bsi, mkset(pf.p_bsi.2, &[pf.gu, pf.h32], uni([n_inter as u32, rm, 0, 0])), c64(real_m * n_inter), 1); bar(); }
             mvf16(l.w2_f16, pf.h32, pf.ffn32, n_embd, n_inter); bar();
-            disp(pf.p_add, mkset(pf.p_add.2, &[pf.x32, pf.ffn32], uni([(real_m * n_embd) as u32, 0, 0, 0])), c64(real_m * n_embd), 1); bar();
+            if !v_skip_extra { disp(pf.p_add, mkset(pf.p_add.2, &[pf.x32, pf.ffn32], uni([(real_m * n_embd) as u32, 0, 0, 0])), c64(real_m * n_embd), 1); bar(); }
         }
         // Final norm; ONE batched Q6 LM head over all real_m rows (weight streamed
         // once, not real_m times) -> vlogits[real_m, vocab]; then per-row argmax.
@@ -2175,6 +2182,18 @@ mod tests {
             let _ = model.verify_forward(&vinp[..mm], prompt.len()); // warm up (builds for this M)
             let tv = Instant::now(); for _ in 0..n { let _ = model.verify_forward(&vinp[..mm], prompt.len()); } let v_ms = tv.elapsed().as_secs_f64() * 1e3 / n as f64;
             eprintln!("  probe: verify({mm})={v_ms:.2}ms = {:.1} greedy tokens (greedy_tok={g_ms:.2}ms; win at M needs < accepted+1)", v_ms / g_ms);
+        }
+        // Decompose where verify's time goes vs a 6ms greedy decode of the same M=1
+        // work: matvec-only floor, +sdpa/kvcopy, +norms/residual = full. Localizes
+        // the recoverable overhead (stale SDPA + transfer-copy K/V vs the deployed
+        // fused kvwrite + barrier-lean SDPA in forward_inner).
+        let timed = |m: usize| { let _ = model.verify_forward(&vinp[..m], prompt.len());
+            let t = Instant::now(); for _ in 0..n { let _ = model.verify_forward(&vinp[..m], prompt.len()); } t.elapsed().as_secs_f64() * 1e3 / n as f64 };
+        for (label, var) in [("matvec-only", "VK_V_MVONLY"), ("no-sdpa+kvcopy", "VK_V_NOSDPA"), ("full", "")] {
+            if !var.is_empty() { unsafe { std::env::set_var(var, "1"); } }
+            let (v1, v4) = (timed(1), timed(4));
+            if !var.is_empty() { unsafe { std::env::remove_var(var); } }
+            eprintln!("  decomp[{label:>14}]: verify(1)={v1:.2}ms  verify(4)={v4:.2}ms");
         }
     }
 
