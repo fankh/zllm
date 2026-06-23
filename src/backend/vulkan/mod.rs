@@ -821,8 +821,10 @@ struct PrefillW {
     kc: ash::vk::Buffer, vc: ash::vk::Buffer,                                            // shared decode KV cache
 }
 
-const PREFILL_MAX_M: usize = 256; // fast-lane prompt cap; M padded to this. 256 (vs 128) keeps the
-// coopmat GEMM's M-tiles busy (M=128 ran at 4.4 TFLOP/s, M=256 at 8.1 for ~the same wall time).
+const PREFILL_MAX_M: usize = 1024; // single-pass batched prefill cap. The per-call tile is dynamic
+// (round_up(real_m,128)), so short prompts stay small; raising the CAP lets prompts up to 1024 tok
+// prefill in ONE coopmat forward (the prefill→decode handoff for RAG-scale prompts). Buffers grow
+// to this (gu = 1024*2*n_inter*4 ≈ 67MB). M=128 GEMM 4.4 TFLOP/s, M=256 8.1, M=512 10.2 (amortizes).
 const VERIFY_MAX_M: usize = 8;    // spec-decode verify window cap (matvec MAXM)
 
 // Resources for the batched prefill forward (built once at load).
@@ -2484,7 +2486,8 @@ mod tests {
     #[ignore]
     fn vk_prefill_vs_candle() {
         use std::time::Instant;
-        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        let path = std::env::var("ZLLM_MODEL").unwrap_or_else(|_| "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf".to_string());
+        let path = path.as_str();
         if !std::path::Path::new(path).exists() { eprintln!("model not found; skipping"); return; }
         let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan ({e}); skipping"); return; } };
         let model = VkModel::load(path, ctx).expect("load");

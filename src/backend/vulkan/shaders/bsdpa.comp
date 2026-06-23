@@ -13,7 +13,7 @@ layout(binding = 1) readonly  buffer KC_ { float kc[];   };
 layout(binding = 2) readonly  buffer VC_ { float vc[];   };
 layout(binding = 3) writeonly buffer O_  { float outp[]; };
 layout(binding = 4) uniform   P_ { uint n_head; uint n_kv; uint hd; uint m_rows; } p;
-const uint MAXSEQ = 256u;
+const uint MAXSEQ = 1024u;  // = PREFILL_MAX_M (longest single-pass prefill); causal scores/query
 shared float sc[MAXSEQ];   // scores, then probs
 shared float qsh[64];      // this (query,head)'s query
 shared float red[64];      // reduction scratch
