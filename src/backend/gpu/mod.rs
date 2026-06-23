@@ -2797,27 +2797,47 @@ struct BlockState {
     cache_map: std::collections::HashMap<u64, u32>,
     /// Physical block → its registered prefix hash (to drop the map entry on reclaim).
     block_hash: Vec<Option<u64>>,
+    /// Per physical block: the `clock` tick of its last cache use (register or
+    /// reuse). Used to reclaim the LEAST-recently-used cached block first so a hot
+    /// shared prefix (low-index, allocated early) survives churn from cold one-offs.
+    last_use: Vec<u64>,
+    /// Monotonic logical clock, bumped on every cache touch (LRU ordering key).
+    clock: u64,
+    /// A/B: reclaim by lowest index (old behaviour) instead of LRU. Set from
+    /// `ZLLM_FIRST_FIT` at construction; tests flip it directly to compare.
+    first_fit: bool,
     /// Prefix-cache stats, in blocks (reused vs freshly prefilled).
     hits: u64,
     misses: u64,
 }
 
 impl BlockState {
-    /// Allocate one physical block: prefer a truly-free block; else reclaim an
-    /// unreferenced (refcount 0) cached block, dropping its prefix-cache entry.
-    /// Returns None only if every block is currently referenced.
+    /// Allocate one physical block: prefer a truly-free block; else reclaim the
+    /// LEAST-recently-used unreferenced (refcount 0) cached block, dropping its
+    /// prefix-cache entry. Returns None only if every block is currently referenced.
     fn alloc(&mut self) -> Option<u32> {
         if let Some(b) = self.free.pop() {
             self.refcount[b as usize] = 1;
             return Some(b);
         }
-        let reclaim = (0..self.refcount.len()).find(|&i| self.refcount[i] == 0 && self.block_hash[i].is_some());
+        // LRU reclaim: among reclaimable cached blocks pick the one with the
+        // smallest last-use tick (first-fit by index would evict hot low-index
+        // prefix blocks before cold high-index one-offs — exactly backwards).
+        let reclaimable = (0..self.refcount.len())
+            .filter(|&i| self.refcount[i] == 0 && self.block_hash[i].is_some());
+        let reclaim = if self.first_fit { reclaimable.min() } else { reclaimable.min_by_key(|&i| self.last_use[i]) };
         if let Some(i) = reclaim {
             if let Some(h) = self.block_hash[i].take() { self.cache_map.remove(&h); }
             self.refcount[i] = 1;
             return Some(i as u32);
         }
         None
+    }
+
+    /// Stamp `phys` as just-used for LRU ordering (bump the logical clock).
+    fn touch(&mut self, phys: u32) {
+        self.clock += 1;
+        self.last_use[phys as usize] = self.clock;
     }
 }
 
@@ -2866,6 +2886,9 @@ impl<'a> BatchedDecoder<'a> {
             refcount: vec![0u32; n_blocks],
             cache_map: std::collections::HashMap::new(),
             block_hash: vec![None; n_blocks],
+            last_use: vec![0u64; n_blocks],
+            clock: 0,
+            first_fit: std::env::var("ZLLM_FIRST_FIT").is_ok(),
             hits: 0, misses: 0,
         };
         Self {
@@ -3083,6 +3106,7 @@ impl<'a> BatchedDecoder<'a> {
             match bs.cache_map.get(&h).copied() {
                 Some(phys) => {
                     bs.refcount[phys as usize] += 1;
+                    bs.touch(phys); // LRU: a reused prefix block is hot — keep it
                     bs.slot_blocks[slot as usize].push(phys);
                     bs.table_host[slot as usize * self.max_blocks_per_seq + lb] = phys;
                     cached_blocks += 1;
@@ -3109,7 +3133,7 @@ impl<'a> BatchedDecoder<'a> {
             let h = prefix_block_hash(prev_h, &prompt[lb * bsz..(lb + 1) * bsz]);
             prev_h = h;
             let phys = bs.slot_blocks[slot as usize][lb];
-            if !bs.cache_map.contains_key(&h) { bs.cache_map.insert(h, phys); bs.block_hash[phys as usize] = Some(h); }
+            if !bs.cache_map.contains_key(&h) { bs.cache_map.insert(h, phys); bs.block_hash[phys as usize] = Some(h); bs.touch(phys); }
         }
     }
 
@@ -3840,6 +3864,37 @@ impl GpuBatchServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// LRU block reclaim (pure logic, no GPU): under pool pressure `alloc` must
+    /// evict the LEAST-recently-used cached block so a hot shared prefix (touched
+    /// often) survives churn from cold one-offs. First-fit-by-index (the old
+    /// behaviour) would evict in index order [0,1,2,3] and thrash the hot prefix.
+    #[test]
+    fn gpu_block_lru_reclaim() {
+        let mut bs = BlockState {
+            free: Vec::new(),                    // pool exhausted → every alloc reclaims
+            slot_blocks: vec![Vec::new(); 1],
+            table_host: vec![0; 8],
+            refcount: vec![0u32; 4],             // all reclaimable
+            cache_map: std::collections::HashMap::new(),
+            block_hash: vec![None; 4],
+            last_use: vec![0u64; 4],
+            clock: 0,
+            first_fit: false,
+            hits: 0, misses: 0,
+        };
+        for (b, h) in [(0u32, 100u64), (1, 101), (2, 102), (3, 103)] {
+            bs.cache_map.insert(h, b);
+            bs.block_hash[b as usize] = Some(h);
+        }
+        // Touch order 2,3,0,1 → ticks [3,4,1,2]; block 2 is LRU, block 1 is MRU.
+        for b in [2u32, 3, 0, 1] { bs.touch(b); }
+        // Each alloc consumes one cached block (refcount→1, hash dropped); the next
+        // picks the next-coldest. Reclaim order is LRU→MRU, NOT index order.
+        let order: Vec<u32> = (0..4).map(|_| bs.alloc().expect("reclaimable")).collect();
+        assert_eq!(order, vec![2, 3, 0, 1], "must reclaim least-recently-used first (hot prefix last)");
+        assert!(bs.alloc().is_none(), "pool fully consumed");
+    }
 
     /// Smallest possible end-to-end GPU compute: upload a vector, run a
     /// WGSL shader that doubles each element, read it back, verify. Proves
@@ -5047,6 +5102,48 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         assert!(reused >= 2, "expected B to reuse ≥2 shared-prefix blocks, got {reused}");
         assert_eq!(got_b, ref_b, "prefix-cached output diverged from cold computation");
         eprintln!("prefix-cached B is bit-identical to cold B ✓");
+    }
+
+    /// LRU vs first-fit reclaim under overcommit pressure (the workload paged KV
+    /// exists for): a HOT shared prefix is re-admitted every round while COLD
+    /// one-off prompts churn a small pool. LRU keeps the hot prefix resident →
+    /// it keeps hitting; first-fit evicts the low-index hot blocks first → thrash.
+    /// `cargo test --release --features gpu --lib gpu_lru_vs_firstfit -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gpu_lru_vs_firstfit() {
+        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() { eprintln!("model not found; skipping"); return; }
+        let ctx = match GpuContext::new() { Ok(c) => c, Err(e) => { eprintln!("no GPU ({e}); skipping"); return; } };
+        let model = GpuModel::load(path, ctx).expect("load");
+
+        const ROUNDS: usize = 10;
+        // Hot request = 48-token shared prefix (3 full blocks) + a short unique tail.
+        let shared: Vec<u32> = (0..48u32).map(|i| 1000 + i).collect();
+        let mut hot = shared.clone(); hot.extend([2001, 2002, 2003, 2004]);
+
+        // Small overcommitted pool: 8 blocks, ≤4 per seq (max_seq 64). Hot needs 4,
+        // each cold one-off needs 3 → cold churn forces cache-block reclaim.
+        let run = |first_fit: bool| -> u64 {
+            let dec = model.batched_decoder_paged(2, 64, 8);
+            dec.blocks.borrow_mut().first_fit = first_fit;
+            let mut hot_hits = 0u64;
+            for r in 0..ROUNDS {
+                let (_, cached) = dec.prefill_slot_cached(&hot, 0, None);
+                if cached > 0 { hot_hits += 1; }
+                dec.free_slot(0);
+                let cold: Vec<u32> = (0..48u32).map(|i| 50_000 + (r as u32) * 100 + i).collect();
+                dec.prefill_slot_cached(&cold, 1, None);
+                dec.free_slot(1);
+            }
+            hot_hits
+        };
+        let lru = run(false);
+        let ff = run(true);
+        eprintln!("hot-prefix HITS over {ROUNDS} rounds under churn: LRU {lru} vs first-fit {ff}");
+        assert!(lru > ff, "LRU should keep the hot prefix resident more than first-fit ({lru} vs {ff})");
+        assert!(lru >= ROUNDS as u64 - 1, "LRU should hit every round after warmup, got {lru}/{ROUNDS}");
+        eprintln!("LRU reclaim keeps the hot prefix resident under pressure ✓");
     }
 
     /// GPU temperature sampling (Gumbel-max): temp=0 must equal greedy and ignore
