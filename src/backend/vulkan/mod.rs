@@ -2197,6 +2197,84 @@ mod tests {
         }
     }
 
+    /// TREE DRAFTING acceptance prototype: generate real greedy text with VkModel,
+    /// then SIMULATE the spec-decode loop with linear n-gram drafts vs a draft TREE
+    /// at MATCHED verify-row budgets, measuring tokens/forward (acceptance). No GPU
+    /// tree-mask kernel yet — this validates whether the acceptance gain is worth
+    /// building one. Higher tok/forward shifts the spec-decode win threshold above
+    /// the verify matvec floor (~28ms @ M=4 → break-even at 4.75 tok/forward).
+    /// `cargo test --release --features vulkan --lib vk_tree_drafting -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_tree_drafting() {
+        use crate::engine::spec_decode::{lookup_draft_best, lookup_tree, tree_accept};
+        let path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() { eprintln!("model not found; skipping"); return; }
+        let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan device ({e}); skipping"); return; } };
+        let model = VkModel::load(path, ctx).expect("load");
+        let max_len = 3; // n-gram lookup length
+        // Simulate the greedy spec loop: at each forward, commit accepted+1 tokens.
+        let sim_lin = |full: &[u32], start: usize, k: usize| -> (usize, usize) {
+            let (mut p, mut fwd) = (start, 0usize);
+            while p < full.len() {
+                let d = lookup_draft_best(&full[..p], &full[..p], max_len, k).unwrap_or_default();
+                let acc = d.iter().zip(&full[p..]).take_while(|(a, b)| a == b).count();
+                p += (acc + 1).min(full.len() - p); fwd += 1;
+            }
+            (full.len() - start, fwd)
+        };
+        let sim_tree = |full: &[u32], start: usize, branch: usize, nodes: usize| -> (usize, usize) {
+            let (mut p, mut fwd) = (start, 0usize);
+            while p < full.len() {
+                let t = lookup_tree(&full[..p], &full[..p], max_len, branch, nodes);
+                let acc = tree_accept(&t, &full[p..]);
+                p += (acc + 1).min(full.len() - p); fwd += 1;
+            }
+            (full.len() - start, fwd)
+        };
+        // Iterated LINEAR lookup: re-look-up after each drafted token to extend the
+        // single spine (isolates iteration from the tree's branching).
+        let sim_lin_iter = |full: &[u32], start: usize, k: usize| -> (usize, usize) {
+            let (mut p, mut fwd) = (start, 0usize);
+            while p < full.len() {
+                let mut ctx: Vec<u32> = full[..p].to_vec();
+                let mut draft: Vec<u32> = Vec::new();
+                for _ in 0..k {
+                    match lookup_draft_best(&full[..p], &ctx, max_len, 1) {
+                        Some(d) if !d.is_empty() => { ctx.push(d[0]); draft.push(d[0]); }
+                        _ => break,
+                    }
+                }
+                let acc = draft.iter().zip(&full[p..]).take_while(|(a, b)| a == b).count();
+                p += (acc + 1).min(full.len() - p); fwd += 1;
+            }
+            (full.len() - start, fwd)
+        };
+        // Generate greedy continuations for a few prompts (real model output).
+        let prompts: Vec<(&str, Vec<u32>)> = vec![
+            ("general", vec![128000, 791, 6864, 315, 9822, 374]),       // "The capital of France is"
+            ("list",    vec![128000, 7896, 220, 16, 311, 220, 605, 25]), // "List 1 to 10:"
+            ("echo",    { let mut p = vec![128000u32]; for _ in 0..8 { p.extend_from_slice(&[791, 4062, 14198, 39935]); } p }), // repetitive
+        ];
+        let n_gen = 240usize;
+        for (label, prompt) in &prompts {
+            let mut full = prompt.clone();
+            let mut next = 0u32;
+            for (i, &t) in prompt.iter().enumerate() { next = model.forward_argmax(t, i); }
+            full.push(next); let mut pos = prompt.len();
+            while full.len() < prompt.len() + n_gen { next = model.forward_argmax(next, pos); full.push(next); pos += 1; }
+            eprintln!("[{label}] {} generated tokens (matched verify-row budget B: linear k=B-1 vs tree B nodes, branch 2):", n_gen);
+            for &b in &[4usize, 8, 16] {
+                let (lt, lf) = sim_lin(&full, prompt.len(), b - 1);
+                let (it, if_) = sim_lin_iter(&full, prompt.len(), b - 1);
+                let (tt, tf) = sim_tree(&full, prompt.len(), 2, b);
+                let (ltpf, itpf, ttpf) = (lt as f64 / lf as f64, it as f64 / if_ as f64, tt as f64 / tf as f64);
+                eprintln!("   B={b:>2}: linear {ltpf:.2}  |  iter-linear {itpf:.2}  |  tree {ttpf:.2} tok/fwd  (tree vs linear {:+.0}%, tree vs iter {:+.0}%)",
+                    (ttpf / ltpf - 1.0) * 100.0, (ttpf / itpf - 1.0) * 100.0);
+            }
+        }
+    }
+
     /// greedy decode matches candle CPU token-for-token (the engine the server
     /// will use). Also prints decode tok/s on real weights.
     /// `cargo test --release --features vulkan --lib vk_model_vs_candle -- --ignored --nocapture`

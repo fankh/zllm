@@ -77,6 +77,152 @@ pub fn lookup_draft_best(
     None
 }
 
+// ---------------------------------------------------------------------------
+// Tree drafting (SpecInfer/Medusa-style token tree)
+//
+// A linear draft bets the whole row budget on ONE continuation: it accepts only
+// up to the first token where the model disagrees with the top-1 n-gram guess.
+// A token TREE spends the same budget across several branches — each node's
+// children are the top-`branch` n-gram continuations — so the model's true
+// continuation is recovered whenever it sits in the top-B at each step, not just
+// the top-1. Verified in ONE forward with a tree-attention mask (each node
+// attends only its ancestor path). Raises tokens/forward → shifts the spec-decode
+// win threshold above the verify matvec floor. This module builds + scores the
+// tree; the GPU tree-mask SDPA is the separate kernel a win needs.
+// ---------------------------------------------------------------------------
+
+/// One node of a flattened speculative token tree. `node[0]` is the root (the
+/// already-committed token); every other node is a candidate continuation.
+/// `parent` is the attention ancestry (a node attends 0..=pos AND its ancestor
+/// chain) and `depth` is the position offset from the root.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TreeNode {
+    pub token: u32,
+    pub parent: usize,
+    pub depth: usize,
+}
+
+/// A flattened draft tree ready for tree-mask verification.
+#[derive(Clone, Debug, Default)]
+pub struct DraftTree {
+    pub nodes: Vec<TreeNode>,
+}
+
+impl DraftTree {
+    pub fn len(&self) -> usize { self.nodes.len() }
+    pub fn is_empty(&self) -> bool { self.nodes.is_empty() }
+
+    /// Tokens on the path root→node, excluding the root, in depth order.
+    fn path_after_root(&self, mut idx: usize) -> Vec<u32> {
+        let mut t = Vec::new();
+        while idx != 0 {
+            t.push(self.nodes[idx].token);
+            idx = self.nodes[idx].parent;
+        }
+        t.reverse();
+        t
+    }
+}
+
+/// Distinct tokens that followed `key` in `haystack`, ranked by match frequency
+/// (then recency), capped at `branch`. Returns `(token, count)`.
+fn ngram_continuations(haystack: &[u32], key: &[u32], branch: usize) -> Vec<(u32, usize)> {
+    let l = key.len();
+    if l == 0 || haystack.len() <= l || branch == 0 {
+        return Vec::new();
+    }
+    let mut count: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    let mut last_seen: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for start in 0..=haystack.len() - l - 1 {
+        if haystack[start..start + l] == *key {
+            let nxt = haystack[start + l];
+            *count.entry(nxt).or_default() += 1;
+            last_seen.insert(nxt, start); // later overwrites → most-recent wins
+        }
+    }
+    let mut v: Vec<(u32, usize)> = count.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(last_seen[&b.0].cmp(&last_seen[&a.0])));
+    v.truncate(branch);
+    v
+}
+
+/// Best n-gram continuations for `recent`: try the longest key first (most
+/// context = most confident), falling back to shorter for coverage. Mirrors
+/// `lookup_draft_best`'s multi-length policy but returns the top-`branch` set.
+fn best_continuations(haystack: &[u32], recent: &[u32], max_len: usize, branch: usize) -> Vec<(u32, usize)> {
+    let min_len = 2;
+    for len in (min_len..=max_len.max(min_len)).rev() {
+        if recent.len() < len {
+            continue;
+        }
+        let key = &recent[recent.len() - len..];
+        let c = ngram_continuations(haystack, key, branch);
+        if !c.is_empty() {
+            return c;
+        }
+    }
+    Vec::new()
+}
+
+/// Build a draft tree (≤ `max_nodes` nodes) rooted at the last `recent` token.
+/// Expansion is best-first by cumulative path probability (product of per-step
+/// frequency shares), so the node budget concentrates on the most probable
+/// continuations — a deep "spine" along the confident path plus shallow branches
+/// where the n-gram is least sure. `branch` children per node, n-gram length up
+/// to `max_len`.
+pub fn lookup_tree(haystack: &[u32], recent: &[u32], max_len: usize, branch: usize, max_nodes: usize) -> DraftTree {
+    let Some(&root_tok) = recent.last() else { return DraftTree::default() };
+    let mut tree = DraftTree { nodes: vec![TreeNode { token: root_tok, parent: 0, depth: 0 }] };
+    if max_nodes <= 1 || branch == 0 {
+        return tree;
+    }
+    // Frontier of expandable nodes with their cumulative path score.
+    let mut frontier: Vec<(f64, usize)> = vec![(1.0, 0)];
+    while tree.nodes.len() < max_nodes && !frontier.is_empty() {
+        // Expand the highest-scoring frontier node (best-first / probable-tree).
+        let bi = (0..frontier.len())
+            .max_by(|&a, &b| frontier[a].0.partial_cmp(&frontier[b].0).unwrap())
+            .unwrap();
+        let (score, idx) = frontier.remove(bi);
+        let mut eff: Vec<u32> = recent.to_vec();
+        eff.extend(tree.path_after_root(idx));
+        let conts = best_continuations(haystack, &eff, max_len, branch);
+        let total: usize = conts.iter().map(|c| c.1).sum::<usize>().max(1);
+        for (tok, cnt) in conts {
+            if tree.nodes.len() >= max_nodes {
+                break;
+            }
+            let child = tree.nodes.len();
+            tree.nodes.push(TreeNode { token: tok, parent: idx, depth: tree.nodes[idx].depth + 1 });
+            frontier.push((score * (cnt as f64 / total as f64), child));
+        }
+    }
+    tree
+}
+
+/// Greedy tree acceptance: how many tokens of the model's true continuation
+/// `target` (target[0] = the token after the root) follow a connected root path
+/// in the tree. This is exactly what a greedy tree-verify commits minus the
+/// bonus: the model's argmax chain is followed as deep as the tree contains it.
+pub fn tree_accept(tree: &DraftTree, target: &[u32]) -> usize {
+    if tree.nodes.is_empty() {
+        return 0;
+    }
+    let mut cur = 0usize; // root
+    let mut acc = 0usize;
+    'next: for &want in target {
+        for (i, n) in tree.nodes.iter().enumerate() {
+            if i != 0 && n.parent == cur && n.token == want {
+                cur = i;
+                acc += 1;
+                continue 'next;
+            }
+        }
+        break;
+    }
+    acc
+}
+
 /// Given main-model logits at K+1 positions (one per input token)
 /// and the K drafts that occupied positions 1..K+1, return:
 ///   - the number of drafts the main model agrees with (greedy
@@ -300,5 +446,60 @@ mod tests {
         let mut v = vec![0.0; vocab];
         v[peak as usize] = 10.0;
         v
+    }
+
+    // --- tree drafting ---
+
+    #[test]
+    fn ngram_continuations_ranked_by_frequency_then_recency() {
+        // [1,2] is followed by 3 (twice) and 4 (once). 3 ranks first (frequency).
+        let h = vec![1, 2, 3, 9, 1, 2, 3, 9, 1, 2, 4, 9];
+        let c = ngram_continuations(&h, &[1, 2], 4);
+        assert_eq!(c, vec![(3, 2), (4, 1)]);
+    }
+
+    #[test]
+    fn tree_recovers_what_linear_misses() {
+        // [1,2] is followed by 4,5 (older) and by 3,6 (most recent). A LINEAR draft
+        // bets on the most-recent continuation (3,…) and accepts 0 of the true
+        // continuation [4,5]. The TREE keeps both 3 and 4 as depth-1 children, so it
+        // follows 4 then 5 → accepts 2.
+        let h = vec![1, 2, 4, 5, 8, 1, 2, 3, 6, 9];
+        let recent = [1u32, 2];
+        let target = [4u32, 5]; // the model's true continuation after the root (2)
+
+        let linear = lookup_draft_best(&h, &recent, 2, 3).unwrap();
+        assert_eq!(linear, vec![3, 6, 9]); // most-recent match
+        let linear_accept = linear.iter().zip(&target).take_while(|(a, b)| a == b).count();
+        assert_eq!(linear_accept, 0);
+
+        let tree = lookup_tree(&h, &recent, 2, 2, 8);
+        assert_eq!(tree.nodes[0].token, 2); // root = the committed token
+        assert_eq!(tree_accept(&tree, &target), 2); // tree follows 4→5
+
+        assert!(tree_accept(&tree, &target) > linear_accept, "tree must beat linear here");
+    }
+
+    #[test]
+    fn tree_accept_follows_spine_and_stops_off_tree() {
+        // Continuation 1→2→3→4: a deterministic spine. recent=[7,1] so the root
+        // context ([7,1]) is present in the haystack and the spine expands.
+        let h = vec![1, 2, 3, 4, 7, 1, 2, 3, 4, 8, 1];
+        let tree = lookup_tree(&h, &[7u32, 1], 2, 2, 8); // root token = 1
+        assert_eq!(tree_accept(&tree, &[2, 3, 4]), 3); // whole spine
+        assert_eq!(tree_accept(&tree, &[2, 9]), 1);    // diverges after 2
+        assert_eq!(tree_accept(&tree, &[5]), 0);       // not in tree at all
+    }
+
+    #[test]
+    fn tree_respects_node_budget() {
+        let h = vec![1, 2, 3, 1, 2, 4, 1, 2, 5, 1, 3, 6, 1, 3, 7, 1];
+        let tree = lookup_tree(&h, &[0u32, 1], 2, 3, 5);
+        assert!(tree.len() <= 5, "tree exceeded node budget: {}", tree.len());
+        assert_eq!(tree.nodes[0].depth, 0);
+        // every non-root node points at a shallower parent
+        for (i, n) in tree.nodes.iter().enumerate().skip(1) {
+            assert!(n.parent < i && n.depth == tree.nodes[n.parent].depth + 1);
+        }
     }
 }
