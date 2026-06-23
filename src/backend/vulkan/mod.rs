@@ -2195,6 +2195,35 @@ mod tests {
         assert!(agree >= 8, "VkModel diverges from candle too early ({agree}); kernel/wiring bug");
     }
 
+    /// BATCHED THROUGHPUT SCALING: time the batched forward (verify_forward, M rows in ONE
+    /// forward via batched_matvec_q4k) at M=1..8 to see how aggregate tok/s scales with the
+    /// batch — does weight-amortization push the BW-bound single-stream into compute-bound
+    /// throughput that beats llama-server's batched decode?
+    /// `ZLLM_CTX=64 cargo test --release --features vulkan --lib vk_batch_scaling -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_batch_scaling() {
+        use std::time::Instant;
+        let path = std::env::var("ZLLM_MODEL").unwrap_or_else(|_| "C:/models/llama-3.2-1b/Llama-3.2-1B-Q4pure.gguf".to_string());
+        if !std::path::Path::new(&path).exists() { eprintln!("model not found at {path}; skipping"); return; }
+        let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan ({e}); skipping"); return; } };
+        let model = VkModel::load(&path, ctx).expect("load");
+        let depth: usize = std::env::var("ZLLM_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+        let mut next = 128000u32;
+        for i in 0..depth { next = model.forward_argmax(if i == 0 { 128000 } else { next }, i); }
+        eprintln!("=== batched VkModel decode scaling @ctx~{} (vs llama: 1=229 8=1008) ===", depth);
+        for m in [1usize, 2, 4, 8] {
+            let toks: Vec<u32> = (0..m).map(|i| (100 + i) as u32).collect();
+            let reps = 60usize;
+            for _ in 0..3 { let _ = model.verify_forward(&toks, depth); } // warm
+            let t0 = Instant::now();
+            for _ in 0..reps { let _ = model.verify_forward(&toks, depth); }
+            let dt = t0.elapsed().as_secs_f64();
+            eprintln!("  M={}: {:.0} tok/s aggregate  ({:.2} ms/forward, {:.0} tok/s/stream)",
+                m, (m * reps) as f64 / dt, dt * 1e3 / reps as f64, reps as f64 / dt);
+        }
+    }
+
     /// SLOT KV-WRITE scatter (step 3a): each stream writes its roped K/V into its own
     /// slot at its own position. Validated by reading the cache back.
     /// `cargo test --release --features vulkan --lib vk_kvwrite_slot -- --ignored --nocapture`
@@ -2553,6 +2582,17 @@ mod tests {
         unsafe { sdpa_bench_inner(&ctx); }
     }
 
+    /// BATCHED-MATVEC SCALING: weight-stationary Q4_K matvec (batched_matvec_q4k) at M=1..8 on
+    /// an uncached shape — does holding the weight stream constant while growing M give ~M×
+    /// aggregate throughput (the batching ceiling that decides if VkModel can beat llama)?
+    /// `cargo test --release --features vulkan --lib vk_bmv_scaling -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_bmv_scaling() {
+        let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan ({e}); skipping"); return; } };
+        unsafe { bmv_scaling_inner(&ctx); }
+    }
+
     /// MATVEC TIMING: per-shape decode-matvec GB/s (Q4_K). CAVEAT: the iter-loop reuses one
     /// weight buffer, so shapes that fit in cache (<~16MB: wq/wv/w2) report CACHE bandwidth
     /// (can exceed the 256 GB/s DRAM peak) — only lm_head (148MB) reflects the true cold-DRAM
@@ -2564,6 +2604,62 @@ mod tests {
     fn vk_matvec_bench() {
         let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan ({e}); skipping"); return; } };
         unsafe { matvec_bench_inner(&ctx); }
+    }
+}
+
+#[cfg(test)]
+unsafe fn bmv_scaling_inner(ctx: &VkContext) {
+    use ash::vk;
+    use candle_core::{Device, Tensor};
+    use candle_core::quantized::{QTensor, GgmlDType};
+    let dev = &ctx.device;
+    let (n, k) = (32768usize, 2048usize); // 37MB Q4 weight — uncached (> L2), so real DRAM streaming
+    let wbytes = {
+        let mut w = vec![0f32; n * k];
+        for i in 0..w.len() { w[i] = ((((i as i64).wrapping_mul(2654435761) & 0xFFFF) as f32) / 32768.0 - 1.0) * 0.3; }
+        QTensor::quantize(&Tensor::from_vec(w, (n, k), &Device::Cpu).unwrap(), GgmlDType::Q4K).unwrap().data().unwrap().to_vec()
+    };
+    let (mv_p, mv_l, mv_sl, _) = ctx.make_pipeline_raw(BMV_Q4K_SPV, 3);
+    let wb = { let (b, _m, p) = ctx.uma_buffer(wbytes.len() as u64).unwrap(); std::ptr::copy_nonoverlapping(wbytes.as_ptr(), p, wbytes.len()); b };
+    let cmd_pool = dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family), None).unwrap();
+    let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(8).pool_sizes(&[
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(24),
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(8)]), None).unwrap();
+    let cs = vk::PipelineStageFlags::COMPUTE_SHADER;
+    let barr = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
+    let gxof = (n as u32).min(65535);
+    eprintln!("=== batched_matvec_q4k scaling, N={} K={} (37MB, uncached) ===", n, k);
+    let mut t1 = 0.0f64;
+    for m in [1usize, 2, 4, 8] {
+        let (xb, _mx, xp) = ctx.uma_buffer((m * k * 4) as u64).unwrap();
+        for i in 0..m * k { *((xp as *mut f32).add(i)) = ((i % 17) as f32 - 8.0) * 0.1; }
+        let (ob, _mo, _) = ctx.uma_buffer((m * n * 4) as u64).unwrap();
+        let (ub, _mu, up) = ctx.uma_buffer(20).unwrap();
+        std::ptr::copy_nonoverlapping([m as u32, n as u32, k as u32, (k / 256) as u32, gxof].as_ptr() as *const u8, up, 20);
+        let set = dev.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&[mv_sl])).unwrap()[0];
+        let infos: Vec<[vk::DescriptorBufferInfo; 1]> = [wb, xb, ob].iter().map(|&b| [vk::DescriptorBufferInfo::default().buffer(b).range(vk::WHOLE_SIZE)]).collect();
+        let ui = [vk::DescriptorBufferInfo::default().buffer(ub).range(vk::WHOLE_SIZE)];
+        let mut w: Vec<vk::WriteDescriptorSet> = infos.iter().enumerate().map(|(i, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(i as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(info)).collect();
+        w.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(3).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&ui));
+        dev.update_descriptor_sets(&w, &[]);
+        let iters = 200u32;
+        let cmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).unwrap()[0];
+        dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+        for _ in 0..iters {
+            dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, mv_p);
+            dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, mv_l, 0, &[set], &[]);
+            dev.cmd_dispatch(cmd, gxof, (n as u32).div_ceil(gxof), 1);
+            dev.cmd_pipeline_barrier(cmd, cs, cs, vk::DependencyFlags::empty(), &[barr], &[], &[]);
+        }
+        dev.end_command_buffer(cmd).unwrap();
+        let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None).unwrap(); let cmds = [cmd];
+        for _ in 0..2 { dev.reset_fences(&[fence]).unwrap(); dev.queue_submit(ctx.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence).unwrap(); dev.wait_for_fences(&[fence], true, u64::MAX).unwrap(); }
+        let t0 = std::time::Instant::now();
+        dev.reset_fences(&[fence]).unwrap(); dev.queue_submit(ctx.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence).unwrap(); dev.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+        let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        if m == 1 { t1 = us; }
+        eprintln!("  M={}: {:>6.1}us/forward  {:>4.1}x throughput vs M=1  ({:.2}x time)", m, us, (m as f64) * t1 / us, us / t1);
+        dev.destroy_fence(fence, None);
     }
 }
 
