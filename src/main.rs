@@ -436,9 +436,22 @@ async fn main() -> anyhow::Result<()> {
                         use std::io::Write;
                         print!("{prompt}");
                         std::io::stdout().flush()?;
-                        // Prefill: feed the prompt; the last argmax is the first generated token.
-                        let mut next = 0u32;
-                        for (i, &t) in prompt_tokens.iter().enumerate() { next = vmodel.forward_argmax(t, i); }
+                        // Prefill → decode KV handoff: prefill fills the SHARED resident KV; decode
+                        // continues from pos = prompt.len() reading that same cache.
+                        let argmax = |v: &[f32]| -> u32 { let mut bi = 0u32; let mut bv = f32::MIN; for (i, &x) in v.iter().enumerate() { if x > bv { bv = x; bi = i as u32; } } bi };
+                        let t_prefill = std::time::Instant::now();
+                        let seq_prefill = std::env::var("ZLLM_SEQ_PREFILL").is_ok(); // A/B: force sequential prefill
+                        let mut next;
+                        if !seq_prefill && !prompt_tokens.is_empty() && prompt_tokens.len() <= vmodel.prefill_cap() {
+                            // Fast path: ONE batched coopmat forward fills the KV (the handoff).
+                            next = argmax(&vmodel.prefill_forward(&prompt_tokens));
+                        } else {
+                            // Fallback (empty or > tile): sequential prefill into the same KV.
+                            let mut n = 0u32;
+                            for (i, &t) in prompt_tokens.iter().enumerate() { n = vmodel.forward_argmax(t, i); }
+                            next = n;
+                        }
+                        let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1e3;
                         let mut pos = prompt_tokens.len();
                         let start = std::time::Instant::now(); // time decode (steady-state)
                         let mut generated = 0usize;
@@ -448,8 +461,8 @@ async fn main() -> anyhow::Result<()> {
                             next = vmodel.forward_argmax(next, pos); pos += 1;
                         }
                         let elapsed = start.elapsed();
-                        println!("\n\n--- {} tokens in {:.2}s ({:.1} tok/s) [ZLLM_VK decode] ---",
-                            generated, elapsed.as_secs_f64(), generated as f64 / elapsed.as_secs_f64());
+                        println!("\n\n--- TTFT {:.0}ms ({} prompt tok) | {} gen tok in {:.2}s ({:.1} tok/s) [ZLLM_VK] ---",
+                            prefill_ms, prompt_tokens.len(), generated, elapsed.as_secs_f64(), generated as f64 / elapsed.as_secs_f64());
                         return Ok(());
                     }
                     Err(e) => tracing::warn!("VkModel load failed ({e}); falling back to candle CPU"),

@@ -1327,6 +1327,10 @@ impl VkModel {
         unsafe { self.prefill_inner(prompt) }
     }
 
+    /// Longest prompt the single-pass batched prefill handles (one coopmat tile). Prompts up to
+    /// this fill the shared KV in one batched forward; longer ones need chunked prefill.
+    pub fn prefill_cap(&self) -> usize { PREFILL_MAX_M }
+
     unsafe fn prefill_inner(&self, prompt: &[u32]) -> Vec<f32> {
         use ash::vk;
         let dv = &self.ctx.device;
