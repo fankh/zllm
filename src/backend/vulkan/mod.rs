@@ -1643,6 +1643,7 @@ impl VkModel {
         let flat_combine = std::env::var("ZLLM_FLAT_COMBINE").is_ok(); // diag A/B: flat vs hierarchical combine
         let online_partial = std::env::var("ZLLM_ONLINE_PARTIAL").is_ok(); // diag A/B: force online (vs 2-pass) partial
         let use_p2 = hd <= 64 && !online_partial; // 2-pass partial only valid for hd<=64
+        let skip_lm = std::env::var("VK_NOLM").is_ok(); // diag: skip LM-head matvec (isolate its cost)
         for l in &self.layers {
             if !skip_norm { disp(self.p_rms, l.attn_norm, 1, 1); bar(); }              // attn norm
             // QKV with RoPE fused into the wq/wk output (q/k come out rotated);
@@ -1675,7 +1676,7 @@ impl VkModel {
         }
         if lm {
             if !skip_norm { disp(self.p_rms, self.s_final_norm, 1, 1); bar(); }        // final norm
-            disp(if self.lm_q4 { self.p_mv } else { self.p_q6k }, self.s_lm, gxof(self.vocab), (self.vocab as u32).div_ceil(gxof(self.vocab))); // LM head (Q4 or Q6)
+            if !skip_lm { disp(if self.lm_q4 { self.p_mv } else { self.p_q6k }, self.s_lm, gxof(self.vocab), (self.vocab as u32).div_ceil(gxof(self.vocab))); } // LM head (Q4 or Q6)
             if argmax { bar(); disp((self.p_argmax.0, self.p_argmax.1), self.s_argmax, 1, 1); }  // GPU argmax (4-byte readback)
         }
         let _ = attn_dim;
@@ -2550,6 +2551,74 @@ mod tests {
     fn vk_sdpa_bench() {
         let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan ({e}); skipping"); return; } };
         unsafe { sdpa_bench_inner(&ctx); }
+    }
+
+    /// MATVEC TIMING: per-shape decode-matvec GB/s (Q4_K). CAVEAT: the iter-loop reuses one
+    /// weight buffer, so shapes that fit in cache (<~16MB: wq/wv/w2) report CACHE bandwidth
+    /// (can exceed the 256 GB/s DRAM peak) — only lm_head (148MB) reflects the true cold-DRAM
+    /// rate (~215 GB/s = 84% of peak). In the real decode every weight streams cold (663MB model
+    /// > cache), so the whole forward is DRAM-bound at the lm_head rate — matvecs are near-optimal.
+    /// `cargo test --release --features vulkan --lib vk_matvec_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_matvec_bench() {
+        let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan ({e}); skipping"); return; } };
+        unsafe { matvec_bench_inner(&ctx); }
+    }
+}
+
+#[cfg(test)]
+unsafe fn matvec_bench_inner(ctx: &VkContext) {
+    use ash::vk;
+    use candle_core::{Device, Tensor};
+    use candle_core::quantized::{QTensor, GgmlDType};
+    let dev = &ctx.device;
+    let qbytes = |n: usize, k: usize| -> Vec<u8> {
+        let mut w = vec![0f32; n * k];
+        for i in 0..w.len() { w[i] = ((((i as i64).wrapping_mul(2654435761) & 0xFFFF) as f32) / 32768.0 - 1.0) * 0.3; }
+        QTensor::quantize(&Tensor::from_vec(w, (n, k), &Device::Cpu).unwrap(), GgmlDType::Q4K).unwrap().data().unwrap().to_vec()
+    };
+    let (mv_p, mv_l, mv_sl, _) = ctx.make_pipeline_raw(DECODE_MATVEC_Q4K_SPV, 3);
+    let cmd_pool = dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family), None).unwrap();
+    let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(8).pool_sizes(&[
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(24),
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(8)]), None).unwrap();
+    let cs = vk::PipelineStageFlags::COMPUTE_SHADER;
+    let barr = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
+    let gxof = |n: usize| (n as u32).min(65535);
+    // (label, rows N, reduction K)
+    let shapes = [("wq/wo", 2048usize, 2048usize), ("wv/wk", 512, 2048), ("w13", 16384, 2048), ("w2", 2048, 8192), ("lm_head", 128256, 2048)];
+    for (label, n, k) in shapes {
+        let wb = { let bytes = qbytes(n, k); let (b, _m, p) = ctx.uma_buffer(bytes.len() as u64).unwrap(); std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len()); b };
+        let (xb, _mx, xp) = ctx.uma_buffer((k * 4) as u64).unwrap();
+        for i in 0..k { *((xp as *mut f32).add(i)) = ((i % 17) as f32 - 8.0) * 0.1; }
+        let (ob, _mo, _) = ctx.uma_buffer((n * 4) as u64).unwrap();
+        let (ub, _mu, up) = ctx.uma_buffer(16).unwrap();
+        std::ptr::copy_nonoverlapping([n as u32, k as u32, (k / 256) as u32, gxof(n)].as_ptr() as *const u8, up, 16);
+        let set = dev.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&[mv_sl])).unwrap()[0];
+        let infos: Vec<[vk::DescriptorBufferInfo; 1]> = [wb, xb, ob].iter().map(|&b| [vk::DescriptorBufferInfo::default().buffer(b).range(vk::WHOLE_SIZE)]).collect();
+        let ui = [vk::DescriptorBufferInfo::default().buffer(ub).range(vk::WHOLE_SIZE)];
+        let mut w: Vec<vk::WriteDescriptorSet> = infos.iter().enumerate().map(|(i, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(i as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(info)).collect();
+        w.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(3).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&ui));
+        dev.update_descriptor_sets(&w, &[]);
+        let iters = 300u32;
+        let cmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).unwrap()[0];
+        dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+        for _ in 0..iters {
+            dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, mv_p);
+            dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, mv_l, 0, &[set], &[]);
+            dev.cmd_dispatch(cmd, gxof(n), (n as u32).div_ceil(gxof(n)), 1);
+            dev.cmd_pipeline_barrier(cmd, cs, cs, vk::DependencyFlags::empty(), &[barr], &[], &[]);
+        }
+        dev.end_command_buffer(cmd).unwrap();
+        let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None).unwrap(); let cmds = [cmd];
+        for _ in 0..2 { dev.reset_fences(&[fence]).unwrap(); dev.queue_submit(ctx.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence).unwrap(); dev.wait_for_fences(&[fence], true, u64::MAX).unwrap(); }
+        let t0 = std::time::Instant::now();
+        dev.reset_fences(&[fence]).unwrap(); dev.queue_submit(ctx.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence).unwrap(); dev.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+        let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        let bytes = n as f64 * k as f64 * 0.5625; // Q4_K ~4.5 bpw
+        eprintln!("matvec {:>8} N={:>6} K={:>5}: {:>6.1}us  {:>5.0} GB/s", label, n, k, us, bytes / us / 1e3);
+        dev.destroy_fence(fence, None);
     }
 }
 
