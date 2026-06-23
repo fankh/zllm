@@ -2113,6 +2113,22 @@ mod tests {
         for (i, &tk) in prompt.iter().enumerate() { next = model.forward_argmax(tk, i); }
         let first_next = next;
         let mut vk_gen = vec![next];
+        // ZLLM_CTX=D: isolate the decode rate AT depth D (no avg-ctx confound). Warm the KV
+        // to D untimed, then time REPS windows of `window` steps starting at pos D (each window
+        // re-attends KV[0..D], overwriting D..D+window). Shows how SDPA scales with context.
+        if let Ok(cs) = std::env::var("ZLLM_CTX") {
+            let depth: usize = cs.parse().unwrap_or(512);
+            let window = 32usize;
+            let mut n = first_next; let mut pos = prompt.len();
+            while pos < depth { n = model.forward_argmax(n, pos); pos += 1; }
+            let nseed = n;
+            let rd: usize = std::env::var("ZLLM_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+            let t = Instant::now();
+            for _ in 0..rd { let mut nn = nseed; let mut p2 = depth; for _ in 0..window { nn = model.forward_argmax(nn, p2); p2 += 1; } }
+            let dt = t.elapsed();
+            eprintln!("VkModel decode @ctx~{}: {:.1} tok/s ({} reps x {} steps)", depth, (rd * window) as f64 / dt.as_secs_f64(), rd, window);
+            return;
+        }
         let t0 = Instant::now();
         let mut total = 0usize;
         for rep in 0..reps {
