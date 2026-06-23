@@ -683,6 +683,21 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
+        Self::from_gguf_requant(ct, reader, device, &|_| None)
+    }
+
+    /// Like `from_gguf`, but each tensor is round-tripped through the sub-Q4
+    /// dtype returned by `requant(name)` (dequantize → re-quantize) before use —
+    /// e.g. `|n| n.contains("ffn_down").then_some(GgmlDType::Q3K)`. The model then
+    /// runs on candle's path carrying that tensor's lower-precision error, which
+    /// is exactly what a Q3 decode kernel would compute. Lets the sensitivity
+    /// harness measure each tensor's quality cost with NO kernel work.
+    pub fn from_gguf_requant<R: std::io::Seek + std::io::Read>(
+        ct: gguf_file::Content,
+        reader: &mut R,
+        device: &Device,
+        requant: &dyn Fn(&str) -> Option<GgmlDType>,
+    ) -> Result<Self> {
         let md_get = |s: &str| match ct.metadata.get(s) {
             None => candle_core::bail!("cannot find {s} in metadata"),
             Some(v) => Ok(v),
@@ -709,31 +724,37 @@ impl ModelWeights {
         let (cos, sin) = precomput_freqs_cis(rope_dim, rope_freq_base, device)?;
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
 
-        let tok_embeddings_q = ct.tensor(reader, "token_embd.weight", device)?;
+        // Load a tensor, optionally re-quantizing it to a sub-Q4 dtype (for the
+        // sensitivity harness). `requant(name) == None` → the tensor verbatim.
+        let get = |reader: &mut R, name: &str| -> Result<QTensor> {
+            let qt = ct.tensor(reader, name, device)?;
+            Ok(match requant(name) {
+                Some(dt) if qt.dtype() != dt => QTensor::quantize(&qt.dequantize(device)?, dt)?,
+                _ => qt,
+            })
+        };
+
+        let tok_embeddings_q = get(reader, "token_embd.weight")?;
         let tok_embeddings = tok_embeddings_q.dequantize(device)?;
         let norm = RmsNorm::from_qtensor(
             ct.tensor(reader, "output_norm.weight", device)?,
             rms_norm_eps,
         )?;
-        let output = match ct.tensor(reader, "output.weight", device) {
+        let output = match get(reader, "output.weight") {
             Ok(tensor) => tensor,
             Err(_) => tok_embeddings_q,
         };
         let mut layers = Vec::with_capacity(block_count);
         for layer_idx in 0..block_count {
             let prefix = format!("blk.{layer_idx}");
-            let attention_wq = ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?;
-            let attention_wk = ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?;
-            let attention_wv = ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?;
-            let attention_wo =
-                ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?;
+            let attention_wq = get(reader, &format!("{prefix}.attn_q.weight"))?;
+            let attention_wk = get(reader, &format!("{prefix}.attn_k.weight"))?;
+            let attention_wv = get(reader, &format!("{prefix}.attn_v.weight"))?;
+            let attention_wo = get(reader, &format!("{prefix}.attn_output.weight"))?;
             let mlp_or_moe = if n_expert <= 1 {
-                let feed_forward_w1 =
-                    ct.tensor(reader, &format!("{prefix}.ffn_gate.weight"), device)?;
-                let feed_forward_w2 =
-                    ct.tensor(reader, &format!("{prefix}.ffn_down.weight"), device)?;
-                let feed_forward_w3 =
-                    ct.tensor(reader, &format!("{prefix}.ffn_up.weight"), device)?;
+                let feed_forward_w1 = get(reader, &format!("{prefix}.ffn_gate.weight"))?;
+                let feed_forward_w2 = get(reader, &format!("{prefix}.ffn_down.weight"))?;
+                let feed_forward_w3 = get(reader, &format!("{prefix}.ffn_up.weight"))?;
                 MlpOrMoe::Mlp(Mlp {
                     feed_forward_w1: QMatMul::from_qtensor(feed_forward_w1)?,
                     feed_forward_w2: QMatMul::from_qtensor(feed_forward_w2)?,

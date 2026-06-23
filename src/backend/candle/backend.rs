@@ -122,6 +122,33 @@ impl CandleCpuBackend {
         self.n_layers
     }
 
+    /// Load a GGUF model, re-quantizing each tensor to the sub-Q4 dtype returned
+    /// by `requant(name)` (dequantize → re-quantize). For the quantization
+    /// sensitivity harness — runs the degraded model on candle's path with no
+    /// kernel change. `requant(name) == None` keeps the tensor verbatim.
+    pub fn load_model_requant(
+        &mut self,
+        path: &Path,
+        requant: &dyn Fn(&str) -> Option<candle_core::quantized::GgmlDType>,
+    ) -> Result<()> {
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| ZllmError::Model(format!("cannot open model file: {e}")))?;
+        let content = gguf_file::Content::read(&mut file)
+            .map_err(|e| ZllmError::Model(format!("invalid GGUF file: {e}")))?;
+        let n_layers = content.metadata.get("llama.block_count").and_then(|v| v.to_u32().ok()).unwrap_or(32) as usize;
+        let hidden_size = content.metadata.get("llama.embedding_length").and_then(|v| v.to_u32().ok()).unwrap_or(4096) as usize;
+        let vocab_size = content.metadata.get("llama.vocab_size").and_then(|v| v.to_u32().ok()).unwrap_or(128256) as usize;
+        let model = ModelWeights::from_gguf_requant(content, &mut file, &self.device, requant)
+            .map_err(|e| ZllmError::Model(format!("failed to load model weights: {e}")))?;
+        self.model = Some(model);
+        self.n_layers = n_layers;
+        self.hidden_size = hidden_size;
+        self.vocab_size = vocab_size;
+        self.hidden_states = vec![vec![0.0; hidden_size]; n_layers];
+        self.index_pos = 0;
+        Ok(())
+    }
+
     /// Run the forward pass and return the next-token logits as a
     /// `Vec<f32>` of length `vocab_size`. Increments `index_pos` for
     /// KV-cache state. Use this when you want to apply a custom sampler
