@@ -1,0 +1,41 @@
+// Flash-decode SDPA combine, HIERARCHICAL (one shader, used for both tree levels). The
+// flat combine (sdpa_flash_combine) ran one workgroup per head, each serially merging ALL
+// n_blocks partials — only n_head=32 workgroups on 40 CUs => occupancy-starved (the combine
+// was ~40% of the SDPA at ctx2048). Here a workgroup merges only `chunk` consecutive input
+// partials in the range [sg*chunk, ...): level 1 launches grid (n_head, ceil(n_in/chunk)) =
+// many workgroups, each writing a super-partial (unnormalized acc, running max m, denom l);
+// level 2 launches grid (n_head, 1) over the few super-partials with final_norm=1 to emit the
+// normalized output. The log-sum-exp merge is associative, so the two-level result is exact.
+// Compile: glslangValidator --target-env vulkan1.3 -V sdpa_flash_combine_h.comp -o sdpa_flash_combine_h.spv
+#version 450 core
+layout(local_size_x = 32) in;
+layout(binding = 0) readonly  buffer IN_  { float inp[];  };  // [n_head, n_in, hd+2]
+layout(binding = 1) writeonly buffer OUT_ { float outp[]; };  // final [n_head,hd] OR super [n_head,n_super,hd+2]
+layout(binding = 2) uniform   P_ { uint n_head; uint n_kv; uint hd; uint n_in; uint chunk; uint final_norm; } p;
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint sg = gl_WorkGroupID.y;                 // super-group index within this head
+    uint lane = gl_LocalInvocationID.x;
+    uint dpl = (p.hd + 31u) / 32u;
+    uint start = sg * p.chunk;
+    uint end = min(start + p.chunk, p.n_in);
+    uint n_super = (p.n_in + p.chunk - 1u) / p.chunk;
+    float gm = -1e30;
+    for (uint b = start; b < end; b++) { gm = max(gm, inp[(h * p.n_in + b) * (p.hd + 2u) + p.hd]); }
+    float gdenom = 0.0;
+    float acc[8]; for (uint i = 0u; i < dpl; i++) { acc[i] = 0.0; }
+    for (uint b = start; b < end; b++) {
+        uint base = (h * p.n_in + b) * (p.hd + 2u);
+        float w = exp(inp[base + p.hd] - gm);
+        gdenom += inp[base + p.hd + 1u] * w;
+        for (uint i = 0u; i < dpl; i++) { uint d = lane + i * 32u; if (d < p.hd) { acc[i] += inp[base + d] * w; } }
+    }
+    if (p.final_norm == 1u) {
+        float inv = 1.0 / gdenom;
+        for (uint i = 0u; i < dpl; i++) { uint d = lane + i * 32u; if (d < p.hd) { outp[h * p.hd + d] = acc[i] * inv; } }
+    } else {
+        uint ob = (h * n_super + sg) * (p.hd + 2u);
+        for (uint i = 0u; i < dpl; i++) { uint d = lane + i * 32u; if (d < p.hd) { outp[ob + d] = acc[i]; } }
+        if (lane == 0u) { outp[ob + p.hd] = gm; outp[ob + p.hd + 1u] = gdenom; }
+    }
+}

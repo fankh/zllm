@@ -23,11 +23,16 @@ const ROPE_SPV: &[u8] = include_bytes!("shaders/rope.spv");
 const SDPA_DECODE_SPV: &[u8] = include_bytes!("shaders/sdpa_decode.spv");
 const SDPA_FLASH_PARTIAL_SPV: &[u8] = include_bytes!("shaders/sdpa_flash_partial.spv");
 const SDPA_FLASH_COMBINE_SPV: &[u8] = include_bytes!("shaders/sdpa_flash_combine.spv");
+const SDPA_FLASH_COMBINE_H_SPV: &[u8] = include_bytes!("shaders/sdpa_flash_combine_h.spv");
 const SDPA_FLASH_BLOCK: usize = 32; // must match BLOCK in the flash shaders
 // Use the barrier-lean single-pass decode SDPA up to this depth (must stay < sdpa_decode's
 // MAXSEQ=512); only beyond it does the flash partial/combine path's extra parallelism pay
 // for its 2 dispatches + combine. The single-pass tree-reduces once, not per position.
 const FLASH_MIN_SEQ: usize = 256;
+// Hierarchical flash combine: each level-1 workgroup merges this many block-partials into one
+// super-partial (grid n_head × ceil(nblk/SUPER) => many workgroups, fixing the flat combine's
+// occupancy starvation); level 2 merges the few super-partials. ~4-6x faster combine at long ctx.
+const SDPA_SUPER: usize = 8;
 const SILU_MUL_SPV: &[u8] = include_bytes!("shaders/silu_mul.spv");
 const DECODE_MATVEC_Q6K_SPV: &[u8] = include_bytes!("shaders/decode_matvec_q6k.spv");
 #[cfg(test)]
@@ -773,6 +778,11 @@ unsafe fn vk_uni8(ctx: &VkContext, bufs: &mut Vec<(ash::vk::Buffer, ash::vk::Dev
     std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, p, 32);
     bufs.push((b, m)); b
 }
+unsafe fn vk_uni8p(ctx: &VkContext, bufs: &mut Vec<(ash::vk::Buffer, ash::vk::DeviceMemory)>, d: [u32; 8]) -> (ash::vk::Buffer, *mut u8) {
+    let (b, m, p) = ctx.uma_buffer(32).unwrap();
+    std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, p, 32);
+    bufs.push((b, m)); (b, p)
+}
 // Repack a raw Q6_K tensor (210-byte blocks) into aligned SoA buffers: ql
 // (128 B/blk), qh (64 B), scales (16 i8/blk, sign-extracted in-shader), d (f32).
 // Scales stay i8 (not expanded to f32) so the matvec stays bandwidth-bound.
@@ -907,6 +917,7 @@ struct VkLayerOps {
     wq_rope: ash::vk::DescriptorSet, wk_rope: ash::vk::DescriptorSet, // QKV+rope fused (q/k)
     kvw_k: ash::vk::DescriptorSet, kvw_v: ash::vk::DescriptorSet, sdpa: ash::vk::DescriptorSet,
     fp: ash::vk::DescriptorSet, fc: ash::vk::DescriptorSet, wo: Mv,
+    fc1: ash::vk::DescriptorSet, fc2: ash::vk::DescriptorSet, // hierarchical combine: L1 (part->super), L2 (super->attn)
     ffn_norm: ash::vk::DescriptorSet, w13: Mv, w2: Mv,
 }
 
@@ -919,6 +930,7 @@ pub struct VkModel {
     lm_nb: usize,
     // per-token mapped uniforms / activations
     x_ptr: *mut u8, cos_ptr: *mut u8, sin_ptr: *mut u8, base_ptr: *mut u8, seq_ptr: *mut u8, logits_ptr: *mut u8,
+    l1_ptr: *mut u8, l2_ptr: *mut u8, // hierarchical-combine L1/L2 uniforms (refreshed per token)
     // descriptor sets
     layers: Vec<VkLayerOps>,
     s_rope_q: ash::vk::DescriptorSet, s_rope_k: ash::vk::DescriptorSet, s_silu: ash::vk::DescriptorSet,
@@ -934,6 +946,8 @@ pub struct VkModel {
     p_rope: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_kvw: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     p_sdpa: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_fp: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     p_fc: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_silu: (ash::vk::Pipeline, ash::vk::PipelineLayout),
+    p_ch: (ash::vk::Pipeline, ash::vk::PipelineLayout), // hierarchical (tree) flash combine
+
     p_add: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_q6k: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     p_argmax: Pipe3, p_mvrope: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     // Pre-allocated scratch for verify_forward (spec-decode), reused every call so
@@ -1086,12 +1100,17 @@ impl VkModel {
         let (logits, logits_ptr) = vk_zeros(&ctx, &mut bufs, vocab);
         let nblk_max = max_seq.div_ceil(SDPA_FLASH_BLOCK);
         let (part, _) = vk_zeros(&ctx, &mut bufs, n_head * nblk_max * (hd + 2));
+        let n_super_max = nblk_max.div_ceil(SDPA_SUPER);
+        let (superp, _) = vk_zeros(&ctx, &mut bufs, n_head * n_super_max * (hd + 2)); // hierarchical-combine scratch
         // Uniforms.
         let (u_norm, _) = vk_uni(&ctx, &mut bufs, [n_embd as u32, eps.to_bits(), 0, 0]);
         let (u_rope_q, _) = vk_uni(&ctx, &mut bufs, [n_head as u32, hd as u32, 0, 0]);
         let (u_rope_k, _) = vk_uni(&ctx, &mut bufs, [n_kv as u32, hd as u32, 0, 0]);
         let (u_base, base_ptr) = vk_uni(&ctx, &mut bufs, [kv_dim as u32, 0, 0, 0]);
         let (u_seq, seq_ptr) = vk_uni(&ctx, &mut bufs, [n_head as u32, n_kv as u32, hd as u32, 1]);
+        // Hierarchical combine uniforms {n_head,n_kv,hd,n_in,chunk,final}; n_in/chunk refreshed per token.
+        let (u_l1, l1_ptr) = vk_uni8p(&ctx, &mut bufs, [n_head as u32, n_kv as u32, hd as u32, 1, SDPA_SUPER as u32, 0, 0, 0]);
+        let (u_l2, l2_ptr) = vk_uni8p(&ctx, &mut bufs, [n_head as u32, n_kv as u32, hd as u32, 1, 1, 1, 0, 0]);
         let (u_silu, _) = vk_uni(&ctx, &mut bufs, [n_inter as u32, 0, 0, 0]);
         let (u_add, _) = vk_uni(&ctx, &mut bufs, [n_embd as u32, 0, 0, 0]);
         let gxof = |n: usize| (n as u32).min(65535);
@@ -1110,6 +1129,7 @@ impl VkModel {
         let (sdpa_p, sdpa_l, sdpa_sl) = mkpipe(SDPA_DECODE_SPV, 4);
         let (fp_p, fp_l, fp_sl) = mkpipe(SDPA_FLASH_PARTIAL_SPV, 4);
         let (fc_p, fc_l, fc_sl) = mkpipe(SDPA_FLASH_COMBINE_SPV, 2);
+        let (ch_p, ch_l, ch_sl) = mkpipe(SDPA_FLASH_COMBINE_H_SPV, 2); // hierarchical combine (both levels)
         let (silu_p, silu_l, silu_sl) = mkpipe(SILU_MUL_SPV, 3);
         let (add_p, add_l, add_sl) = mkpipe(RESIDUAL_ADD_SPV, 2);
         let (q6k_p, q6k_l, q6k_sl) = mkpipe(DECODE_MATVEC_Q6K_SPV, 6);
@@ -1182,6 +1202,8 @@ impl VkModel {
                 sdpa: mkset(sdpa_sl, &[q, r.kc, r.vc, attn], u_seq),
                 fp: mkset(fp_sl, &[q, r.kc, r.vc, part], u_seq),
                 fc: mkset(fc_sl, &[part, attn], u_seq),
+                fc1: mkset(ch_sl, &[part, superp], u_l1),   // L1: block-partials -> super-partials
+                fc2: mkset(ch_sl, &[superp, attn], u_l2),   // L2: super-partials -> attn (normalized)
                 wo,
                 ffn_norm: mkset(rms_sl, &[x_buf, r.fn_, normed], u_norm),
                 w13, w2,
@@ -1258,10 +1280,11 @@ impl VkModel {
 
         Ok(Self {
             n_embd, n_head, n_kv, hd, n_inter, vocab, n_layers, kv_dim, half, max_seq, eps, embed, cos, sin, lm_nb,
-            x_ptr, cos_ptr, sin_ptr, base_ptr, seq_ptr, logits_ptr,
+            x_ptr, cos_ptr, sin_ptr, base_ptr, seq_ptr, logits_ptr, l1_ptr, l2_ptr,
             layers, s_rope_q, s_rope_k, s_silu, s_final_norm, s_lm, s_argmax, argmax_ptr, lm_q4,
             p_rms: (rms_p, rms_l), p_mv: (mv_p, mv_l), p_rope: (rope_p, rope_l), p_kvw: (kvw_p, kvw_l),
             p_sdpa: (sdpa_p, sdpa_l), p_fp: (fp_p, fp_l), p_fc: (fc_p, fc_l), p_silu: (silu_p, silu_l),
+            p_ch: (ch_p, ch_l),
             p_add: (add_p, add_l), p_q6k: (q6k_p, q6k_l), p_argmax: (argmax_p, argmax_l, argmax_sl), p_mvrope: (mvr_p, mvr_l),
             last_rec: std::cell::Cell::new(-1),
             verify_unis, verify_argmax, verify_pool, verify_cmd, verify_fence,
@@ -1584,6 +1607,12 @@ impl VkModel {
         std::ptr::copy_nonoverlapping(self.sin[pos * half..].as_ptr() as *const u8, self.sin_ptr, half * 4);
         std::ptr::copy_nonoverlapping([kv_dim as u32, (pos * kv_dim) as u32, 0u32, 0u32].as_ptr() as *const u8, self.base_ptr, 16);
         std::ptr::copy_nonoverlapping([n_head as u32, n_kv as u32, hd as u32, seq_len].as_ptr() as *const u8, self.seq_ptr, 16);
+        if seq_len as usize > FLASH_MIN_SEQ { // refresh hierarchical-combine uniforms for this depth
+            let nblk = (seq_len as usize).div_ceil(SDPA_FLASH_BLOCK);
+            let n_super = nblk.div_ceil(SDPA_SUPER);
+            std::ptr::copy_nonoverlapping([n_head as u32, n_kv as u32, hd as u32, nblk as u32, SDPA_SUPER as u32, 0u32].as_ptr() as *const u8, self.l1_ptr, 24);
+            std::ptr::copy_nonoverlapping([n_head as u32, n_kv as u32, hd as u32, n_super as u32, n_super as u32, 1u32].as_ptr() as *const u8, self.l2_ptr, 24);
+        }
 
         // Record-once: only re-record when the SDPA grid (single-pass vs flash
         // n_blocks) or the lm/argmax tail changes; otherwise reuse self.cmd.
@@ -1608,6 +1637,7 @@ impl VkModel {
         let skip_extra = mvonly || std::env::var("VK_NOEXTRA").is_ok(); // diag: skip kvwrite+residual
         let skip_norm = mvonly || std::env::var("VK_NONORM").is_ok();   // diag: skip rmsnorms
         let skip_attn = mvonly;                               // diag: skip rope+sdpa
+        let flat_combine = std::env::var("ZLLM_FLAT_COMBINE").is_ok(); // diag A/B: flat vs hierarchical combine
         for l in &self.layers {
             if !skip_norm { disp(self.p_rms, l.attn_norm, 1, 1); bar(); }              // attn norm
             // QKV with RoPE fused into the wq/wk output (q/k come out rotated);
@@ -1620,8 +1650,14 @@ impl VkModel {
             disp(self.p_kvw, l.kvw_v, (kv_dim as u32).div_ceil(64), 1); bar(); }       // append K,V to cache
             if seq_len as usize > FLASH_MIN_SEQ {
                 let nblk = (seq_len as usize).div_ceil(SDPA_FLASH_BLOCK) as u32;
-                disp(self.p_fp, l.fp, n_head as u32, nblk); bar();
-                disp(self.p_fc, l.fc, n_head as u32, 1); bar();
+                let n_super = (nblk as usize).div_ceil(SDPA_SUPER) as u32;
+                disp(self.p_fp, l.fp, n_head as u32, nblk); bar();      // partials per block
+                if flat_combine {
+                    disp(self.p_fc, l.fc, n_head as u32, 1); bar();     // flat combine (A/B baseline)
+                } else {
+                    disp(self.p_ch, l.fc1, n_head as u32, n_super); bar();  // L1: blocks -> super-partials (parallel)
+                    disp(self.p_ch, l.fc2, n_head as u32, 1); bar();        // L2: super-partials -> attn
+                }
             } else {
                 disp(self.p_sdpa, l.sdpa, n_head as u32, 1); bar();
             }
@@ -2500,6 +2536,123 @@ mod tests {
         };
         unsafe { sdpa_correctness_inner(&ctx); }
     }
+
+    /// SDPA TIMING: isolates the flash partial vs combine GPU time at ZLLM_CTX depth, so
+    /// kernel changes are compared without the thermal/forward noise of end-to-end decode.
+    /// `ZLLM_CTX=2048 cargo test --release --features vulkan --lib vk_sdpa_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_sdpa_bench() {
+        let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan ({e}); skipping"); return; } };
+        unsafe { sdpa_bench_inner(&ctx); }
+    }
+}
+
+#[cfg(test)]
+unsafe fn sdpa_bench_inner(ctx: &VkContext) {
+    use ash::vk;
+    let dev = &ctx.device;
+    let seq: usize = std::env::var("ZLLM_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(2048);
+    let (n_head, n_kv, hd) = (32usize, 8usize, 64usize);
+    let nblk = seq.div_ceil(SDPA_FLASH_BLOCK);
+    let rnd = |i: usize, s: usize| (((i.wrapping_mul(2654435761).wrapping_add(s.wrapping_mul(40503))) & 0xFFFF) as f32 / 32768.0 - 1.0);
+    let mk = |data: Vec<f32>| { let (b, _m, p) = ctx.uma_buffer((data.len() * 4) as u64).unwrap(); std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, p, data.len() * 4); b };
+    let q = mk((0..n_head * hd).map(|i| rnd(i, 1)).collect());
+    let kc = mk((0..seq * n_kv * hd).map(|i| rnd(i, 2)).collect());
+    let vc = mk((0..seq * n_kv * hd).map(|i| rnd(i, 3)).collect());
+    let (out, _mo, out_ptr) = ctx.uma_buffer((n_head * hd * 4) as u64).unwrap();
+    let (part, _mp, _) = ctx.uma_buffer((n_head * nblk * (hd + 2) * 4) as u64).unwrap();
+    let (ub, _mu, up) = ctx.uma_buffer(16).unwrap();
+    let pv = [n_head as u32, n_kv as u32, hd as u32, seq as u32];
+    std::ptr::copy_nonoverlapping(pv.as_ptr() as *const u8, up, 16);
+    let ui = [vk::DescriptorBufferInfo::default().buffer(ub).range(vk::WHOLE_SIZE)];
+    let (fp_p, fp_l, fp_sl, _) = ctx.make_pipeline_raw(SDPA_FLASH_PARTIAL_SPV, 4);
+    let (fc_p, fc_l, fc_sl, _) = ctx.make_pipeline_raw(SDPA_FLASH_COMBINE_SPV, 2);
+    let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(6).pool_sizes(&[
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(16),
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(6)]), None).unwrap();
+    let mkset = |sl: vk::DescriptorSetLayout, bufs: &[vk::Buffer]| -> vk::DescriptorSet {
+        let set = dev.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(std::slice::from_ref(&sl))).unwrap()[0];
+        let infos: Vec<[vk::DescriptorBufferInfo; 1]> = bufs.iter().map(|&b| [vk::DescriptorBufferInfo::default().buffer(b).range(vk::WHOLE_SIZE)]).collect();
+        let mut w: Vec<vk::WriteDescriptorSet> = infos.iter().enumerate().map(|(i, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(i as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(info)).collect();
+        w.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(bufs.len() as u32).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&ui));
+        dev.update_descriptor_sets(&w, &[]); set
+    };
+    let s_fp = mkset(fp_sl, &[q, kc, vc, part]);
+    let s_fc = mkset(fc_sl, &[part, out]);
+    // Hierarchical (two-level) combine setup.
+    let sup: usize = std::env::var("ZLLM_SUPER").ok().and_then(|s| s.parse().ok()).unwrap_or(8); // blocks per super-partial
+    let n_super = nblk.div_ceil(sup);
+    let (superp, _msp, _) = ctx.uma_buffer((n_head * n_super * (hd + 2) * 4) as u64).unwrap();
+    let (ch_p, ch_l, ch_sl, _) = ctx.make_pipeline_raw(SDPA_FLASH_COMBINE_H_SPV, 2);
+    let mk_u6 = |d: [u32; 6]| -> vk::Buffer { let (b, _m, p) = ctx.uma_buffer(24).unwrap(); std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, p, 24); b };
+    let u_l1 = mk_u6([n_head as u32, n_kv as u32, hd as u32, nblk as u32, sup as u32, 0]);          // L1: merge `sup` blocks -> super-partial
+    let u_l2 = mk_u6([n_head as u32, n_kv as u32, hd as u32, n_super as u32, n_super as u32, 1]);   // L2: merge all super-partials -> final
+    let mkset_h = |in_b: vk::Buffer, out_b: vk::Buffer, u: vk::Buffer| -> vk::DescriptorSet {
+        let set = dev.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(std::slice::from_ref(&ch_sl))).unwrap()[0];
+        let bi: Vec<[vk::DescriptorBufferInfo; 1]> = [in_b, out_b].iter().map(|&b| [vk::DescriptorBufferInfo::default().buffer(b).range(vk::WHOLE_SIZE)]).collect();
+        let uiv = [vk::DescriptorBufferInfo::default().buffer(u).range(vk::WHOLE_SIZE)];
+        let mut w: Vec<vk::WriteDescriptorSet> = bi.iter().enumerate().map(|(i, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(i as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(info)).collect();
+        w.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(2).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&uiv));
+        dev.update_descriptor_sets(&w, &[]); set
+    };
+    let s_l1 = mkset_h(part, superp, u_l1);
+    let s_l2 = mkset_h(superp, out, u_l2);
+    let cmd_pool = dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family), None).unwrap();
+    let cs = vk::PipelineStageFlags::COMPUTE_SHADER;
+    let barr = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
+    let iters = 300u32;
+    let rec = |with_combine: bool| -> vk::CommandBuffer {
+        let cmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).unwrap()[0];
+        dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+        for _ in 0..iters {
+            dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, fp_p);
+            dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, fp_l, 0, &[s_fp], &[]);
+            dev.cmd_dispatch(cmd, n_head as u32, nblk as u32, 1);
+            dev.cmd_pipeline_barrier(cmd, cs, cs, vk::DependencyFlags::empty(), &[barr], &[], &[]);
+            if with_combine {
+                dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, fc_p);
+                dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, fc_l, 0, &[s_fc], &[]);
+                dev.cmd_dispatch(cmd, n_head as u32, 1, 1);
+                dev.cmd_pipeline_barrier(cmd, cs, cs, vk::DependencyFlags::empty(), &[barr], &[], &[]);
+            }
+        }
+        dev.end_command_buffer(cmd).unwrap(); cmd
+    };
+    let rec2 = || -> vk::CommandBuffer {  // partial + hierarchical (L1 + L2) combine
+        let cmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).unwrap()[0];
+        dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+        for _ in 0..iters {
+            dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, fp_p);
+            dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, fp_l, 0, &[s_fp], &[]);
+            dev.cmd_dispatch(cmd, n_head as u32, nblk as u32, 1);
+            dev.cmd_pipeline_barrier(cmd, cs, cs, vk::DependencyFlags::empty(), &[barr], &[], &[]);
+            dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, ch_p);
+            dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, ch_l, 0, &[s_l1], &[]);
+            dev.cmd_dispatch(cmd, n_head as u32, n_super as u32, 1);
+            dev.cmd_pipeline_barrier(cmd, cs, cs, vk::DependencyFlags::empty(), &[barr], &[], &[]);
+            dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, ch_l, 0, &[s_l2], &[]);
+            dev.cmd_dispatch(cmd, n_head as u32, 1, 1);
+            dev.cmd_pipeline_barrier(cmd, cs, cs, vk::DependencyFlags::empty(), &[barr], &[], &[]);
+        }
+        dev.end_command_buffer(cmd).unwrap(); cmd
+    };
+    let time = |cmd: vk::CommandBuffer| -> f64 {
+        let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None).unwrap(); let cmds = [cmd];
+        for _ in 0..2 { dev.reset_fences(&[fence]).unwrap(); dev.queue_submit(ctx.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence).unwrap(); dev.wait_for_fences(&[fence], true, u64::MAX).unwrap(); }
+        let t0 = std::time::Instant::now();
+        dev.reset_fences(&[fence]).unwrap(); dev.queue_submit(ctx.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence).unwrap(); dev.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+        let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64; dev.destroy_fence(fence, None); us
+    };
+    let p_us = time(rec(false));
+    let f_us = time(rec(true));
+    // Correctness: flat combine output vs hierarchical, max abs diff.
+    let _ = time(rec(true)); let flat_out = std::slice::from_raw_parts(out_ptr as *const f32, n_head * hd).to_vec();
+    let _ = time(rec2()); let hier_out = std::slice::from_raw_parts(out_ptr as *const f32, n_head * hd).to_vec();
+    let maxd = flat_out.iter().zip(&hier_out).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let h_us = time(rec2());
+    eprintln!("SDPA flash @ctx{} (nblk={}): partial={:.1}us | flat combine={:.1}us (total {:.1}) | hier combine={:.1}us (total {:.1}, sup={} nsuper={}) | maxdiff={:.2e}",
+        seq, nblk, p_us, f_us - p_us, f_us, h_us - p_us, h_us, sup, n_super, maxd);
 }
 
 #[cfg(test)]
