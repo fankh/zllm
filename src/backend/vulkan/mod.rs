@@ -1689,6 +1689,8 @@ impl VkModel {
         let online_partial = std::env::var("ZLLM_ONLINE_PARTIAL").is_ok(); // diag A/B: force online (vs 2-pass) partial
         let use_p2 = hd <= 64 && !online_partial; // 2-pass partial only valid for hd<=64
         let skip_lm = std::env::var("VK_NOLM").is_ok(); // diag: skip LM-head matvec (isolate its cost)
+        let skip_ffn = std::env::var("VK_NOFFN").is_ok(); // diag: skip FFN matvecs (w13/w2 + silu)
+        let skip_w2 = std::env::var("VK_NOW2").is_ok();   // diag: skip just w2 (long-K down proj)
         for l in &self.layers {
             if !skip_norm { disp(self.p_rms, l.attn_norm, 1, 1); bar(); }              // attn norm
             // QKV with RoPE fused into the wq/wk output (q/k come out rotated);
@@ -1715,9 +1717,11 @@ impl VkModel {
             }
             mv(l.wo, n_embd); bar();                                                   // O proj + residual (folded: x += attn)
             if !skip_norm { disp(self.p_rms, l.ffn_norm, 1, 1); bar(); }               // ffn norm
-            mv(l.w13, n_inter * 2); bar();                                             // gate+up (concat, one matvec)
-            if !skip_attn { disp(self.p_silu, self.s_silu, (n_inter as u32).div_ceil(64), 1); bar(); } // silu·mul
-            mv(l.w2, n_embd); bar();                                                   // down proj + residual (folded: x += ffn)
+            if !skip_ffn {
+                mv(l.w13, n_inter * 2); bar();                                         // gate+up (concat, one matvec)
+                if !skip_attn { disp(self.p_silu, self.s_silu, (n_inter as u32).div_ceil(64), 1); bar(); } // silu·mul
+                if !skip_w2 { mv(l.w2, n_embd); bar(); }                               // down proj + residual (folded: x += ffn)
+            }
         }
         if lm {
             if !skip_norm { disp(self.p_rms, self.s_final_norm, 1, 1); bar(); }        // final norm
