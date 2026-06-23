@@ -1,3 +1,11 @@
+// Prefill causal SDPA, barrier-lean. The old kernel ran ONE thread per (query,head) with a
+// `float av[128]` register array that SPILLED to scratch → 65 GFLOP/s (33% of the prefill
+// forward). This mirrors the decode-SDPA fix (sdpa_decode.comp): 64 threads per (query,head);
+// pre-compute the causal scores in shared (no per-position online-softmax recurrence), one
+// max-reduce, one exp+sum, then output with one-thread-per-head-dim (single-float accumulator,
+// NO register-array spill). Grid: dispatch(m_rows * n_head) workgroups. Query m attends keys
+// 0..=m (causal). hd <= 64; seq_len = m+1 <= MAXSEQ (prefill chunk = 128 rows).
+// Compile: glslangValidator --target-env vulkan1.3 -V bsdpa.comp -o bsdpa.spv
 #version 450 core
 layout(local_size_x = 64) in;
 layout(binding = 0) readonly  buffer Q_  { float q[];    };
@@ -5,25 +13,48 @@ layout(binding = 1) readonly  buffer KC_ { float kc[];   };
 layout(binding = 2) readonly  buffer VC_ { float vc[];   };
 layout(binding = 3) writeonly buffer O_  { float outp[]; };
 layout(binding = 4) uniform   P_ { uint n_head; uint n_kv; uint hd; uint m_rows; } p;
+const uint MAXSEQ = 256u;
+shared float sc[MAXSEQ];   // scores, then probs
+shared float qsh[64];      // this (query,head)'s query
+shared float red[64];      // reduction scratch
 void main() {
-    uint idx = gl_GlobalInvocationID.x;
-    if (idx >= p.m_rows * p.n_head) { return; }
-    uint m = idx / p.n_head; uint h = idx % p.n_head;
-    uint hd = p.hd; uint kvh = h / (p.n_head / p.n_kv);
+    uint wg = gl_WorkGroupID.x;                 // one workgroup per (query m, head h)
+    uint m = wg / p.n_head; uint h = wg % p.n_head;
+    uint t = gl_LocalInvocationID.x;
+    uint hd = p.hd;
+    uint kvh = h / (p.n_head / p.n_kv);
     float scale = 1.0 / sqrt(float(hd));
-    uint seq_len = m + 1u; // prefill: query at pos m attends 0..=m
+    uint seq_len = m + 1u;                       // causal: query m attends keys 0..=m
     uint qb = m * (p.n_head * hd) + h * hd;
-    float av[128]; for (uint d = 0u; d < hd; d++) { av[d] = 0.0; }
-    float mx = -1e30; float l = 0.0;
-    for (uint t = 0u; t < seq_len; t++) {
-        uint kb = (t * p.n_kv + kvh) * hd;
-        float s = 0.0; for (uint d = 0u; d < hd; d++) { s += q[qb + d] * kc[kb + d]; }
-        s *= scale;
-        float mn = max(mx, s); float corr = exp(mx - mn); float pe = exp(s - mn);
-        l = l * corr + pe;
-        for (uint d = 0u; d < hd; d++) { av[d] = av[d] * corr + pe * vc[kb + d]; }
-        mx = mn;
+    if (t < hd) { qsh[t] = q[qb + t]; }
+    barrier();
+    // Phase 1: causal scores — each thread owns key positions {t, t+64, ...}.
+    for (uint pos = t; pos < seq_len; pos += 64u) {
+        uint kb = (pos * p.n_kv + kvh) * hd;
+        float s = 0.0;
+        for (uint d = 0u; d < hd; d++) { s += qsh[d] * kc[kb + d]; }
+        sc[pos] = s * scale;
     }
-    float inv = 1.0 / l;
-    for (uint d = 0u; d < hd; d++) { outp[qb + d] = av[d] * inv; }
+    barrier();
+    // Phase 2: max over scores.
+    float mxv = -1e30;
+    for (uint pos = t; pos < seq_len; pos += 64u) { mxv = max(mxv, sc[pos]); }
+    red[t] = mxv; barrier();
+    for (uint st = 32u; st > 0u; st >>= 1u) { if (t < st) { red[t] = max(red[t], red[t + st]); } barrier(); }
+    float mx = red[0]; barrier();
+    // Phase 3: exp + running sum (overwrite scores with probs).
+    float lsum = 0.0;
+    for (uint pos = t; pos < seq_len; pos += 64u) { float e = exp(sc[pos] - mx); sc[pos] = e; lsum += e; }
+    red[t] = lsum; barrier();
+    for (uint st = 32u; st > 0u; st >>= 1u) { if (t < st) { red[t] += red[t + st]; } barrier(); }
+    float l = red[0]; barrier();
+    // Phase 4: output — thread t owns head-dim t (single accumulator, no spill).
+    if (t < hd) {
+        float av = 0.0;
+        for (uint pos = 0u; pos < seq_len; pos++) {
+            uint kb = (pos * p.n_kv + kvh) * hd;
+            av += sc[pos] * vc[kb + t];
+        }
+        outp[qb + t] = av / l;
+    }
 }
