@@ -851,6 +851,7 @@ struct PrefillRes {
     p_add: Pipe3, p_q6k: Pipe3, p_bsd: Pipe3,
     // Small-M weight-stationary matvecs for spec-decode verify (M = draft window).
     p_bmq4: Pipe3, p_bmf16: Pipe3, p_bmq6: Pipe3,
+    p_skinny: Pipe3,  // column-tiled skinny Q4 GEMM (faster batched matvec; ZLLM_VERIFY_BMV forces bmv)
     vlogits: ash::vk::Buffer,  // [VERIFY_MAX_M, vocab] batched LM-head logits
     lm_ql: ash::vk::Buffer, lm_qh: ash::vk::Buffer, lm_scl: ash::vk::Buffer, lm_dd: ash::vk::Buffer,
     final_norm: ash::vk::Buffer, logits: ash::vk::Buffer, logits_ptr: *mut u8,
@@ -1242,6 +1243,7 @@ impl VkModel {
         let p_add = mkp(RESIDUAL_ADD_SPV, 2, false);
         let p_q6k = mkp(DECODE_MATVEC_Q6K_SPV, 6, false);
         let p_bmq4 = mkp(BMV_Q4K_SPV, 3, false);
+        let p_skinny = mkp(SKINNY_GEMM_Q4K_SPV, 3, false);
         let p_bmf16 = mkp(BMV_F16_SPV, 3, false);
         let p_bmq6 = mkp(BMV_Q6K_SPV, 6, false);
         let mm = PREFILL_MAX_M;
@@ -1259,7 +1261,7 @@ impl VkModel {
         let (pf_logits, pf_logits_ptr) = vk_zeros(&ctx, &mut bufs, vocab);
         let (pf_vlogits, _) = vk_zeros(&ctx, &mut bufs, VERIFY_MAX_M * vocab);
         PrefillRes {
-            w: pw, p_q4, p_f16, p_bn, p_br, p_bs, p_bsi, p_t16, p_add, p_q6k, p_bsd, p_bmq4, p_bmf16, p_bmq6,
+            w: pw, p_q4, p_f16, p_bn, p_br, p_bs, p_bsi, p_t16, p_add, p_q6k, p_bsd, p_bmq4, p_skinny, p_bmf16, p_bmq6,
             vlogits: pf_vlogits,
             lm_ql, lm_qh, lm_scl, lm_dd, final_norm, logits: pf_logits, logits_ptr: pf_logits_ptr,
             x32: pf_x32, x32_ptr: pf_x32_ptr, x16: pf_x16, n32: pf_n32, n16: pf_n16, q: pf_q,
@@ -1541,10 +1543,19 @@ impl VkModel {
         // Weight-stationary matvec: one workgroup per output column (W row); the
         // dequantized weight is reused across all real_m activation rows. Reads f32
         // activations directly (no f16 staging). Uniform: [M, N, K, nb/0, gx_grid].
+        // ZLLM_VERIFY_SKINNY swaps in the column-tiled skinny GEMM (3.8x the matvec in isolation,
+        // but ~parity end-to-end: verify_forward's ~40ms fixed overhead — re-record + ~200 barriers
+        // — swamps it; needs a record-once batched forward to pay off). bmv is the validated default.
+        let use_skinny = std::env::var("ZLLM_VERIFY_SKINNY").is_ok();
         let mvq4 = |w: vk::Buffer, x: vk::Buffer, out: vk::Buffer, n: usize, k: usize| {
-            let gx = (n as u32).min(65535);
-            let set = mkset(pf.p_bmq4.2, &[w, x, out], uni5([rm, n as u32, k as u32, (k / 256) as u32, gx]));
-            disp(pf.p_bmq4, set, gx, (n as u32).div_ceil(gx));
+            if use_skinny { // grid = ceil(N/64) workgroups (64 columns each)
+                let set = mkset(pf.p_skinny.2, &[w, x, out], uni5([rm, n as u32, k as u32, (k / 256) as u32, 0]));
+                disp(pf.p_skinny, set, (n as u32).div_ceil(64), 1);
+            } else {
+                let gx = (n as u32).min(65535);
+                let set = mkset(pf.p_bmq4.2, &[w, x, out], uni5([rm, n as u32, k as u32, (k / 256) as u32, gx]));
+                disp(pf.p_bmq4, set, gx, (n as u32).div_ceil(gx));
+            }
         };
         let mvf16 = |w: vk::Buffer, x: vk::Buffer, out: vk::Buffer, n: usize, k: usize| {
             let gx = (n as u32).min(65535);
