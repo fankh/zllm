@@ -1,0 +1,56 @@
+// 2-PASS flash-decode partial — removes the online-softmax SERIAL recurrence. The online
+// version updates a running (max, denom, acc) at every position, so each position's subgroup
+// reduction + exp gates the next — the K-load latency can't hide behind the dependency chain.
+// Here pass 1 computes ALL of the block's scores via INDEPENDENT subgroup reductions (the K
+// loads across positions overlap, nothing serializes them) into shared sc[]; pass 2 then does
+// max + exp + V-accumulate with no subgroup op (per-lane dims). Output (av, m, l) is identical
+// to the online partial, so the combine is unchanged. hd<=64 (dims-per-lane <= 2); sc[] is 32
+// floats (negligible LDS, no occupancy cost). One wave32 subgroup per (head, block).
+// Compile: glslangValidator --target-env vulkan1.3 -V sdpa_flash_partial2.comp -o sdpa_flash_partial2.spv
+#version 450 core
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 32) in;
+layout(binding = 0) readonly  buffer Q_   { float q[];    };
+layout(binding = 1) readonly  buffer KC_  { float kc[];   };
+layout(binding = 2) readonly  buffer VC_  { float vc[];   };
+layout(binding = 3) writeonly buffer PRT_ { float part[]; };  // [n_head*n_blocks*(hd+2)]
+layout(binding = 4) uniform   P_ { uint n_head; uint n_kv; uint hd; uint seq_len; } p;
+const uint BLOCK = 32u;
+shared float sc[BLOCK];
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint blk = gl_WorkGroupID.y;
+    uint n_blocks = (p.seq_len + BLOCK - 1u) / BLOCK;
+    uint lane = gl_LocalInvocationID.x;
+    uint kvh = h / (p.n_head / p.n_kv);
+    float scale = 1.0 / sqrt(float(p.hd));
+    bool a0 = lane < p.hd; bool a1 = (lane + 32u) < p.hd;
+    float qd0 = a0 ? q[h * p.hd + lane] : 0.0;
+    float qd1 = a1 ? q[h * p.hd + lane + 32u] : 0.0;
+    uint start = blk * BLOCK; uint end = min(start + BLOCK, p.seq_len); uint bk = end - start;
+    // PASS 1: all scores via independent subgroup reductions (K-load latency overlaps).
+    for (uint i = 0u; i < bk; i++) {
+        uint kb = ((start + i) * p.n_kv + kvh) * p.hd;
+        float pp = 0.0;
+        if (a0) { pp += qd0 * kc[kb + lane]; }
+        if (a1) { pp += qd1 * kc[kb + lane + 32u]; }
+        float s = subgroupAdd(pp) * scale;
+        if (lane == 0u) { sc[i] = s; }
+    }
+    barrier();
+    // PASS 2: max, then exp + V-accumulate (no subgroup op; per-lane dims).
+    float m = -1e30;
+    for (uint i = 0u; i < bk; i++) { m = max(m, sc[i]); }
+    float l = 0.0; float av0 = 0.0; float av1 = 0.0;
+    for (uint i = 0u; i < bk; i++) {
+        uint kb = ((start + i) * p.n_kv + kvh) * p.hd;
+        float pe = exp(sc[i] - m);
+        l += pe;
+        if (a0) { av0 += pe * vc[kb + lane]; }
+        if (a1) { av1 += pe * vc[kb + lane + 32u]; }
+    }
+    uint base = (h * n_blocks + blk) * (p.hd + 2u);
+    if (a0) { part[base + lane] = av0; }
+    if (a1) { part[base + lane + 32u] = av1; }
+    if (lane == 0u) { part[base + p.hd] = m; part[base + p.hd + 1u] = l; }
+}
