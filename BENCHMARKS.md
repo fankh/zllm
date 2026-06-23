@@ -18,14 +18,27 @@ All numbers are tok/s. Bigger is better.
 
 ## 1. Single-stream decode
 
-| backend | zllm | llama.cpp | zllm / llama |
-|---|---:|---:|---:|
-| CPU      | ~63  | 65.5  | 0.96× (tie) |
-| iGPU     | 82.5 | 201.2 | 0.41× |
+| backend | model | zllm | llama.cpp | zllm / llama |
+|---|---|---:|---:|---:|
+| CPU  | Q4_K_M | ~63 | 65.5 | 0.96× (tie) |
+| iGPU (wgpu, old) | Q4_K_M | 82.5 | 201.2 | 0.41× |
+| **iGPU (raw-Vulkan VkModel)** | **all-Q4** | **209.7** | **187.0** | **1.12× — zllm WINS** |
 
-Both CPU figures sit at the memory-bandwidth ceiling (~55 GB/s effective) — decode streams the
-full ~0.76 GB of weights per token, so this is bandwidth-bound and the two engines tie. On the iGPU,
-zllm is ~2.4× behind llama.cpp's hand-tuned Vulkan kernels.
+CPU is memory-bandwidth bound (~55 GB/s effective; ~0.76 GB streamed/token) — the engines tie.
+The raw-Vulkan **VkModel** decode engine (`ZLLM_VK=1`) **beats** llama.cpp's tuned Vulkan on
+short-context decode, measured **fair sustained** (both 30 reps, GPU hot) on an all-Q4 model
+(`llama-quantize --pure ... Q4_K_S`). It throttles less than llama under sustained load (~3% vs ~12%).
+By context depth (steady-state, vs llama): ctx64 **1.02×**, ctx512 0.96×, ctx2048 0.94× (after the
+SDPA work below). zllm leads at short context, trails slightly at long. Matvecs are DRAM-bandwidth
+bound at ~84% of peak (near-optimal — not the lever).
+
+**SDPA kernel progression (this engine, all bit-exact vs candle / CPU softmax):**
+- Barrier-lean decode SDPA (pre-compute scores in registers, one softmax reduce — no per-position
+  shared-mem tree reduce; ~512 → ~14 barriers/head): decode **181 → 209.7 sustained** (also runs cooler).
+- Hierarchical (tree) flash-combine (`n_head × ceil(nblk/8)` parallel level-1, short level-2):
+  long-ctx **+6.7% @ ctx2048** (combine kernel 22 → 4.7µs, 4.7×).
+- 2-pass flash partial (independent subgroup reductions, no online-softmax recurrence; hd≤64):
+  long-ctx **+8% @ ctx2048**. Together: ctx2048 0.85× → 0.94× vs llama.
 
 ## 2. Prefill (TTFT / batched-compute)
 
@@ -251,7 +264,20 @@ cargo test --release --features vulkan --lib vk_decode_matvec_bandwidth     -- -
 cargo test --release --features vulkan --lib vk_decode_projection           -- --ignored --nocapture  # decode matvec tok/s
 cargo test --release --features vulkan --lib vk_fused_decode_throughput     -- --ignored --nocapture  # fused decode forward (~290 tok/s, beats llama)
 cargo test --release --features vulkan --lib vk_sdpa_correctness            -- --ignored --nocapture  # SDPA (single + flash) bit-exact vs CPU ref
-cargo test --release --features vulkan --lib vk_model_vs_candle             -- --ignored --nocapture  # real-weight VkModel: greedy 24/24 vs candle + tok/s
+cargo test --release --features vulkan --lib vk_model_vs_candle             -- --ignored --nocapture  # real-weight VkModel: greedy bit-exact vs candle + tok/s (ZLLM_MODEL/ZLLM_CTX/ZLLM_REPS/ZLLM_NTIME)
+
+# === THE DECODE WIN (raw-Vulkan VkModel, all-Q4 — beats llama on short-context decode) ===
+# 1. Make the all-Q4 model (every tensor Q4_K; removes the Q6 LM-head/attn_v/ffn_down drag → 162→209 tok/s):
+llama-quantize --allow-requantize --pure --token-embedding-type q4_K --output-tensor-type q4_K \
+    Llama-3.2-1B-Instruct-Q4_K_M.gguf Llama-3.2-1B-Q4pure.gguf Q4_K_S
+# 2. Reproduce from the CLI (~213 tok/s decode — the same forward_argmax path the server fast-lane uses):
+ZLLM_VK=1 zllm generate -m Llama-3.2-1B-Q4pure.gguf -t tokenizer.json -p "The future of AI is" --max-tokens 120
+# 3. Fair head-to-head (both sustained): zllm ZLLM_REPS=30 vs `llama-bench -m Q4pure.gguf -p 0 -n 128 -r 30`
+# Validation suite (run before releases; bit-exact; need a GPU + model):
+cargo test --release --features vulkan --lib vk_sdpa_correctness -- --ignored --nocapture  # SDPA single+flash exact vs CPU ref
+cargo test --release --features vulkan --lib vk_sdpa_bench       -- --ignored --nocapture  # partial(online/2pass)+combine(flat/hier) µs by ZLLM_CTX
+cargo test --release --features vulkan --lib vk_bmv_scaling      -- --ignored --nocapture  # batched matvec / skinny GEMM (+repack) scaling
+# Deployed-kernel A/B toggles (regression-check): ZLLM_FLAT_COMBINE / ZLLM_ONLINE_PARTIAL / ZLLM_VERIFY_SKINNY / VK_MVONLY / VK_NOLM
 # Server fast-lane: build --features vulkan, run with ZLLM_VK=1, POST /v1/inspect/enabled {false}, then chat
 VK_SEQ=512 cargo test --release --features vulkan --lib vk_fused_decode_throughput -- --ignored --nocapture  # decode at a given context depth
 cargo test --release --features vulkan --lib vk_barrier_coherence_probe     -- --ignored --nocapture  # barrier cost/coherence (VK_EXECBAR/VK_NOBAR show staleness)

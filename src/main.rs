@@ -419,6 +419,43 @@ async fn main() -> anyhow::Result<()> {
                 LlamaTokenizer::from_file(&tokenizer)?
             };
 
+            // GPU fast-lane: ZLLM_VK=1 decodes on the raw-Vulkan VkModel engine (the optimized
+            // forward — barrier-lean SDPA + tree combine + 2-pass partial; bit-exact vs candle).
+            // This is the path that beats llama.cpp on short-context decode (all-Q4 model).
+            #[cfg(feature = "vulkan")]
+            if std::env::var("ZLLM_VK").is_ok() {
+                let prompt_tokens = tok.encode(&prompt)?;
+                tracing::info!("Prompt: {} tokens", prompt_tokens.len());
+                let eos_id = tok.eos_token_id().unwrap_or(128001);
+                let t_load = std::time::Instant::now();
+                match backend::vulkan::VkContext::new()
+                    .and_then(|ctx| backend::vulkan::VkModel::load(model.to_str().unwrap_or(""), ctx))
+                {
+                    Ok(vmodel) => {
+                        tracing::info!("VkModel loaded in {} ms (ZLLM_VK)", t_load.elapsed().as_millis());
+                        use std::io::Write;
+                        print!("{prompt}");
+                        std::io::stdout().flush()?;
+                        // Prefill: feed the prompt; the last argmax is the first generated token.
+                        let mut next = 0u32;
+                        for (i, &t) in prompt_tokens.iter().enumerate() { next = vmodel.forward_argmax(t, i); }
+                        let mut pos = prompt_tokens.len();
+                        let start = std::time::Instant::now(); // time decode (steady-state)
+                        let mut generated = 0usize;
+                        while generated < max_tokens && next != eos_id && next != 128009 {
+                            if let Ok(text) = tok.decode(&[next]) { print!("{text}"); std::io::stdout().flush()?; }
+                            generated += 1;
+                            next = vmodel.forward_argmax(next, pos); pos += 1;
+                        }
+                        let elapsed = start.elapsed();
+                        println!("\n\n--- {} tokens in {:.2}s ({:.1} tok/s) [ZLLM_VK decode] ---",
+                            generated, elapsed.as_secs_f64(), generated as f64 / elapsed.as_secs_f64());
+                        return Ok(());
+                    }
+                    Err(e) => tracing::warn!("VkModel load failed ({e}); falling back to candle CPU"),
+                }
+            }
+
             // Load model
             let mut candle_backend = CandleCpuBackend::new();
             candle_backend.load_model(&model, &QuantConfig {
