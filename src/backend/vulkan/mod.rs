@@ -2102,14 +2102,21 @@ mod tests {
         let n_gen = 24usize;
         let _ = &argmax;
         let n_time = 128usize; // match llama-bench tg128 (avg ctx ~64) for a fair rate
+        // ZLLM_REPS>1 re-runs the 128-tok decode back-to-back (ctx reset to ~0 each rep) so the
+        // iGPU heats up like `llama-bench -r N` — fair sustained-throughput comparison, not a burst.
+        let reps: usize = std::env::var("ZLLM_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
         let mut next = 0u32;
         for (i, &tk) in prompt.iter().enumerate() { next = model.forward_argmax(tk, i); }
+        let first_next = next;
         let mut vk_gen = vec![next];
-        let mut pos = prompt.len();
         let t0 = Instant::now();
-        for _ in 1..n_time { next = model.forward_argmax(next, pos); vk_gen.push(next); pos += 1; }
+        let mut total = 0usize;
+        for rep in 0..reps {
+            next = first_next; let mut pos = prompt.len();
+            for _ in 1..n_time { next = model.forward_argmax(next, pos); if rep == 0 { vk_gen.push(next); } pos += 1; total += 1; }
+        }
         let dt = t0.elapsed();
-        eprintln!("VkModel decode: {:.1} tok/s over {} tokens (avg ctx ~{})", (n_time - 1) as f64 / dt.as_secs_f64(), n_time - 1, n_time / 2);
+        eprintln!("VkModel decode: {:.1} tok/s over {} tokens ({} reps, avg ctx ~{})", total as f64 / dt.as_secs_f64(), total, reps, n_time / 2);
         eprintln!("VkModel gen: {vk_gen:?}");
 
         use crate::backend::candle::backend::CandleCpuBackend;
