@@ -129,8 +129,8 @@ fn quant_sensitivity_sweep() {
 }
 
 /// Per-class weight element counts (for bytes/token accounting).
-fn class_elems(classes: &[&'static str]) -> std::collections::HashMap<&'static str, usize> {
-    let mut f = std::fs::File::open(MODEL).unwrap();
+fn class_elems(model: &str, classes: &[&'static str]) -> std::collections::HashMap<&'static str, usize> {
+    let mut f = std::fs::File::open(model).unwrap();
     let ct = gguf_file::Content::read(&mut f).unwrap();
     let mut e = std::collections::HashMap::new();
     for (name, info) in &ct.tensor_infos {
@@ -175,10 +175,14 @@ fn eval_config(
 #[test]
 #[ignore]
 fn quant_recipe_gate() {
-    if !std::path::Path::new(MODEL).exists() || !std::path::Path::new(TOKENIZER).exists() {
+    // ZLLM_MODEL overrides the eval model (verify on the DEPLOYED Q4pure, not just Q4_K_M).
+    let model = std::env::var("ZLLM_MODEL").unwrap_or_else(|_| MODEL.to_string());
+    let model_path = Path::new(&model);
+    if !model_path.exists() || !std::path::Path::new(TOKENIZER).exists() {
         eprintln!("model/tokenizer not found; skipping");
         return;
     }
+    eprintln!("eval model: {model}");
     let tok = LlamaTokenizer::from_file(TOKENIZER).expect("tokenizer");
     // Held-out, original text — descriptive / technical / reflective.
     let passages = [
@@ -191,15 +195,15 @@ fn quant_recipe_gate() {
     eprintln!("held-out corpus: {} passages, {n_tok} tokens\n", corpus.len());
 
     let classes = ["attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down", "token_embd"];
-    let elems = class_elems(&classes);
+    let elems = class_elems(&model, &classes);
     let total_q4: f64 = classes.iter().map(|c| elems[c] as f64 * 4.5 / 8.0).sum();
     let mb_saved = |rules: &[(&str, GgmlDType)]| -> f64 {
         rules.iter().map(|(c, dt)| elems.get(c).copied().unwrap_or(0) as f64 * (4.5 - bits(*dt)) / 8.0 / 1e6).sum()
     };
 
     let mut be = CandleCpuBackend::with_device(Device::Cpu);
-    // baseline (all-Q4): per-passage logits + perplexity reference.
-    be.load_model_requant(Path::new(MODEL), &|_| None).unwrap();
+    // baseline: per-passage logits + perplexity reference.
+    be.load_model_requant(model_path, &|_| None).unwrap();
     let mut base_logits: Vec<Vec<Vec<f32>>> = Vec::new();
     let (mut nll_sum, mut n) = (0.0, 0usize);
     for toks in &corpus {
@@ -213,6 +217,9 @@ fn quant_recipe_gate() {
 
     // Recipes (KL isn't additive, so each is measured directly).
     let conservative: Vec<(&str, GgmlDType)> = vec![("ffn_gate", GgmlDType::Q3K), ("ffn_up", GgmlDType::Q3K)];
+    // Q2 frontier for the confirmed-safe gate+up: ~2x the bytes IF quality holds.
+    let gu_q2: Vec<(&str, GgmlDType)> = vec![("ffn_gate", GgmlDType::Q2K), ("ffn_up", GgmlDType::Q2K)];
+    let gu_mixed: Vec<(&str, GgmlDType)> = vec![("ffn_gate", GgmlDType::Q2K), ("ffn_up", GgmlDType::Q3K)];
     // moderate: add the cheap-KL attn projections but NOT ffn_down/token_embd (the
     // heaviest per-class KL) — to locate the knee between conservative and balanced.
     let moderate: Vec<(&str, GgmlDType)> = ["ffn_gate", "ffn_up", "attn_q", "attn_output"]
@@ -226,8 +233,15 @@ fn quant_recipe_gate() {
     eprintln!("{:>32}  {:>8}  {:>9}  {:>8}  {:>10}  {:>10}", "recipe", "mean KL", "perplex", "Δppl%", "MB saved", "~tok/s*");
     eprintln!("{}", "-".repeat(86));
     eprintln!("{:>32}  {:>8}  {:>9.3}  {:>8}  {:>10}  {:>10.0}", "baseline (all-Q4)", "-", base_ppl, "-", "-", 209.7);
-    for (label, rules) in [("conservative: gate+up→Q3", &conservative), ("moderate: +attn_q/o→Q3", &moderate), ("balanced: +down+lm→Q3", &balanced), ("aggressive: balanced, down→Q2", &aggressive)] {
-        let (kl_m, ppl) = eval_config(&mut be, Path::new(MODEL), &corpus, &base_logits, rules);
+    for (label, rules) in [
+        ("conservative: gate+up→Q3", &conservative),
+        ("frontier: gate→Q2,up→Q3", &gu_mixed),
+        ("frontier: gate+up→Q2", &gu_q2),
+        ("moderate: +attn_q/o→Q3", &moderate),
+        ("balanced: +down+lm→Q3", &balanced),
+        ("aggressive: balanced, down→Q2", &aggressive),
+    ] {
+        let (kl_m, ppl) = eval_config(&mut be, model_path, &corpus, &base_logits, rules);
         let mb = mb_saved(rules);
         let tps = 209.7 * total_q4 / (total_q4 - mb * 1e6); // bandwidth-proportional estimate
         eprintln!("{label:>32}  {kl_m:>8.4}  {ppl:>9.3}  {:>7.1}%  {:>9.1}M  {tps:>10.0}", (ppl / base_ppl - 1.0) * 100.0, mb);
@@ -243,11 +257,11 @@ fn quant_recipe_gate() {
         for _ in 0..39 { next = argmax(&be.forward_logits(&[next]).unwrap()); out.push(next); }
         tok.decode(&out).unwrap()
     };
-    be.load_model_requant(Path::new(MODEL), &|_| None).unwrap();
+    be.load_model_requant(model_path, &|_| None).unwrap();
     let base_txt = greedy_gen(&mut be);
-    be.load_model_requant(Path::new(MODEL), &|n: &str| balanced.iter().find(|(c, _)| n.contains(c)).map(|(_, d)| *d)).unwrap();
-    let bal_txt = greedy_gen(&mut be);
+    be.load_model_requant(model_path, &|n: &str| conservative.iter().find(|(c, _)| n.contains(c)).map(|(_, d)| *d)).unwrap();
+    let ship_txt = greedy_gen(&mut be);
     eprintln!("\ncoherence (greedy 40 tok from \"The three primary colors are\"):");
-    eprintln!("  baseline: {base_txt}");
-    eprintln!("  balanced: {bal_txt}");
+    eprintln!("  baseline    : {base_txt}");
+    eprintln!("  gate+up→Q3  : {ship_txt}");
 }
