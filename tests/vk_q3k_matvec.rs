@@ -182,6 +182,40 @@ fn vk_decode_floor() {
     eprintln!("  → gap (in-forward − isolated floor) = dispatch + interleaving overhead = megakernel-recoverable headroom.");
 }
 
+/// Per-dispatch launch+barrier overhead (decode issues ~130 dispatches/token →
+/// this × 130 = the megakernel/fusion ceiling) + the cold-stream BW ceiling (the
+/// warm matvec bench is cache-inflated; a too-big-to-cache matvec shows the truth).
+/// `cargo test --release --features vulkan --test vk_q3k_matvec vk_dispatch_overhead -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn vk_dispatch_overhead() {
+    let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan ({e}); skipping"); return; } };
+    let dev = Device::Cpu;
+    let mk = |n: usize, nb: usize| {
+        let k = nb * 256;
+        let data: Vec<f32> = (0..n * k).map(|i| ((i % 97) as f32 - 48.0) / 50.0).collect();
+        let t = Tensor::from_vec(data, (n, k), &dev).unwrap();
+        (QTensor::quantize(&t, GgmlDType::Q4K).unwrap().data().unwrap().to_vec(),
+         (0..k).map(|i| (i % 7) as f32).collect::<Vec<f32>>())
+    };
+    // Near-zero-work matvecs at high iters → time/iter ≈ dispatch launch + barrier.
+    eprintln!("per-dispatch overhead (near-zero work, time/iter):");
+    for (n, nb, iters) in [(1usize, 1usize, 4000u32), (64, 1, 4000), (512, 1, 2000), (2048, 1, 2000)] {
+        let (w, x) = mk(n, nb);
+        let (_o, ms) = ctx.decode_matvec_q4k(&w, n, nb, &x, iters).unwrap();
+        eprintln!("  {n:>5} rows × {nb} blk: {:.4} ms/dispatch", ms / iters as f64);
+    }
+    // Cold-stream BW ceiling: matvecs of growing size (small = cache-inflated).
+    eprintln!("\ncold-stream BW ceiling (warm bench inflates small matvecs):");
+    for (n, mb_note) in [(16384usize, "18.9MB"), (65536, "76MB"), (131072, "151MB"), (262144, "302MB")] {
+        let nb = 8;
+        let (w, x) = mk(n, nb);
+        let (_o, ms) = ctx.decode_matvec_q4k(&w, n, nb, &x, 30).unwrap();
+        let mb = w.len() as f64 / 1e6;
+        eprintln!("  {n:>6} rows ({mb_note}, {mb:.0}MB): {:.0} GB/s", mb / 1e3 / (ms / 30.0 / 1e3));
+    }
+}
+
 /// Generate the committed SPIR-V from the WGSL (naga is dev-only; the VkModel
 /// lib `include_bytes!`s the .spv). Run once after editing the .wgsl:
 /// `cargo test --features vulkan --test vk_q3k_matvec gen_q3k_spv -- --ignored --nocapture`
