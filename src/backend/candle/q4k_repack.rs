@@ -1264,6 +1264,25 @@ mod tests {
     }
 
     #[test]
+    fn quantize_q8k_redundancy_cost() {
+        use std::time::Instant;
+        // The candle CPU forward re-quantizes the SHARED activation to Q8_K once
+        // per matmul: q/k/v share the attn-norm output (3 quantizes, 2 redundant);
+        // gate/up share the ffn-norm output (2, 1 redundant). 3 redundant/layer ×
+        // 16 layers = 48 redundant 2048-wide quantizes/token. Measure the waste.
+        let n = 2048usize; // n_embd
+        let x: Vec<f32> = (0..n).map(|i| ((i * 37 % 211) as f32 - 105.0) / 50.0).collect();
+        let mut y = vec![BlockQ8K { d: 0.0, qs: [0; QK_K], bsums: [0; QK_K / 16] }; n / QK_K];
+        for _ in 0..2000 { quantize_q8_k(&x, &mut y); } // warm
+        let iters = 200_000;
+        let t = Instant::now();
+        for _ in 0..iters { quantize_q8_k(&x, &mut y); }
+        let us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        eprintln!("quantize_q8_k({n}) = {us:.3} us/call; 48 redundant/tok = {:.3} ms/token wasted (~{:.1}% of a 16.9ms CPU forward)",
+            us * 48.0 / 1000.0, us * 48.0 / 1000.0 / 16.9 * 100.0);
+    }
+
+    #[test]
     fn quantize_q8_k_roundtrip() {
         // Build a synthetic row, quantize, dequantize, verify error
         // bounded by one quantization step (~max_abs/127).
