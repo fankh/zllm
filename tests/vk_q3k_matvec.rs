@@ -216,6 +216,42 @@ fn vk_dispatch_overhead() {
     }
 }
 
+/// PREFILL GEMM decomposition: coopmat Q4_K GEMM TFLOP/s per projection shape at
+/// M=128/256. Finds N-tile-starvation (the prefill analogue of decode's
+/// grid-starve): small-N GEMMs (wk/wv N=512) underutilize the 128×128 coopmat
+/// tile. WMMA peak ~59 TFLOP/s; the documented prefill ceiling is ~17% (~10).
+/// `cargo test --release --features vulkan --test vk_q3k_matvec vk_prefill_gemm_floor -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn vk_prefill_gemm_floor() {
+    let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan ({e}); skipping"); return; } };
+    let dev = Device::Cpu;
+    // (label, N, K)
+    let shapes = [
+        ("wq/wo", 2048usize, 2048usize),
+        ("wk/wv", 512, 2048),
+        ("qkv_fused", 3072, 2048),
+        ("w13", 16384, 2048),
+        ("w2", 2048, 8192),
+    ];
+    for m in [128usize, 256] {
+        eprintln!("=== prefill GEMM, M={m} (coopmat Q4_K, TFLOP/s, % of 59 WMMA peak) ===");
+        for (label, n, k) in shapes {
+            let nb = k / 256;
+            let wd: Vec<f32> = (0..n * k).map(|i| ((i % 89) as f32 - 44.0) / 60.0).collect();
+            let wt = Tensor::from_vec(wd, (n, k), &dev).unwrap();
+            let wb = QTensor::quantize(&wt, GgmlDType::Q4K).unwrap().data().unwrap().to_vec();
+            let x: Vec<f32> = (0..m * k).map(|i| ((i % 11) as f32 - 5.0) / 6.0).collect();
+            let _ = ctx.coopmat_q4k_gemm(&wb, n, nb, &x, m, 3); // warm
+            let (_o, ms) = ctx.coopmat_q4k_gemm(&wb, n, nb, &x, m, 20).expect("gemm");
+            let per = ms / 20.0;
+            let tflops = 2.0 * m as f64 * n as f64 * k as f64 / (per / 1e3) / 1e12;
+            eprintln!("  {label:>10} N={n:>5} K={k}: {per:.3} ms  {tflops:5.1} TFLOP/s  ({:.0}%)", tflops / 59.0 * 100.0);
+        }
+    }
+    eprintln!("→ if wk/wv (N=512) << wq/w13, the prefill GEMM is N-tile-starved → fused QKV helps prefill too.");
+}
+
 /// Generate the committed SPIR-V from the WGSL (naga is dev-only; the VkModel
 /// lib `include_bytes!`s the .spv). Run once after editing the .wgsl:
 /// `cargo test --features vulkan --test vk_q3k_matvec gen_q3k_spv -- --ignored --nocapture`
