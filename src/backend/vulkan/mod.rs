@@ -852,6 +852,7 @@ unsafe fn vk_up_f16t(ctx: &VkContext, bufs: &mut Vec<(ash::vk::Buffer, ash::vk::
 // Per-layer weights needed by the batched prefill GEMMs.
 struct PrefillW {
     wq: ash::vk::Buffer, wk: ash::vk::Buffer, wo: ash::vk::Buffer, w13: ash::vk::Buffer, // Q4 raw bytes
+    wqk: Option<ash::vk::Buffer>, // ZLLM_FUSED_QKV: concat wq+wk for one coopmat GEMM
     wv_f16: ash::vk::Buffer, w2_f16: ash::vk::Buffer,                                    // Q6 dequant -> f16 [K,N]
     attn_norm: ash::vk::Buffer, ffn_norm: ash::vk::Buffer,                               // f32
     kc: ash::vk::Buffer, vc: ash::vk::Buffer,                                            // shared decode KV cache
@@ -896,7 +897,7 @@ struct PrefillRes {
     final_norm: ash::vk::Buffer, logits: ash::vk::Buffer, logits_ptr: *mut u8,
     // scratch (sized for PREFILL_MAX_M rows)
     x32: ash::vk::Buffer, x32_ptr: *mut u8, x16: ash::vk::Buffer,
-    n32: ash::vk::Buffer, n16: ash::vk::Buffer, q: ash::vk::Buffer,
+    n32: ash::vk::Buffer, n16: ash::vk::Buffer, q: ash::vk::Buffer, qk: ash::vk::Buffer,
     attn32: ash::vk::Buffer, attn16: ash::vk::Buffer, gu: ash::vk::Buffer,
     h32: ash::vk::Buffer, h16: ash::vk::Buffer, o32: ash::vk::Buffer, ffn32: ash::vk::Buffer,
     cosb: ash::vk::Buffer, cosb_ptr: *mut u8, sinb: ash::vk::Buffer, sinb_ptr: *mut u8,
@@ -1315,7 +1316,7 @@ impl VkModel {
             let w2_deq: Vec<f32> = ct.tensor(&mut file, &format!("{lp}.ffn_down.weight"), &dev).map_err(|e| e.to_string())?.dequantize(&dev).map_err(|e| e.to_string())?.flatten_all().map_err(|e| e.to_string())?.to_vec1().map_err(|e| e.to_string())?;
             let wv_f16 = vk_up_f16t(&ctx, &mut bufs, &wv_deq, kv_dim, n_embd);
             let w2_f16 = vk_up_f16t(&ctx, &mut bufs, &w2_deq, n_embd, n_inter);
-            pw.push(PrefillW { wq: q4buf(&r.wq), wk: q4buf(&r.wk), wo: q4buf(&r.wo), w13: q4buf(&r.w13), wv_f16, w2_f16, attn_norm: r.an, ffn_norm: r.fn_, kc: r.kc, vc: r.vc });
+            pw.push(PrefillW { wq: q4buf(&r.wq), wk: q4buf(&r.wk), wqk: r.wqk, wo: q4buf(&r.wo), w13: q4buf(&r.w13), wv_f16, w2_f16, attn_norm: r.an, ffn_norm: r.fn_, kc: r.kc, vc: r.vc });
         }
         let mut mkp = |spv: &[u8], n: u32, coop: bool| -> Pipe3 {
             let (p, l, sl, m) = if coop { ctx.make_pipeline_coopmat(spv, n) } else { ctx.make_pipeline_raw(spv, n) };
@@ -1341,6 +1342,7 @@ impl VkModel {
         let pf_x16 = f16buf(&mut bufs, mm * n_embd);
         let (pf_n32, _) = vk_zeros(&ctx, &mut bufs, mm * n_embd); let pf_n16 = f16buf(&mut bufs, mm * n_embd);
         let (pf_q, _) = vk_zeros(&ctx, &mut bufs, mm * n_embd);
+        let (pf_qk, _) = vk_zeros(&ctx, &mut bufs, mm * (n_embd + kv_dim)); // fused-QKV GEMM out (interleaved q|k)
         let (pf_attn32, _) = vk_zeros(&ctx, &mut bufs, mm * n_embd); let pf_attn16 = f16buf(&mut bufs, mm * n_embd);
         let (pf_gu, _) = vk_zeros(&ctx, &mut bufs, mm * n_inter * 2);
         let (pf_h32, _) = vk_zeros(&ctx, &mut bufs, mm * n_inter); let pf_h16 = f16buf(&mut bufs, mm * n_inter);
@@ -1353,7 +1355,7 @@ impl VkModel {
             w: pw, p_q4, p_f16, p_bn, p_br, p_bs, p_bsi, p_t16, p_add, p_q6k, p_bsd, p_bmq4, p_skinny, p_bmf16, p_bmq6,
             vlogits: pf_vlogits,
             lm_ql, lm_qh, lm_scl, lm_dd, final_norm, logits: pf_logits, logits_ptr: pf_logits_ptr,
-            x32: pf_x32, x32_ptr: pf_x32_ptr, x16: pf_x16, n32: pf_n32, n16: pf_n16, q: pf_q,
+            x32: pf_x32, x32_ptr: pf_x32_ptr, x16: pf_x16, n32: pf_n32, n16: pf_n16, q: pf_q, qk: pf_qk,
             attn32: pf_attn32, attn16: pf_attn16, gu: pf_gu, h32: pf_h32, h16: pf_h16, o32: pf_o32, ffn32: pf_ffn32,
             cosb: pf_cosb, cosb_ptr: pf_cosb_ptr, sinb: pf_sinb, sinb_ptr: pf_sinb_ptr,
         }
@@ -1462,6 +1464,8 @@ impl VkModel {
         let cs = vk::PipelineStageFlags::COMPUTE_SHADER;
         let barr = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
         let bar = || dv.cmd_pipeline_barrier(cmd, cs, cs, vk::DependencyFlags::empty(), &[barr], &[], &[]);
+        let tr = vk::PipelineStageFlags::TRANSFER;
+        let bar_c2t = || { let b = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ); dv.cmd_pipeline_barrier(cmd, cs, tr, vk::DependencyFlags::empty(), &[b], &[], &[]); };
         let disp = |p: Pipe3, set: vk::DescriptorSet, gx: u32, gy: u32| {
             dv.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p.0);
             dv.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, p.1, 0, &[set], &[]);
@@ -1480,10 +1484,27 @@ impl VkModel {
             disp(pf.p_bn, mkset(pf.p_bn.2, &[pf.x32, l.attn_norm, pf.n32], u_eps), m as u32, 1); bar();
             if !skip_f16 { disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.n32, pf.n16], uni([(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); } bar();
             // QKV: wq->q (Q4), wk->kc (Q4), wv->vc (f16 dense). K=n_embd.
+            // Fused (ZLLM_FUSED_QKV): one [m, n_embd+kv_dim] coopmat GEMM over concat
+            // wq+wk → pf.qk (interleaved q|k per token), then de-interleave q->pf.q,
+            // k->l.kc (the GEMM output is token-major; cache wants contiguous k).
             if !skip_gemm {
+            if let Some(wqk) = l.wqk {
+                let nqk = n_embd + kv_dim;
+                disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.n16, wqk, pf.qk], uni([m as u32, nqk as u32, n_embd as u32, (n_embd / 256) as u32])), (nqk / 128) as u32, (m / 128) as u32);
+                disp(pf.p_f16, mkset(pf.p_f16.2, &[pf.n16, l.wv_f16, l.vc], uni([m as u32, kv_dim as u32, n_embd as u32, 0])), (kv_dim / 64) as u32, (m / 64) as u32);
+                bar_c2t();
+                let qreg: Vec<vk::BufferCopy> = (0..m).map(|t| vk::BufferCopy::default().src_offset((t * nqk * 4) as u64).dst_offset((t * n_embd * 4) as u64).size((n_embd * 4) as u64)).collect();
+                let kreg: Vec<vk::BufferCopy> = (0..m).map(|t| vk::BufferCopy::default().src_offset(((t * nqk + n_embd) * 4) as u64).dst_offset((t * kv_dim * 4) as u64).size((kv_dim * 4) as u64)).collect();
+                dv.cmd_copy_buffer(cmd, pf.qk, pf.q, &qreg);
+                dv.cmd_copy_buffer(cmd, pf.qk, l.kc, &kreg);
+                // Final: both the de-interleave (transfer) AND wv (compute write l.vc) → rope/SDPA reads.
+                let bc = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
+                dv.cmd_pipeline_barrier(cmd, cs | tr, cs, vk::DependencyFlags::empty(), &[bc], &[], &[]);
+            } else {
             disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.n16, l.wq, pf.q], uni([m as u32, n_embd as u32, n_embd as u32, (n_embd / 256) as u32])), (n_embd / 128) as u32, (m / 128) as u32);
             disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.n16, l.wk, l.kc], uni([m as u32, kv_dim as u32, n_embd as u32, (n_embd / 256) as u32])), (kv_dim / 128) as u32, (m / 128) as u32);
-            disp(pf.p_f16, mkset(pf.p_f16.2, &[pf.n16, l.wv_f16, l.vc], uni([m as u32, kv_dim as u32, n_embd as u32, 0])), (kv_dim / 64) as u32, (m / 64) as u32); } bar();
+            disp(pf.p_f16, mkset(pf.p_f16.2, &[pf.n16, l.wv_f16, l.vc], uni([m as u32, kv_dim as u32, n_embd as u32, 0])), (kv_dim / 64) as u32, (m / 64) as u32); bar();
+            } } else { bar(); }
             // RoPE q, k (k in the cache).
             disp(pf.p_br, mkset(pf.p_br.2, &[pf.q, pf.cosb, pf.sinb], uni([n_head as u32, hd as u32, m as u32, 0])), c64(m * n_head * half), 1);
             disp(pf.p_br, mkset(pf.p_br.2, &[l.kc, pf.cosb, pf.sinb], uni([n_kv as u32, hd as u32, m as u32, 0])), c64(m * n_kv * half), 1); bar();
