@@ -114,3 +114,8 @@ metal = [
     "candle-transformers/metal",
 ]
 
+[dev-dependencies]
+# Offline GLSL/WGSL → SPIR-V generation for new Vulkan kernels (the env has no
+# glslang/glslc/SDK). naga is already in the tree via wgpu; reuse it.
+naga = { version = "22.1", features = ["wgsl-in", "spv-out"] }
+
