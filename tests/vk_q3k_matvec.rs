@@ -46,58 +46,7 @@ fn pack_q3k(bytes: &[u8], n: usize, nb: usize) -> Vec<u32> {
     out
 }
 
-const WGSL: &str = r#"
-struct P { n: u32, k: u32, nb: u32, gx: u32 };
-@group(0) @binding(0) var<storage, read>       w: array<u32>;
-@group(0) @binding(1) var<storage, read>       x: array<f32>;
-@group(0) @binding(2) var<storage, read_write> o: array<f32>;
-@group(0) @binding(3) var<uniform>             p: P;
-var<workgroup> partial: array<f32, 64>;
-@compute @workgroup_size(64)
-fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let row = wid.x + wid.y * (p.gx & 0xffffu);
-    let t = lid.x;
-    let on = row < p.n;
-    var acc = 0.0;
-    let total = p.nb * 256u;
-    var gi = t;
-    loop {
-        if (gi >= total || !on) { break; }
-        let b = gi / 256u;
-        let oi = gi % 256u;
-        let base = (row * p.nb + b) * 29u;
-        let d = bitcast<f32>(w[base]);
-        let h = oi / 128u;
-        let r = oi % 128u;
-        let j = r / 32u;
-        let sub = (r % 32u) / 16u;
-        let l = r % 16u;
-        let shift = 2u * j;
-        let m = 1u << (h * 4u + j);
-        let scale_idx = h * 8u + j * 2u + sub;
-        let qs_idx = h * 32u + sub * 16u + l;
-        let hmask_idx = sub * 16u + l;
-        let scw = w[base + 1u + scale_idx / 4u];
-        let scale = f32(i32((scw >> ((scale_idx % 4u) * 8u)) & 0xffu) - 32);
-        let hw = w[base + 5u + hmask_idx / 4u];
-        let hbit = ((hw >> ((hmask_idx % 4u) * 8u)) & m) != 0u;
-        let qw = w[base + 13u + qs_idx / 4u];
-        let q2 = f32((qw >> ((qs_idx % 4u) * 8u + shift)) & 3u);
-        acc = acc + d * scale * (q2 - select(4.0, 0.0, hbit)) * x[b * 256u + oi];
-        gi = gi + 64u;
-    }
-    partial[t] = acc;
-    workgroupBarrier();
-    var s = 32u;
-    loop {
-        if (s == 0u) { break; }
-        if (t < s) { partial[t] = partial[t] + partial[t + s]; }
-        workgroupBarrier();
-        s = s >> 1u;
-    }
-    if (t == 0u && on) { o[row] = partial[0]; }
-}
-"#;
+const WGSL: &str = include_str!("../src/backend/vulkan/shaders/decode_matvec_q3k.wgsl");
 
 fn compile_wgsl(src: &str) -> Vec<u32> {
     let module = naga::front::wgsl::parse_str(src).expect("wgsl parse");
@@ -138,4 +87,17 @@ fn vk_q3k_matvec_vs_candle() {
     eprintln!("Q3_K matvec GPU vs candle: max abs {maxabs:.3e}, max rel {maxrel:.3e}, n={n} k={k}, {ms:.2}ms");
     assert!(maxrel < 1e-3, "Q3_K GPU matvec diverged from candle (max rel {maxrel})");
     eprintln!("Q3_K decode matvec kernel VALIDATED on GPU ✓");
+}
+
+/// Generate the committed SPIR-V from the WGSL (naga is dev-only; the VkModel
+/// lib `include_bytes!`s the .spv). Run once after editing the .wgsl:
+/// `cargo test --features vulkan --test vk_q3k_matvec gen_q3k_spv -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gen_q3k_spv() {
+    let words = compile_wgsl(WGSL);
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let path = "src/backend/vulkan/shaders/decode_matvec_q3k.spv";
+    std::fs::write(path, &bytes).unwrap();
+    eprintln!("wrote {} ({} bytes, {} words) ✓", path, bytes.len(), words.len());
 }

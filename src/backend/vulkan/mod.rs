@@ -16,6 +16,7 @@ const COOPMAT_GEMM_SPV: &[u8] = include_bytes!("shaders/coopmat_gemm.spv");
 const COOPMAT_Q4K_GEMM_SPV: &[u8] = include_bytes!("shaders/coopmat_q4k_gemm.spv");
 const COOPMAT_Q4K_GEMM_M16_SPV: &[u8] = include_bytes!("shaders/coopmat_q4k_gemm_m16.spv");
 const DECODE_MATVEC_Q4K_SPV: &[u8] = include_bytes!("shaders/decode_matvec_q4k.spv");
+const DECODE_MATVEC_Q3K_SPV: &[u8] = include_bytes!("shaders/decode_matvec_q3k.spv"); // gate+up→Q3 (naga-gen)
 const DECODE_MATVEC_DOWN_Q4K_SPV: &[u8] = include_bytes!("shaders/decode_matvec_down_q4k.spv");
 const DECODE_MATVEC_Q4K_ROPE_SPV: &[u8] = include_bytes!("shaders/decode_matvec_q4k_rope.spv");
 const RMSNORM_SPV: &[u8] = include_bytes!("shaders/rmsnorm.spv");
@@ -811,6 +812,33 @@ unsafe fn vk_up_q6k(ctx: &VkContext, bufs: &mut Vec<(ash::vk::Buffer, ash::vk::D
     (vk_up_bytes(ctx, bufs, &ql), vk_up_bytes(ctx, bufs, &qh), vk_up_bytes(ctx, bufs, &scl), vk_up_f32(ctx, bufs, &dd))
 }
 
+// Repack candle Q3_K blocks (110 B) into the decode_matvec_q3k layout (29 u32 /
+// block, 4-aligned): d_f32 | 16 pre-shuffled 6-bit scale bytes | hmask[32] |
+// qs[64], then upload as one buffer. Mirrors tests/vk_q3k_matvec::pack_q3k.
+unsafe fn vk_up_q3k(ctx: &VkContext, bufs: &mut Vec<(ash::vk::Buffer, ash::vk::DeviceMemory)>, bytes: &[u8], n_blocks: usize) -> ash::vk::Buffer {
+    assert_eq!(bytes.len(), n_blocks * 110, "Q3_K byte length");
+    let (km1, km2) = (0x0303_0303u32, 0x0f0f_0f0fu32);
+    let u = |s: &[u8], i: usize| u32::from_le_bytes([s[i], s[i + 1], s[i + 2], s[i + 3]]);
+    let mut packed = vec![0u32; n_blocks * 29];
+    for bi in 0..n_blocks {
+        let blk = &bytes[bi * 110..][..110];
+        let base = bi * 29;
+        packed[base] = half::f16::from_bits(u16::from_le_bytes([blk[108], blk[109]])).to_f32().to_bits();
+        let (s0, s1, s2) = (u(blk, 96), u(blk, 100), u(blk, 104));
+        let a = [
+            (s0 & km2) | ((s2 & km1) << 4),
+            (s1 & km2) | (((s2 >> 2) & km1) << 4),
+            ((s0 >> 4) & km2) | (((s2 >> 4) & km1) << 4),
+            ((s1 >> 4) & km2) | (((s2 >> 6) & km1) << 4),
+        ];
+        for w in 0..4 { packed[base + 1 + w] = a[w]; }
+        for w in 0..8 { packed[base + 5 + w] = u(blk, w * 4); }
+        for w in 0..16 { packed[base + 13 + w] = u(blk, 32 + w * 4); }
+    }
+    let pb: Vec<u8> = packed.iter().flat_map(|w| w.to_le_bytes()).collect();
+    vk_up_bytes(ctx, bufs, &pb)
+}
+
 // Upload an [N,K] f32 weight as a TRANSPOSED f16 buffer [K,N] (the layout the
 // dense coopmat GEMM wants for B: C[M,N]=A[M,K]·B[K,N]). For the Q6 prefill path.
 unsafe fn vk_up_f16t(ctx: &VkContext, bufs: &mut Vec<(ash::vk::Buffer, ash::vk::DeviceMemory)>, deq: &[f32], n: usize, k: usize) -> ash::vk::Buffer {
@@ -878,10 +906,12 @@ struct PrefillRes {
 enum VkWeight {
     Q4 { buf: ash::vk::Buffer, nb: usize },
     Q6 { ql: ash::vk::Buffer, qh: ash::vk::Buffer, scl: ash::vk::Buffer, dd: ash::vk::Buffer, nb: usize },
+    // Packed Q3_K (29 u32/block, vk_up_q3k layout): same 3-storage interface as Q4.
+    Q3 { buf: ash::vk::Buffer, nb: usize },
 }
-// A matvec dispatch: which kernel + its descriptor set.
+// A matvec dispatch: which kernel pipeline (0=p_mv/Q4, 1=p_q6k/Q6, 2=p_q3/Q3) + its set.
 #[derive(Clone, Copy)]
-struct Mv { q6: bool, set: ash::vk::DescriptorSet }
+struct Mv { pipe: u8, set: ash::vk::DescriptorSet }
 
 unsafe fn vk_alloc_set(dv: &ash::Device, pool: ash::vk::DescriptorPool, sl: ash::vk::DescriptorSetLayout, sb: &[ash::vk::Buffer], u: ash::vk::Buffer) -> ash::vk::DescriptorSet {
     use ash::vk;
@@ -917,11 +947,16 @@ unsafe fn vk_mk_mv(ctx: &VkContext, pool: ash::vk::DescriptorPool, mv_sl: ash::v
     match *w {
         VkWeight::Q4 { buf, nb } => {
             let (u, _) = vk_uni(ctx, bufs, [rows as u32, (nb * 256) as u32, nb as u32, gx | ((acc as u32) << 16)]);
-            Mv { q6: false, set: vk_alloc_set(&ctx.device, pool, mv_sl, &[buf, x_in, out], u) }
+            Mv { pipe: 0, set: vk_alloc_set(&ctx.device, pool, mv_sl, &[buf, x_in, out], u) }
         }
         VkWeight::Q6 { ql, qh, scl, dd, nb } => {
             let (u, _) = vk_uni(ctx, bufs, [rows as u32, nb as u32, gx, acc as u32]);
-            Mv { q6: true, set: vk_alloc_set(&ctx.device, pool, q6k_sl, &[ql, qh, scl, dd, x_in, out], u) }
+            Mv { pipe: 1, set: vk_alloc_set(&ctx.device, pool, q6k_sl, &[ql, qh, scl, dd, x_in, out], u) }
+        }
+        // Q3_K reuses the Q4 3-storage set + uniform {N,K,nb,gx}; only the pipeline differs.
+        VkWeight::Q3 { buf, nb } => {
+            let (u, _) = vk_uni(ctx, bufs, [rows as u32, (nb * 256) as u32, nb as u32, gx | ((acc as u32) << 16)]);
+            Mv { pipe: 2, set: vk_alloc_set(&ctx.device, pool, mv_sl, &[buf, x_in, out], u) }
         }
     }
 }
@@ -958,6 +993,7 @@ pub struct VkModel {
     last_rec: std::cell::Cell<i64>,
     // pipelines (pipeline, layout)
     p_rms: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_mv: (ash::vk::Pipeline, ash::vk::PipelineLayout),
+    p_q3: (ash::vk::Pipeline, ash::vk::PipelineLayout), // Q3_K decode matvec (gate+up→Q3)
     p_rope: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_kvw: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     p_sdpa: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_fp: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     p_fc: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_silu: (ash::vk::Pipeline, ash::vk::PipelineLayout),
@@ -1037,13 +1073,26 @@ impl VkModel {
         // Concatenate ffn_gate + ffn_up into one Q4_K weight ([2*n_inter, n_embd])
         // so the FFN's two projections are one bigger matvec dispatch (saturates
         // the bus better than two medium ones). Both are Q4_K in Q4_K_M.
-        let load_gateup = |bufs: &mut Vec<_>, file: &mut std::fs::File, p: &str| -> Result<VkWeight, String> {
+        // ZLLM_Q3_GATEUP keeps the Q4 w13 (prefill coopmat GEMM still needs it) AND
+        // builds a Q3_K copy used by DECODE (validated recipe: +2.7% ppl, ~10% fewer
+        // bytes/token → faster decode; see quant_sensitivity).
+        let q3_gateup = std::env::var("ZLLM_Q3_GATEUP").is_ok();
+        let load_gateup = |bufs: &mut Vec<_>, file: &mut std::fs::File, p: &str, as_q3: bool| -> Result<VkWeight, String> {
             let g = ct.tensor(file, &format!("{p}.ffn_gate.weight"), &dev).map_err(|e| e.to_string())?;
             let u = ct.tensor(file, &format!("{p}.ffn_up.weight"), &dev).map_err(|e| e.to_string())?;
             if g.dtype() != GgmlDType::Q4K || u.dtype() != GgmlDType::Q4K {
                 return Err(format!("{p}: gate/up concat needs Q4_K (got {:?}/{:?})", g.dtype(), u.dtype()));
             }
             let nb = g.shape().dims()[1] / 256;
+            if as_q3 {
+                let gd = g.dequantize(&dev).map_err(|e| e.to_string())?;
+                let ud = u.dequantize(&dev).map_err(|e| e.to_string())?;
+                let cat = candle_core::Tensor::cat(&[&gd, &ud], 0).map_err(|e| e.to_string())?;
+                let q3 = candle_core::quantized::QTensor::quantize(&cat, GgmlDType::Q3K).map_err(|e| e.to_string())?;
+                let bytes = q3.data().map_err(|e| e.to_string())?;
+                let n_blocks = cat.shape().dims()[0] * nb;
+                return Ok(VkWeight::Q3 { buf: vk_up_q3k(&ctx, bufs, &bytes, n_blocks), nb });
+            }
             let mut b = g.data().map_err(|e| e.to_string())?.to_vec();
             b.extend_from_slice(&u.data().map_err(|e| e.to_string())?);
             Ok(VkWeight::Q4 { buf: vk_up_bytes(&ctx, bufs, &b), nb })
@@ -1072,7 +1121,7 @@ impl VkModel {
         let n_inter = ct.tensor(&mut file, "blk.0.ffn_gate.weight", &dev).map_err(|e| e.to_string())?.shape().dims()[0];
 
         // Per-layer weights + KV cache.
-        struct RawLayer { an: vk::Buffer, fn_: vk::Buffer, wq: VkWeight, wk: VkWeight, wv: VkWeight, wo: VkWeight, w13: VkWeight, w2: VkWeight, kc: vk::Buffer, vc: vk::Buffer }
+        struct RawLayer { an: vk::Buffer, fn_: vk::Buffer, wq: VkWeight, wk: VkWeight, wv: VkWeight, wo: VkWeight, w13: VkWeight, w13_q3: Option<VkWeight>, w2: VkWeight, kc: vk::Buffer, vc: vk::Buffer }
         let mut raw: Vec<RawLayer> = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
             let p = format!("blk.{i}");
@@ -1082,11 +1131,12 @@ impl VkModel {
             let wk = load_w(&mut bufs, &mut file, &format!("{p}.attn_k.weight"))?;
             let wv = load_w(&mut bufs, &mut file, &format!("{p}.attn_v.weight"))?;
             let wo = load_w(&mut bufs, &mut file, &format!("{p}.attn_output.weight"))?;
-            let w13 = load_gateup(&mut bufs, &mut file, &p)?;
+            let w13 = load_gateup(&mut bufs, &mut file, &p, false)?; // Q4 (prefill)
+            let w13_q3 = if q3_gateup { Some(load_gateup(&mut bufs, &mut file, &p, true)?) } else { None }; // Q3 decode copy
             let w2 = load_w(&mut bufs, &mut file, &format!("{p}.ffn_down.weight"))?;
             let (kc, _) = vk_zeros(&ctx, &mut bufs, max_seq * kv_dim);
             let (vc, _) = vk_zeros(&ctx, &mut bufs, max_seq * kv_dim);
-            raw.push(RawLayer { an, fn_, wq, wk, wv, wo, w13, w2, kc, vc });
+            raw.push(RawLayer { an, fn_, wq, wk, wv, wo, w13, w13_q3, w2, kc, vc });
         }
 
         // RoPE tables (interleaved rope_i, matching candle + rope.comp).
@@ -1140,6 +1190,7 @@ impl VkModel {
         };
         let (rms_p, rms_l, rms_sl) = mkpipe(RMSNORM_SPV, 3);
         let (mv_p, mv_l, mv_sl) = mkpipe(DECODE_MATVEC_Q4K_SPV, 3);
+        let (q3_p, q3_l, _q3_sl) = mkpipe(DECODE_MATVEC_Q3K_SPV, 3); // Q3_K reuses the 3-storage layout
         let (rope_p, rope_l, rope_sl) = mkpipe(ROPE_SPV, 3);
         let (kvw_p, kvw_l, kvw_sl) = mkpipe(KV_WRITE_SPV, 2);
         let (sdpa_p, sdpa_l, sdpa_sl) = mkpipe(SDPA_DECODE_SPV, 4);
@@ -1203,7 +1254,7 @@ impl VkModel {
             let wv = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.wv, normed, v_buf, kv_dim, false);
             // wo/w2 fold the residual: write x_buf += proj (no separate radd dispatch).
             let wo = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.wo, attn, x_buf, n_embd, true);
-            let w13 = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.w13, normed, gu, n_inter * 2, false);
+            let w13 = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, r.w13_q3.as_ref().unwrap_or(&r.w13), normed, gu, n_inter * 2, false);
             let w2 = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.w2, hbuf, x_buf, n_embd, true);
             let wqb = match &r.wq { VkWeight::Q4 { buf, .. } => *buf, _ => panic!("wq not Q4") };
             let wkb = match &r.wk { VkWeight::Q4 { buf, .. } => *buf, _ => panic!("wk not Q4") };
@@ -1300,7 +1351,7 @@ impl VkModel {
             n_embd, n_head, n_kv, hd, n_inter, vocab, n_layers, kv_dim, half, max_seq, eps, embed, cos, sin, lm_nb,
             x_ptr, cos_ptr, sin_ptr, base_ptr, seq_ptr, logits_ptr, l1_ptr, l2_ptr,
             layers, s_rope_q, s_rope_k, s_silu, s_final_norm, s_lm, s_argmax, argmax_ptr, lm_q4,
-            p_rms: (rms_p, rms_l), p_mv: (mv_p, mv_l), p_rope: (rope_p, rope_l), p_kvw: (kvw_p, kvw_l),
+            p_rms: (rms_p, rms_l), p_mv: (mv_p, mv_l), p_q3: (q3_p, q3_l), p_rope: (rope_p, rope_l), p_kvw: (kvw_p, kvw_l),
             p_sdpa: (sdpa_p, sdpa_l), p_fp: (fp_p, fp_l), p_fc: (fc_p, fc_l), p_silu: (silu_p, silu_l),
             p_ch: (ch_p, ch_l), p_fp2: (f2_p, f2_l),
             p_add: (add_p, add_l), p_q6k: (q6k_p, q6k_l), p_argmax: (argmax_p, argmax_l, argmax_sl), p_mvrope: (mvr_p, mvr_l),
@@ -1695,7 +1746,7 @@ impl VkModel {
             dv.cmd_dispatch(cmd, gx, gy, 1);
         };
         let gxof = |n: usize| (n as u32).min(65535);
-        let mv = |m: Mv, n: usize| disp(if m.q6 { self.p_q6k } else { self.p_mv }, m.set, gxof(n), (n as u32).div_ceil(gxof(n)));
+        let mv = |m: Mv, n: usize| disp(match m.pipe { 1 => self.p_q6k, 2 => self.p_q3, _ => self.p_mv }, m.set, gxof(n), (n as u32).div_ceil(gxof(n)));
         let mvonly = std::env::var("VK_MVONLY").is_ok();      // diag: matvecs only (skip all small ops)
         let skip_extra = mvonly || std::env::var("VK_NOEXTRA").is_ok(); // diag: skip kvwrite+residual
         let skip_norm = mvonly || std::env::var("VK_NONORM").is_ok();   // diag: skip rmsnorms
