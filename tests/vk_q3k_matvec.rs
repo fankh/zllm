@@ -131,6 +131,57 @@ fn vk_q3_vs_q4_bench() {
     eprintln!("  → if time ratio < 1: Q3 IS faster (win); if ~1: ALU offsets the fewer bytes (parity confirmed).");
 }
 
+/// Decode overhead decomposition: sum the ISOLATED (warm, no interleaving) time
+/// of every matvec at its real Llama-3.2-1B shape, compare to the in-forward
+/// matvec time (VK_MVONLY). The gap = dispatch-launch + interleaving overhead =
+/// the megakernel-recoverable headroom. Answers "is decode at the matvec floor
+/// or overhead-bound?".
+/// `cargo test --release --features vulkan --test vk_q3k_matvec vk_decode_floor -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn vk_decode_floor() {
+    let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan ({e}); skipping"); return; } };
+    let dev = Device::Cpu;
+    let iters = 80u32;
+    // (label, n_rows, k, count) — Llama-3.2-1B: n_embd 2048, kv_dim 512, n_inter 8192, vocab 128256, 16 layers.
+    let shapes = [
+        ("wq", 2048usize, 2048usize, 16usize),
+        ("wk", 512, 2048, 16),
+        ("wv", 512, 2048, 16),
+        ("wo", 2048, 2048, 16),
+        ("w13", 16384, 2048, 16),
+        ("w2", 2048, 8192, 16),
+        ("lm_head", 128256, 2048, 1),
+        // Occupancy probe: fused QKV (wq+wk+wv = 2048+512+512 rows) as ONE dispatch,
+        // + a sweep to see how BW scales with row count (the grid-starve curve).
+        ("qkv_fused", 3072, 2048, 16),
+        ("rows_1024", 1024, 2048, 16),
+        ("rows_4096", 4096, 2048, 16),
+        ("rows_8192", 8192, 2048, 16),
+    ];
+    let mut total_ms = 0f64;
+    let mut total_mb = 0f64;
+    eprintln!("isolated (warm) matvec time per shape:");
+    for (label, n, k, count) in shapes {
+        let nb = k / 256;
+        let data: Vec<f32> = (0..n * k).map(|i| (((i * 1103515245usize + 12345) % 1009) as f32 - 500.0) / 90.0).collect();
+        let t = Tensor::from_vec(data, (n, k), &dev).unwrap();
+        let q4 = QTensor::quantize(&t, GgmlDType::Q4K).unwrap();
+        let q4b = q4.data().unwrap();
+        let xs: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) / 5.0).collect();
+        let (_o, ms) = ctx.decode_matvec_q4k(&q4b, n, nb, &xs, iters).expect("mv");
+        let per = ms / iters as f64;
+        let mb = q4b.len() as f64 / 1e6;
+        let gbs = mb / 1e3 / (per / 1e3);
+        eprintln!("  {label:>8} {n:>6}x{k}: {per:.3} ms × {count} = {:.3} ms  ({mb:.1} MB, {gbs:.0} GB/s warm)", per * count as f64);
+        total_ms += per * count as f64;
+        total_mb += mb * count as f64;
+    }
+    eprintln!("\n  Σ isolated matvec floor = {total_ms:.3} ms/token  ({total_mb:.0} MB, {:.0} GB/s)", total_mb / 1e3 / (total_ms / 1e3));
+    eprintln!("  → in-forward matvec (VK_MVONLY) measured ~4.29 ms (233 tok/s); full decode ~4.76 ms (210 tok/s).");
+    eprintln!("  → gap (in-forward − isolated floor) = dispatch + interleaving overhead = megakernel-recoverable headroom.");
+}
+
 /// Generate the committed SPIR-V from the WGSL (naga is dev-only; the VkModel
 /// lib `include_bytes!`s the .spv). Run once after editing the .wgsl:
 /// `cargo test --features vulkan --test vk_q3k_matvec gen_q3k_spv -- --ignored --nocapture`
