@@ -651,10 +651,19 @@ impl VkContext {
         let k = nb * 256;
         assert_eq!(weight_bytes.len(), n * nb * 144);
         assert_eq!(x.len(), k);
-        unsafe { self.decode_matvec_q4k_inner(weight_bytes, n, nb, x, iters) }
+        let spv = ash::util::read_spv(&mut std::io::Cursor::new(DECODE_MATVEC_Q4K_SPV)).map_err(|e| format!("read_spv: {e}"))?;
+        unsafe { self.decode_matvec_q4k_inner(&spv, weight_bytes, n, nb, x, iters) }
     }
 
-    unsafe fn decode_matvec_q4k_inner(&self, weight_bytes: &[u8], n: usize, nb: usize, x: &[f32], iters: u32) -> Result<(Vec<f32>, f64), String> {
+    /// Run a 4-binding decode matvec (storage W,X,O + uniform{N,K,nb,gx}) from
+    /// arbitrary SPIR-V `spv` (words) over a packed weight buffer — the shader
+    /// owns its block stride, so this is dtype-agnostic. Used by the Q3 kernel
+    /// validation (naga-compiled WGSL) and reusable for any 1-row matvec kernel.
+    pub fn decode_matvec_spv(&self, spv: &[u32], weight_bytes: &[u8], n: usize, nb: usize, x: &[f32], iters: u32) -> Result<(Vec<f32>, f64), String> {
+        unsafe { self.decode_matvec_q4k_inner(spv, weight_bytes, n, nb, x, iters) }
+    }
+
+    unsafe fn decode_matvec_q4k_inner(&self, spv: &[u32], weight_bytes: &[u8], n: usize, nb: usize, x: &[f32], iters: u32) -> Result<(Vec<f32>, f64), String> {
         use std::time::Instant;
         let dev = &self.device;
         let k = nb * 256;
@@ -668,8 +677,7 @@ impl VkContext {
         let dims = [n as u32, k as u32, nb as u32, gx];
         std::ptr::copy_nonoverlapping(dims.as_ptr() as *const u8, p_ptr, 16);
 
-        let spv = ash::util::read_spv(&mut std::io::Cursor::new(DECODE_MATVEC_Q4K_SPV)).map_err(|e| format!("read_spv: {e}"))?;
-        let module = dev.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spv), None).map_err(|e| format!("module: {e}"))?;
+        let module = dev.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(spv), None).map_err(|e| format!("module: {e}"))?;
 
         let mut bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..3)
             .map(|b| vk::DescriptorSetLayoutBinding::default().binding(b).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE))
