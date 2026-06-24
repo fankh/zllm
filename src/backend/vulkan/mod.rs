@@ -965,6 +965,7 @@ unsafe fn vk_mk_mv(ctx: &VkContext, pool: ash::vk::DescriptorPool, mv_sl: ash::v
 struct VkLayerOps {
     attn_norm: ash::vk::DescriptorSet, wq: Mv, wk: Mv, wv: Mv,
     wq_rope: ash::vk::DescriptorSet, wk_rope: ash::vk::DescriptorSet, // QKV+rope fused (q/k)
+    wqk_rope: Option<ash::vk::DescriptorSet>, // ZLLM_FUSED_QKV: one mvrope over concat wq+wk
     kvw_k: ash::vk::DescriptorSet, kvw_v: ash::vk::DescriptorSet, sdpa: ash::vk::DescriptorSet,
     fp: ash::vk::DescriptorSet, fc: ash::vk::DescriptorSet, wo: Mv,
     fc1: ash::vk::DescriptorSet, fc2: ash::vk::DescriptorSet, // hierarchical combine: L1 (part->super), L2 (super->attn)
@@ -1097,6 +1098,20 @@ impl VkModel {
             b.extend_from_slice(&u.data().map_err(|e| e.to_string())?);
             Ok(VkWeight::Q4 { buf: vk_up_bytes(&ctx, bufs, &b), nb })
         };
+        // ZLLM_FUSED_QKV concatenates wq+wk into one Q4 weight [n_embd+kv_dim, n_embd]
+        // → one p_mvrope dispatch (rope is per-dim-in-head, head-count-agnostic) instead
+        // of two small grid-starved ones. wv stays separate. See vk_prefill_gemm_floor.
+        let fused_qkv = std::env::var("ZLLM_FUSED_QKV").is_ok();
+        let load_wqk = |bufs: &mut Vec<_>, file: &mut std::fs::File, p: &str| -> Result<vk::Buffer, String> {
+            let wqt = ct.tensor(file, &format!("{p}.attn_q.weight"), &dev).map_err(|e| e.to_string())?;
+            let wkt = ct.tensor(file, &format!("{p}.attn_k.weight"), &dev).map_err(|e| e.to_string())?;
+            if wqt.dtype() != GgmlDType::Q4K || wkt.dtype() != GgmlDType::Q4K {
+                return Err(format!("{p}: fused QKV needs Q4_K wq/wk"));
+            }
+            let mut b = wqt.data().map_err(|e| e.to_string())?.to_vec();
+            b.extend_from_slice(&wkt.data().map_err(|e| e.to_string())?);
+            Ok(vk_up_bytes(&ctx, bufs, &b))
+        };
         let load_norm = |bufs: &mut Vec<_>, file: &mut std::fs::File, name: &str| -> Result<vk::Buffer, String> {
             let qt = ct.tensor(file, name, &dev).map_err(|e| e.to_string())?;
             let v: Vec<f32> = qt.dequantize(&dev).map_err(|e| e.to_string())?.flatten_all().map_err(|e| e.to_string())?.to_vec1().map_err(|e| e.to_string())?;
@@ -1121,7 +1136,7 @@ impl VkModel {
         let n_inter = ct.tensor(&mut file, "blk.0.ffn_gate.weight", &dev).map_err(|e| e.to_string())?.shape().dims()[0];
 
         // Per-layer weights + KV cache.
-        struct RawLayer { an: vk::Buffer, fn_: vk::Buffer, wq: VkWeight, wk: VkWeight, wv: VkWeight, wo: VkWeight, w13: VkWeight, w13_q3: Option<VkWeight>, w2: VkWeight, kc: vk::Buffer, vc: vk::Buffer }
+        struct RawLayer { an: vk::Buffer, fn_: vk::Buffer, wq: VkWeight, wk: VkWeight, wv: VkWeight, wo: VkWeight, w13: VkWeight, w13_q3: Option<VkWeight>, w2: VkWeight, wqk: Option<vk::Buffer>, kc: vk::Buffer, vc: vk::Buffer }
         let mut raw: Vec<RawLayer> = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
             let p = format!("blk.{i}");
@@ -1134,9 +1149,10 @@ impl VkModel {
             let w13 = load_gateup(&mut bufs, &mut file, &p, false)?; // Q4 (prefill)
             let w13_q3 = if q3_gateup { Some(load_gateup(&mut bufs, &mut file, &p, true)?) } else { None }; // Q3 decode copy
             let w2 = load_w(&mut bufs, &mut file, &format!("{p}.ffn_down.weight"))?;
+            let wqk = if fused_qkv { Some(load_wqk(&mut bufs, &mut file, &p)?) } else { None };
             let (kc, _) = vk_zeros(&ctx, &mut bufs, max_seq * kv_dim);
             let (vc, _) = vk_zeros(&ctx, &mut bufs, max_seq * kv_dim);
-            raw.push(RawLayer { an, fn_, wq, wk, wv, wo, w13, w13_q3, w2, kc, vc });
+            raw.push(RawLayer { an, fn_, wq, wk, wv, wo, w13, w13_q3, w2, wqk, kc, vc });
         }
 
         // RoPE tables (interleaved rope_i, matching candle + rope.comp).
@@ -1158,6 +1174,7 @@ impl VkModel {
         let (q, _) = vk_zeros(&ctx, &mut bufs, attn_dim);
         let (k_buf, _) = vk_zeros(&ctx, &mut bufs, kv_dim);
         let (v_buf, _) = vk_zeros(&ctx, &mut bufs, kv_dim);
+        let (qk_buf, _) = vk_zeros(&ctx, &mut bufs, attn_dim + kv_dim); // fused QKV: q | k (q,k roped together)
         let (attn, _) = vk_zeros(&ctx, &mut bufs, attn_dim);
         let (o_buf, _) = vk_zeros(&ctx, &mut bufs, n_embd);
         let (gu, _) = vk_zeros(&ctx, &mut bufs, n_inter * 2); // [gate(n_inter); up(n_inter)]
@@ -1262,13 +1279,23 @@ impl VkModel {
             let u_wkr = vk_uni8(&ctx, &mut bufs, [kv_dim as u32, n_embd as u32, (n_embd / 256) as u32, gxof(kv_dim / 2), half as u32, 0, 0, 0]);
             let wq_rope = mkset(mvr_sl, &[wqb, normed, cos_buf, sin_buf, q], u_wqr);
             let wk_rope = mkset(mvr_sl, &[wkb, normed, cos_buf, sin_buf, k_buf], u_wkr);
+            // Fused QKV: one mvrope over concat wq+wk → qk_buf (q|k roped together);
+            // repoint kvw_k/sdpa/fp to read k/q from qk_buf slices. wv stays separate.
+            let wqk_rope = if let Some(wqkb) = r.wqk {
+                let u = vk_uni8(&ctx, &mut bufs, [(n_embd + kv_dim) as u32, n_embd as u32, (n_embd / 256) as u32, gxof((n_embd + kv_dim) / 2), half as u32, 0, 0, 0]);
+                Some(mkset(mvr_sl, &[wqkb, normed, cos_buf, sin_buf, qk_buf], u))
+            } else { None };
+            let qsrc = if fused_qkv { qk_buf } else { q };
+            let kvw_k = if fused_qkv {
+                vk_alloc_set_off(&ctx.device, desc_pool, kvw_sl, &[(r.kc, 0, vk::WHOLE_SIZE), (qk_buf, (n_embd * 4) as u64, (kv_dim * 4) as u64)], u_base)
+            } else { mkset(kvw_sl, &[r.kc, k_buf], u_base) };
             layers.push(VkLayerOps {
                 attn_norm: mkset(rms_sl, &[x_buf, r.an, normed], u_norm),
-                wq, wk, wv, wq_rope, wk_rope,
-                kvw_k: mkset(kvw_sl, &[r.kc, k_buf], u_base),
+                wq, wk, wv, wq_rope, wk_rope, wqk_rope,
+                kvw_k,
                 kvw_v: mkset(kvw_sl, &[r.vc, v_buf], u_base),
-                sdpa: mkset(sdpa_sl, &[q, r.kc, r.vc, attn], u_seq),
-                fp: mkset(fp_sl, &[q, r.kc, r.vc, part], u_seq),
+                sdpa: mkset(sdpa_sl, &[qsrc, r.kc, r.vc, attn], u_seq),
+                fp: mkset(fp_sl, &[qsrc, r.kc, r.vc, part], u_seq),
                 fc: mkset(fc_sl, &[part, attn], u_seq),
                 fc1: mkset(ch_sl, &[part, superp], u_l1),   // L1: block-partials -> super-partials
                 fc2: mkset(ch_sl, &[superp, attn], u_l2),   // L2: super-partials -> attn (normalized)
@@ -1761,8 +1788,14 @@ impl VkModel {
             if !skip_norm { disp(self.p_rms, l.attn_norm, 1, 1); bar(); }              // attn norm
             // QKV with RoPE fused into the wq/wk output (q/k come out rotated);
             // wv normal (V isn't roped). Removes the separate RoPE dispatch + barrier.
-            disp(self.p_mvrope, l.wq_rope, gxof(n_embd / 2), ((n_embd / 2) as u32).div_ceil(gxof(n_embd / 2)));
-            disp(self.p_mvrope, l.wk_rope, gxof(kv_dim / 2), ((kv_dim / 2) as u32).div_ceil(gxof(kv_dim / 2)));
+            if let Some(wqk) = l.wqk_rope {
+                // Fused: one mvrope over concat wq+wk (grid-starve fix) → qk_buf.
+                let pr = (n_embd + kv_dim) / 2;
+                disp(self.p_mvrope, wqk, gxof(pr), (pr as u32).div_ceil(gxof(pr)));
+            } else {
+                disp(self.p_mvrope, l.wq_rope, gxof(n_embd / 2), ((n_embd / 2) as u32).div_ceil(gxof(n_embd / 2)));
+                disp(self.p_mvrope, l.wk_rope, gxof(kv_dim / 2), ((kv_dim / 2) as u32).div_ceil(gxof(kv_dim / 2)));
+            }
             mv(l.wv, kv_dim); bar();                                                   // QKV + rope(q,k)
             if !skip_attn {
             if !skip_extra { disp(self.p_kvw, l.kvw_k, (kv_dim as u32).div_ceil(64), 1);
