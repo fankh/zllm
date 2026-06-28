@@ -718,6 +718,47 @@ impl VkContext {
         }
     }
 
+    /// Measure the cost of `n_sync` atomic grid-wide barriers in a persistent
+    /// dispatch of `n_wg` workgroups (no other work). per-sync = (cost(N)-cost(1))/(N-1).
+    /// Decides megakernel viability: a forward has ~194 syncs/token, so >2µs/sync
+    /// (>0.4ms, >8%) would sink it. Buffers: sync array (binding 0) + uniform.
+    pub fn grid_sync_cost(&self, spv: &[u32], n_wg: u32, n_sync: u32) -> Result<f64, String> {
+        use ash::vk; use std::time::Instant;
+        unsafe {
+            let dev = &self.device;
+            let (sb, sm, sp) = self.uma_buffer(1024)?; std::ptr::write_bytes(sp, 0, 1024); // 256 u32 counters
+            let (pb, pm, pp) = self.uma_buffer(16)?;
+            std::ptr::copy_nonoverlapping([n_wg, n_sync, 0u32, 0u32].as_ptr() as *const u8, pp, 16);
+            let spvb: Vec<u8> = spv.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let (pipe, layout, sl, module) = self.make_pipeline_raw(&spvb, 1);
+            let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&[
+                vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1),
+                vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(1)]), None).map_err(|e| format!("pool: {e}"))?;
+            let set = dev.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&[sl])).map_err(|e| format!("set: {e}"))?[0];
+            let si = [vk::DescriptorBufferInfo::default().buffer(sb).range(vk::WHOLE_SIZE)];
+            let ui = [vk::DescriptorBufferInfo::default().buffer(pb).range(vk::WHOLE_SIZE)];
+            dev.update_descriptor_sets(&[
+                vk::WriteDescriptorSet::default().dst_set(set).dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&si),
+                vk::WriteDescriptorSet::default().dst_set(set).dst_binding(1).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&ui)], &[]);
+            let cp = dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(self.queue_family), None).unwrap();
+            let cmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cp).command_buffer_count(1)).unwrap()[0];
+            dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+            dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe);
+            dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+            dev.cmd_dispatch(cmd, n_wg, 1, 1);
+            dev.end_command_buffer(cmd).unwrap();
+            let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+            let t0 = Instant::now();
+            dev.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence).map_err(|e| format!("submit: {e}"))?;
+            dev.wait_for_fences(&[fence], true, 5_000_000_000).map_err(|e| format!("wait: {e}"))?;
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            dev.destroy_fence(fence, None); dev.destroy_command_pool(cp, None); dev.destroy_descriptor_pool(pool, None);
+            dev.destroy_pipeline(pipe, None); dev.destroy_pipeline_layout(layout, None); dev.destroy_descriptor_set_layout(sl, None); dev.destroy_shader_module(module, None);
+            for (b, m) in [(sb, sm), (pb, pm)] { dev.unmap_memory(m); dev.destroy_buffer(b, None); dev.free_memory(m, None); }
+            Ok(ms)
+        }
+    }
+
     unsafe fn decode_matvec_q4k_inner(&self, spv: &[u32], weight_bytes: &[u8], n: usize, nb: usize, x: &[f32], iters: u32) -> Result<(Vec<f32>, f64), String> {
         use std::time::Instant;
         let dev = &self.device;
@@ -2951,6 +2992,40 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         eprintln!("megakernel PoC (2 matvec + atomic grid-sync, {n_wg} wg): max rel {maxrel:.3e}, {ms:.2}ms");
         assert!(maxrel < 1e-3, "GRID-SYNC RACE: y2 wrong (max rel {maxrel}) → device-scope sync NOT coherent in WGSL on this GPU; megakernel not buildable this way");
         eprintln!("✓ atomic grid-sync is COHERENT on this GPU → megakernel foundation WORKS");
+    }
+
+    /// Per-grid-sync cost (decides megakernel viability: ~194 syncs/token).
+    /// `cargo test --release --features vulkan --lib vk_grid_sync_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_grid_sync_cost() {
+        const WGSL: &str = r#"
+struct P { n_wg: u32, n_sync: u32 };
+@group(0) @binding(0) var<storage, read_write> sync: array<atomic<u32>, 256>;
+@group(0) @binding(1) var<uniform>             p: P;
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    for (var s = 0u; s < p.n_sync; s = s + 1u) {
+        workgroupBarrier(); storageBarrier();
+        if (lid.x == 0u) {
+            atomicAdd(&sync[s], 1u);
+            var spin = 0u;
+            loop { if (atomicLoad(&sync[s]) >= p.n_wg) { break; } spin = spin + 1u; if (spin > 10000000u) { break; } }
+        }
+        workgroupBarrier(); storageBarrier();
+    }
+}
+"#;
+        let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan ({e}); skipping"); return; } };
+        let m = naga::front::wgsl::parse_str(WGSL).expect("parse");
+        let i = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&m).expect("validate");
+        let spv = naga::back::spv::write_vec(&m, &i, &naga::back::spv::Options::default(), None).expect("spv");
+        for n_wg in [128u32, 256, 512, 1024] {
+            let c1 = ctx.grid_sync_cost(&spv, n_wg, 1).unwrap();
+            let cn = ctx.grid_sync_cost(&spv, n_wg, 200).unwrap();
+            let per = (cn - c1) / 199.0 * 1000.0; // µs/sync
+            eprintln!("n_wg={n_wg:>4}: {per:6.2} µs/sync → ~194 syncs/token = {:.3} ms ({:.0}% of a 4.76ms decode)", per * 194.0 / 1000.0, per * 194.0 / 1000.0 / 4.76 * 100.0);
+        }
     }
 
     #[test]
