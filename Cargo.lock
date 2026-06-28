@@ -4614,6 +4614,7 @@ dependencies = [
  "futures",
  "half",
  "hf-hub",
+ "naga",
  "pollster",
  "prometheus",
  "rand",
