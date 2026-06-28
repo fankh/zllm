@@ -48,6 +48,8 @@ const Q6K_MEGAKERNEL_PROBE_SPV: &[u8] = include_bytes!("shaders/q6k_megakernel_p
 #[cfg(test)]
 const FFN_MEGAKERNEL_SPV: &[u8] = include_bytes!("shaders/ffn_megakernel.spv");
 const KV_WRITE_SPV: &[u8] = include_bytes!("shaders/kv_write.spv");
+const KV_WRITE_HM_SPV: &[u8] = include_bytes!("shaders/kv_write_hm.spv"); // head-major write (ZLLM_HEADMAJOR_KV)
+const SDPA_FLASH_PARTIAL_HM_SPV: &[u8] = include_bytes!("shaders/sdpa_flash_partial_hm.spv"); // head-major partial (naga-gen)
 const RESIDUAL_ADD_SPV: &[u8] = include_bytes!("shaders/residual_add.spv");
 const ARGMAX_SPV: &[u8] = include_bytes!("shaders/argmax.spv");
 // Batched prefill kernels.
@@ -1072,6 +1074,7 @@ struct VkLayerOps {
 pub struct VkModel {
     pub n_embd: usize, n_head: usize, n_kv: usize, hd: usize, n_inter: usize,
     pub vocab: usize, n_layers: usize, kv_dim: usize, half: usize, max_seq: usize, eps: f32,
+    headmajor: bool, // ZLLM_HEADMAJOR_KV: cache [kv_head,pos,hd] + always-flash (decode-cache-fill only)
     embed: Vec<f32>, cos: Vec<f32>, sin: Vec<f32>,
     // dispatch dims
     lm_nb: usize,
@@ -1096,6 +1099,8 @@ pub struct VkModel {
     p_fc: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_silu: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     p_ch: (ash::vk::Pipeline, ash::vk::PipelineLayout), // hierarchical (tree) flash combine
     p_fp2: (ash::vk::Pipeline, ash::vk::PipelineLayout), // 2-pass flash partial (hd<=64; faster, same output)
+    p_kvw_hm: (ash::vk::Pipeline, ash::vk::PipelineLayout), // head-major KV write (ZLLM_HEADMAJOR_KV)
+    p_fp2_hm: (ash::vk::Pipeline, ash::vk::PipelineLayout), // head-major flash partial (ZLLM_HEADMAJOR_KV)
 
     p_add: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_q6k: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     p_argmax: Pipe3, p_mvrope: (ash::vk::Pipeline, ash::vk::PipelineLayout),
@@ -1311,6 +1316,8 @@ impl VkModel {
         let (fc_p, fc_l, fc_sl) = mkpipe(SDPA_FLASH_COMBINE_SPV, 2);
         let (ch_p, ch_l, ch_sl) = mkpipe(SDPA_FLASH_COMBINE_H_SPV, 2); // hierarchical combine (both levels)
         let (f2_p, f2_l, _f2_sl) = mkpipe(SDPA_FLASH_PARTIAL2_SPV, 4); // 2-pass partial (compatible layout with fp)
+        let (kvwhm_p, kvwhm_l, _kvwhm_sl) = mkpipe(KV_WRITE_HM_SPV, 2);          // head-major KV write (same {dst,src}+uniform layout as kvw)
+        let (f2hm_p, f2hm_l, _f2hm_sl) = mkpipe(SDPA_FLASH_PARTIAL_HM_SPV, 4);   // head-major partial (same {q,kc,vc,part}+uniform layout as fp2)
         let (silu_p, silu_l, silu_sl) = mkpipe(SILU_MUL_SPV, 3);
         let (add_p, add_l, add_sl) = mkpipe(RESIDUAL_ADD_SPV, 2);
         let (q6k_p, q6k_l, q6k_sl) = mkpipe(DECODE_MATVEC_Q6K_SPV, 6);
@@ -1472,12 +1479,15 @@ impl VkModel {
         let verify_fence = dv.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| format!("verify fence: {e}"))?;
 
         Ok(Self {
-            n_embd, n_head, n_kv, hd, n_inter, vocab, n_layers, kv_dim, half, max_seq, eps, embed, cos, sin, lm_nb,
+            n_embd, n_head, n_kv, hd, n_inter, vocab, n_layers, kv_dim, half, max_seq, eps,
+            headmajor: std::env::var("ZLLM_HEADMAJOR_KV").is_ok(),
+            embed, cos, sin, lm_nb,
             x_ptr, cos_ptr, sin_ptr, base_ptr, seq_ptr, logits_ptr, l1_ptr, l2_ptr,
             layers, s_rope_q, s_rope_k, s_silu, s_final_norm, s_lm, s_argmax, argmax_ptr, lm_q4,
             p_rms: (rms_p, rms_l), p_mv: (mv_p, mv_l), p_q3: (q3_p, q3_l), p_rope: (rope_p, rope_l), p_kvw: (kvw_p, kvw_l),
             p_sdpa: (sdpa_p, sdpa_l), p_fp: (fp_p, fp_l), p_fc: (fc_p, fc_l), p_silu: (silu_p, silu_l),
             p_ch: (ch_p, ch_l), p_fp2: (f2_p, f2_l),
+            p_kvw_hm: (kvwhm_p, kvwhm_l), p_fp2_hm: (f2hm_p, f2hm_l),
             p_add: (add_p, add_l), p_q6k: (q6k_p, q6k_l), p_argmax: (argmax_p, argmax_l, argmax_sl), p_mvrope: (mvr_p, mvr_l),
             last_rec: std::cell::Cell::new(-1),
             verify_unis, verify_argmax, verify_pool, verify_cmd, verify_fence,
@@ -1858,13 +1868,21 @@ impl VkModel {
         let (n_embd, n_head, n_kv, hd, n_inter, kv_dim, half) = (self.n_embd, self.n_head, self.n_kv, self.hd, self.n_inter, self.kv_dim, self.half);
         let attn_dim = n_head * hd;
         let seq_len = (pos + 1) as u32;
+        // Head-major KV cache (ZLLM_HEADMAJOR_KV): cache laid [kv_head, pos, hd] so
+        // each SDPA workgroup reads its kv-head CONTIGUOUSLY (vs strided by n_kv*hd).
+        // Requires the head-major kvwrite + partial AND always-flash (the single-pass
+        // sdpa_decode is pos-major), so we force the flash path at every depth. The
+        // combine reads partials (not the cache) → unchanged. Decode-cache-fill only
+        // (prefill still writes pos-major), so this is a research/measurement flag.
+        let headmajor = self.headmajor;
+        let flash = headmajor || seq_len as usize > FLASH_MIN_SEQ;
         // Update per-token mapped buffers.
         std::ptr::copy_nonoverlapping(self.embed[token as usize * n_embd..].as_ptr() as *const u8, self.x_ptr, n_embd * 4);
         std::ptr::copy_nonoverlapping(self.cos[pos * half..].as_ptr() as *const u8, self.cos_ptr, half * 4);
         std::ptr::copy_nonoverlapping(self.sin[pos * half..].as_ptr() as *const u8, self.sin_ptr, half * 4);
         std::ptr::copy_nonoverlapping([kv_dim as u32, (pos * kv_dim) as u32, 0u32, 0u32].as_ptr() as *const u8, self.base_ptr, 16);
         std::ptr::copy_nonoverlapping([n_head as u32, n_kv as u32, hd as u32, seq_len].as_ptr() as *const u8, self.seq_ptr, 16);
-        if seq_len as usize > FLASH_MIN_SEQ { // refresh hierarchical-combine uniforms for this depth
+        if flash { // refresh hierarchical-combine uniforms for this depth
             let nblk = (seq_len as usize).div_ceil(SDPA_FLASH_BLOCK);
             let n_super = nblk.div_ceil(SDPA_SUPER);
             std::ptr::copy_nonoverlapping([n_head as u32, n_kv as u32, hd as u32, nblk as u32, SDPA_SUPER as u32, 0u32].as_ptr() as *const u8, self.l1_ptr, 24);
@@ -1873,7 +1891,7 @@ impl VkModel {
 
         // Record-once: only re-record when the SDPA grid (single-pass vs flash
         // n_blocks) or the lm/argmax tail changes; otherwise reuse self.cmd.
-        let sdpa_key = if (seq_len as usize) > FLASH_MIN_SEQ { (seq_len as usize).div_ceil(SDPA_FLASH_BLOCK) as i64 } else { 0 };
+        let sdpa_key = if flash { (seq_len as usize).div_ceil(SDPA_FLASH_BLOCK) as i64 } else { 0 };
         let rec_key = sdpa_key | ((lm as i64) << 20) | ((argmax as i64) << 21);
         let need_record = self.last_rec.get() != rec_key;
         let cmd = self.cmd;
@@ -1914,12 +1932,14 @@ impl VkModel {
             }
             mv(l.wv, kv_dim); bar();                                                   // QKV + rope(q,k)
             if !skip_attn {
-            if !skip_extra { disp(self.p_kvw, l.kvw_k, (kv_dim as u32).div_ceil(64), 1);
-            disp(self.p_kvw, l.kvw_v, (kv_dim as u32).div_ceil(64), 1); bar(); }       // append K,V to cache
-            if seq_len as usize > FLASH_MIN_SEQ {
+            let kvw_pipe = if headmajor { self.p_kvw_hm } else { self.p_kvw };
+            if !skip_extra { disp(kvw_pipe, l.kvw_k, (kv_dim as u32).div_ceil(64), 1);
+            disp(kvw_pipe, l.kvw_v, (kv_dim as u32).div_ceil(64), 1); bar(); }       // append K,V to cache
+            if flash {
                 let nblk = (seq_len as usize).div_ceil(SDPA_FLASH_BLOCK) as u32;
                 let n_super = (nblk as usize).div_ceil(SDPA_SUPER) as u32;
-                disp(if use_p2 { self.p_fp2 } else { self.p_fp }, l.fp, n_head as u32, nblk); bar(); // partials per block (2-pass if hd<=64)
+                let fp_pipe = if headmajor { self.p_fp2_hm } else if use_p2 { self.p_fp2 } else { self.p_fp };
+                disp(fp_pipe, l.fp, n_head as u32, nblk); bar(); // partials per block (head-major / 2-pass if hd<=64)
                 if flat_combine {
                     disp(self.p_fc, l.fc, n_head as u32, 1); bar();     // flat combine (A/B baseline)
                 } else {
