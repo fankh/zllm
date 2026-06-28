@@ -6,7 +6,9 @@
 // sdpa_flash_partial2 so the combine shader is unchanged: per (head, block)
 // it writes hd un-normalized weighted-V accumulators, then block-max m and
 // block sum-exp l. Compute uses a shared-mem reduction (no subgroup ops, so
-// naga compiles it). Model dim MAX_SEQ is a const. SPV: gen_headmajor_spv.
+// naga compiles it). Already model-general: hd/n_kv come from the uniform and
+// MAX_SEQ is the fixed engine cache cap (mod.rs:1156); qsh[64]/wg(64) cap hd<=64
+// (the engine's SDPA limit). SPV: gen_headmajor_spv.
 struct P { n_head: u32, n_kv: u32, hd: u32, seq_len: u32 };
 @group(0) @binding(0) var<storage, read>       q:    array<f32>;  // [n_head*hd]
 @group(0) @binding(1) var<storage, read>       kc:   array<f32>;  // head-major [n_kv, MAX_SEQ, hd]

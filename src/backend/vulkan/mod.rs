@@ -1541,7 +1541,7 @@ impl VkModel {
         let sz = (n as u64) * 4;
         let (temp, tmem, _tp) = self.ctx.uma_buffer(sz).unwrap();
         let (ub, umem, up) = self.ctx.uma_buffer(16).unwrap();
-        std::ptr::copy_nonoverlapping([n, 0u32, 0, 0].as_ptr() as *const u8, up, 16);
+        std::ptr::copy_nonoverlapping([n, self.hd as u32, self.kv_dim as u32, 0u32].as_ptr() as *const u8, up, 16); // slot1=hd, slot2=kv_dim
         let nsets = (self.n_layers * 2) as u32;
         let pool = dv.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(nsets).pool_sizes(&[
             vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(nsets * 2),
@@ -1929,7 +1929,7 @@ impl VkModel {
         std::ptr::copy_nonoverlapping(self.embed[token as usize * n_embd..].as_ptr() as *const u8, self.x_ptr, n_embd * 4);
         std::ptr::copy_nonoverlapping(self.cos[pos * half..].as_ptr() as *const u8, self.cos_ptr, half * 4);
         std::ptr::copy_nonoverlapping(self.sin[pos * half..].as_ptr() as *const u8, self.sin_ptr, half * 4);
-        std::ptr::copy_nonoverlapping([kv_dim as u32, (pos * kv_dim) as u32, 0u32, 0u32].as_ptr() as *const u8, self.base_ptr, 16);
+        std::ptr::copy_nonoverlapping([kv_dim as u32, (pos * kv_dim) as u32, hd as u32, 0u32].as_ptr() as *const u8, self.base_ptr, 16); // slot2=hd for head-major kvwrite
         std::ptr::copy_nonoverlapping([n_head as u32, n_kv as u32, hd as u32, seq_len].as_ptr() as *const u8, self.seq_ptr, 16);
         if flash { // refresh hierarchical-combine uniforms for this depth
             let nblk = (seq_len as usize).div_ceil(SDPA_FLASH_BLOCK);
@@ -2055,6 +2055,120 @@ impl Drop for VkModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cross-dim generalization: the head-major shaders now read hd/kv_dim from
+    /// the uniform, so one SPV serves any hd<=64 model. This validates them at dims
+    /// DIFFERENT from the 1B (hd=32, n_kv=2, n_head=4 vs hd=64, n_kv=8, n_head=32):
+    /// spot-checks kv_write_hm's layout at hd=32, then runs the partial on a
+    /// head-major cache and compares (after a CPU log-sum-exp combine) to a CPU
+    /// softmax-attention reference. `--lib vk_headmajor_crossdim -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_headmajor_crossdim() {
+        use ash::vk;
+        let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan ({e}); skipping"); return; } };
+        let (n_head, n_kv, hd, seq) = (4usize, 2usize, 32usize, 70usize);
+        let max_seq = 4096usize; // must equal MAX_SEQ in the shaders (engine cache cap)
+        let kv_dim = n_kv * hd;  // 64 ≠ the 1B's 512
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        let f = |a: usize, b: usize| (((a * 7 + b * 13) % 17) as f32) * 0.1 - 0.8; // deterministic synthetic
+        let q: Vec<f32> = (0..n_head * hd).map(|i| f(i, 1)).collect();
+        let ksrc: Vec<Vec<f32>> = (0..seq).map(|p| (0..kv_dim).map(|e| f(p, e + 2)).collect()).collect();
+        let vsrc: Vec<Vec<f32>> = (0..seq).map(|p| (0..kv_dim).map(|e| f(p, e + 5)).collect()).collect();
+        let nblk = seq.div_ceil(32);
+        unsafe {
+            let dev = &ctx.device;
+            let hm = |kvh: usize, p: usize, d: usize| kvh * max_seq * hd + p * hd + d; // head-major index
+            // Build the head-major K/V cache directly (the layout the partial reads).
+            let (kc, _kcm, kcp) = ctx.uma_buffer((max_seq * kv_dim * 4) as u64).unwrap();
+            let (vc, _vcm, vcp) = ctx.uma_buffer((max_seq * kv_dim * 4) as u64).unwrap();
+            let kcs = std::slice::from_raw_parts_mut(kcp as *mut f32, max_seq * kv_dim);
+            let vcs = std::slice::from_raw_parts_mut(vcp as *mut f32, max_seq * kv_dim);
+            for p in 0..seq { for kvh in 0..n_kv { for d in 0..hd {
+                kcs[hm(kvh, p, d)] = ksrc[p][kvh * hd + d];
+                vcs[hm(kvh, p, d)] = vsrc[p][kvh * hd + d];
+            }}}
+            let submit = |cmd: vk::CommandBuffer| {
+                let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+                dev.queue_submit(ctx.queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence).unwrap();
+                dev.wait_for_fences(&[fence], true, 5_000_000_000).unwrap();
+                dev.destroy_fence(fence, None);
+            };
+            // (1) Spot-check kv_write_hm at hd=32: write position 3's K via the shader, expect the head-major layout.
+            let (kvw_p, kvw_l, kvw_sl, _) = ctx.make_pipeline_raw(KV_WRITE_HM_SPV, 2);
+            let (chk, _chm, chp) = ctx.uma_buffer((max_seq * kv_dim * 4) as u64).unwrap();
+            std::ptr::write_bytes(chp, 0, max_seq * kv_dim * 4);
+            let (wsrc, _wsm, wsp) = ctx.uma_buffer((kv_dim * 4) as u64).unwrap();
+            std::ptr::copy_nonoverlapping(ksrc[3].as_ptr() as *const u8, wsp, kv_dim * 4);
+            let (wub, _wum, wup) = ctx.uma_buffer(16).unwrap();
+            std::ptr::copy_nonoverlapping([kv_dim as u32, (3 * kv_dim) as u32, hd as u32, 0u32].as_ptr() as *const u8, wup, 16);
+            let wset = vk_alloc_set(dev, {
+                let p = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&[
+                    vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(2),
+                    vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(1)]), None).unwrap(); p
+            }, kvw_sl, &[chk, wsrc], wub);
+            let cpool = dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family), None).unwrap();
+            let wcmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cpool).command_buffer_count(1)).unwrap()[0];
+            dev.begin_command_buffer(wcmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+            dev.cmd_bind_pipeline(wcmd, vk::PipelineBindPoint::COMPUTE, kvw_p);
+            dev.cmd_bind_descriptor_sets(wcmd, vk::PipelineBindPoint::COMPUTE, kvw_l, 0, &[wset], &[]);
+            dev.cmd_dispatch(wcmd, (kv_dim as u32).div_ceil(64), 1, 1);
+            dev.end_command_buffer(wcmd).unwrap(); submit(wcmd);
+            let chks = std::slice::from_raw_parts(chp as *const f32, max_seq * kv_dim);
+            let mut wmax = 0f32;
+            for kvh in 0..n_kv { for d in 0..hd { wmax = wmax.max((chks[hm(kvh, 3, d)] - ksrc[3][kvh * hd + d]).abs()); } }
+            eprintln!("kv_write_hm @hd=32 layout max err: {wmax:.2e}");
+            assert!(wmax < 1e-6, "kv_write_hm wrong layout at hd=32");
+
+            // (2) Run the head-major partial at hd=32 over the cache.
+            let (fp_p, fp_l, fp_sl, _) = ctx.make_pipeline_raw(SDPA_FLASH_PARTIAL_HM_SPV, 4);
+            let (qb, _qm, qp) = ctx.uma_buffer((n_head * hd * 4) as u64).unwrap();
+            std::ptr::copy_nonoverlapping(q.as_ptr() as *const u8, qp, n_head * hd * 4);
+            let (part, _pm, pp) = ctx.uma_buffer((n_head * nblk * (hd + 2) * 4) as u64).unwrap();
+            let (sub, _sm, sup) = ctx.uma_buffer(16).unwrap();
+            std::ptr::copy_nonoverlapping([n_head as u32, n_kv as u32, hd as u32, seq as u32].as_ptr() as *const u8, sup, 16);
+            let pool2 = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&[
+                vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(4),
+                vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(1)]), None).unwrap();
+            let fset = vk_alloc_set(dev, pool2, fp_sl, &[qb, kc, vc, part], sub);
+            let fcmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cpool).command_buffer_count(1)).unwrap()[0];
+            dev.begin_command_buffer(fcmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+            dev.cmd_bind_pipeline(fcmd, vk::PipelineBindPoint::COMPUTE, fp_p);
+            dev.cmd_bind_descriptor_sets(fcmd, vk::PipelineBindPoint::COMPUTE, fp_l, 0, &[fset], &[]);
+            dev.cmd_dispatch(fcmd, n_head as u32, nblk as u32, 1);
+            dev.end_command_buffer(fcmd).unwrap(); submit(fcmd);
+            let ps = std::slice::from_raw_parts(pp as *const f32, n_head * nblk * (hd + 2));
+
+            // (3) CPU log-sum-exp combine of the partials, vs a CPU softmax-attention reference.
+            let mut maxerr = 0f32;
+            for h in 0..n_head {
+                let kvh = h / (n_head / n_kv);
+                // GPU: combine blocks
+                let mut gm = f32::MIN;
+                for b in 0..nblk { gm = gm.max(ps[(h * nblk + b) * (hd + 2) + hd]); }
+                let mut denom = 0f32; let mut acc = vec![0f32; hd];
+                for b in 0..nblk {
+                    let base = (h * nblk + b) * (hd + 2);
+                    let w = (ps[base + hd] - gm).exp();
+                    denom += ps[base + hd + 1] * w;
+                    for d in 0..hd { acc[d] += ps[base + d] * w; }
+                }
+                // CPU reference
+                let mut sc = vec![0f32; seq];
+                for p in 0..seq { let mut s = 0f32; for d in 0..hd { s += q[h * hd + d] * ksrc[p][kvh * hd + d]; } sc[p] = s * scale; }
+                let rm = sc.iter().cloned().fold(f32::MIN, f32::max);
+                let mut rl = 0f32; for p in 0..seq { sc[p] = (sc[p] - rm).exp(); rl += sc[p]; }
+                for d in 0..hd {
+                    let mut rv = 0f32; for p in 0..seq { rv += sc[p] * vsrc[p][kvh * hd + d]; }
+                    let refv = rv / rl; let gpuv = acc[d] / denom;
+                    maxerr = maxerr.max((refv - gpuv).abs());
+                }
+            }
+            eprintln!("head-major partial @hd=32,n_kv=2,seq=70 vs CPU attention: max err {maxerr:.2e}");
+            assert!(maxerr < 1e-4, "head-major partial wrong at non-1B dims");
+            eprintln!("✓ head-major shaders generalize to hd=32/n_kv=2 (different from the 1B's hd=64/n_kv=8)");
+        }
+    }
 
     /// Phase 2.0 spike: bring up the ash device, confirm the coopmat shapes,
     /// run a 16x16x16 cooperative-matrix multiply on the iGPU, and validate it

@@ -14,6 +14,23 @@ fn compile_wgsl(src: &str) -> Vec<u32> {
     naga::back::spv::write_vec(&module, &info, &naga::back::spv::Options::default(), None).expect("spv write")
 }
 
+/// Probe: does naga emit WGSL `@id(N) override` as SPIR-V spec constants (OpSpecConstant
+/// + SpecId N)? Needed to generalize the head-major shaders to any model's dims.
+/// `cargo test --release --features vulkan --test headmajor_kv naga_override_probe -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn naga_override_probe() {
+    const SRC: &str = "@id(0) override HD: u32 = 64u;\n@group(0) @binding(0) var<storage, read_write> o: array<u32>;\n@compute @workgroup_size(1) fn main() { o[0] = HD; }";
+    let module = naga::front::wgsl::parse_str(SRC).expect("wgsl parse");
+    let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&module).expect("validate");
+    // naga 22.1's SPIR-V backend does NOT support pipeline-overridable constants → spec-constants
+    // are unavailable, which is WHY head-major generalization uses uniform-driven dims instead.
+    match naga::back::spv::write_vec(&module, &info, &naga::back::spv::Options::default(), None) {
+        Ok(w) => eprintln!("naga emitted spec constants ({} words) — spec-constant path viable", w.len()),
+        Err(e) => eprintln!("naga SPIR-V backend rejects `override` ({e:?}) → using uniform-driven dims instead"),
+    }
+}
+
 /// The deployed server prefills via the batched prefill_forward (pos-major), so
 /// head-major needs the prefill→decode transpose. This loads the model twice (flag
 /// off, then on), prefills the SAME prompt + decodes, and asserts the two token
@@ -45,6 +62,17 @@ fn prefill_headmajor_matches() {
     eprintln!("head-major gen: {head_major:?}");
     eprintln!("prefill+decode agree on {agree}/{n_gen} tokens (head-major transpose path)");
     assert_eq!(pos_major, head_major, "head-major prefill path diverged from pos-major");
+}
+
+/// Probe: does naga accept a module `const` in @workgroup_size and array sizes?
+/// (Generalizing the partial to any hd via load-time const substitution depends on it.)
+/// `cargo test --release --features vulkan --test headmajor_kv naga_const_wg_probe -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn naga_const_wg_probe() {
+    const SRC: &str = "const HD: u32 = 128u;\nvar<workgroup> s: array<f32, HD>;\n@group(0) @binding(0) var<storage, read_write> o: array<f32>;\n@compute @workgroup_size(HD) fn main(@builtin(local_invocation_id) l: vec3<u32>) { s[l.x] = f32(l.x); o[l.x] = s[l.x]; }";
+    let words = compile_wgsl(SRC);
+    eprintln!("naga const-in-workgroup_size+array OK ({} words)", words.len());
 }
 
 /// `cargo test --release --features vulkan --test headmajor_kv gen_headmajor_spv -- --ignored --nocapture`
