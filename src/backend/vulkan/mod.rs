@@ -50,6 +50,7 @@ const FFN_MEGAKERNEL_SPV: &[u8] = include_bytes!("shaders/ffn_megakernel.spv");
 const KV_WRITE_SPV: &[u8] = include_bytes!("shaders/kv_write.spv");
 const KV_WRITE_HM_SPV: &[u8] = include_bytes!("shaders/kv_write_hm.spv"); // head-major write (ZLLM_HEADMAJOR_KV)
 const SDPA_FLASH_PARTIAL_HM_SPV: &[u8] = include_bytes!("shaders/sdpa_flash_partial_hm.spv"); // head-major partial (naga-gen)
+const KV_TRANSPOSE_HM_SPV: &[u8] = include_bytes!("shaders/kv_transpose_hm.spv"); // pos→head-major cache transpose (naga-gen)
 const RESIDUAL_ADD_SPV: &[u8] = include_bytes!("shaders/residual_add.spv");
 const ARGMAX_SPV: &[u8] = include_bytes!("shaders/argmax.spv");
 // Batched prefill kernels.
@@ -1101,6 +1102,7 @@ pub struct VkModel {
     p_fp2: (ash::vk::Pipeline, ash::vk::PipelineLayout), // 2-pass flash partial (hd<=64; faster, same output)
     p_kvw_hm: (ash::vk::Pipeline, ash::vk::PipelineLayout), // head-major KV write (ZLLM_HEADMAJOR_KV)
     p_fp2_hm: (ash::vk::Pipeline, ash::vk::PipelineLayout), // head-major flash partial (ZLLM_HEADMAJOR_KV)
+    p_kvtr: (ash::vk::Pipeline, ash::vk::PipelineLayout, ash::vk::DescriptorSetLayout), // pos→head-major transpose
 
     p_add: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_q6k: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     p_argmax: Pipe3, p_mvrope: (ash::vk::Pipeline, ash::vk::PipelineLayout),
@@ -1318,6 +1320,7 @@ impl VkModel {
         let (f2_p, f2_l, _f2_sl) = mkpipe(SDPA_FLASH_PARTIAL2_SPV, 4); // 2-pass partial (compatible layout with fp)
         let (kvwhm_p, kvwhm_l, _kvwhm_sl) = mkpipe(KV_WRITE_HM_SPV, 2);          // head-major KV write (same {dst,src}+uniform layout as kvw)
         let (f2hm_p, f2hm_l, _f2hm_sl) = mkpipe(SDPA_FLASH_PARTIAL_HM_SPV, 4);   // head-major partial (same {q,kc,vc,part}+uniform layout as fp2)
+        let (kvtr_p, kvtr_l, kvtr_sl) = mkpipe(KV_TRANSPOSE_HM_SPV, 2);          // one-time pos→head-major cache transpose
         let (silu_p, silu_l, silu_sl) = mkpipe(SILU_MUL_SPV, 3);
         let (add_p, add_l, add_sl) = mkpipe(RESIDUAL_ADD_SPV, 2);
         let (q6k_p, q6k_l, q6k_sl) = mkpipe(DECODE_MATVEC_Q6K_SPV, 6);
@@ -1487,7 +1490,7 @@ impl VkModel {
             p_rms: (rms_p, rms_l), p_mv: (mv_p, mv_l), p_q3: (q3_p, q3_l), p_rope: (rope_p, rope_l), p_kvw: (kvw_p, kvw_l),
             p_sdpa: (sdpa_p, sdpa_l), p_fp: (fp_p, fp_l), p_fc: (fc_p, fc_l), p_silu: (silu_p, silu_l),
             p_ch: (ch_p, ch_l), p_fp2: (f2_p, f2_l),
-            p_kvw_hm: (kvwhm_p, kvwhm_l), p_fp2_hm: (f2hm_p, f2hm_l),
+            p_kvw_hm: (kvwhm_p, kvwhm_l), p_fp2_hm: (f2hm_p, f2hm_l), p_kvtr: (kvtr_p, kvtr_l, kvtr_sl),
             p_add: (add_p, add_l), p_q6k: (q6k_p, q6k_l), p_argmax: (argmax_p, argmax_l, argmax_sl), p_mvrope: (mvr_p, mvr_l),
             last_rec: std::cell::Cell::new(-1),
             verify_unis, verify_argmax, verify_pool, verify_cmd, verify_fence,
@@ -1519,7 +1522,53 @@ impl VkModel {
     /// Returns the last token's logits; decode continues from pos=prompt.len().
     /// M is padded to PREFILL_MAX_M (128) — padding rows are zero and never read.
     pub fn prefill_forward(&self, prompt: &[u32]) -> Vec<f32> {
-        unsafe { self.prefill_inner(prompt) }
+        let logits = unsafe { self.prefill_inner(prompt) };
+        // Head-major: the batched prefill wrote the prompt's K/V pos-major (its own
+        // prompt self-attention reads pos-major); decode reads head-major, so convert
+        // the cache once here. Decode-fill paths (forward_argmax) are already head-major.
+        if self.headmajor { unsafe { self.transpose_kv_headmajor(prompt.len().min(PREFILL_MAX_M)); } }
+        logits
+    }
+
+    /// One-time pos-major→head-major transpose of every layer's KV cache, at the
+    /// prefill→decode boundary (ZLLM_HEADMAJOR_KV). Copies each cache to a temp then
+    /// scatters head-major back. Own command buffer — out of the recorded prefill.
+    unsafe fn transpose_kv_headmajor(&self, seq_len: usize) {
+        use ash::vk;
+        if seq_len == 0 { return; }
+        let dv = &self.ctx.device;
+        let n = (seq_len * self.kv_dim) as u32;
+        let sz = (n as u64) * 4;
+        let (temp, tmem, _tp) = self.ctx.uma_buffer(sz).unwrap();
+        let (ub, umem, up) = self.ctx.uma_buffer(16).unwrap();
+        std::ptr::copy_nonoverlapping([n, 0u32, 0, 0].as_ptr() as *const u8, up, 16);
+        let nsets = (self.n_layers * 2) as u32;
+        let pool = dv.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(nsets).pool_sizes(&[
+            vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(nsets * 2),
+            vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(nsets)]), None).unwrap();
+        let cp = dv.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(self.ctx.queue_family), None).unwrap();
+        let cmd = dv.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cp).command_buffer_count(1)).unwrap()[0];
+        dv.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+        let cs = vk::PipelineStageFlags::COMPUTE_SHADER; let tr = vk::PipelineStageFlags::TRANSFER;
+        dv.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.p_kvtr.0);
+        for l in &self.prefill.w {
+            for cache in [l.kc, l.vc] {
+                dv.cmd_copy_buffer(cmd, cache, temp, &[vk::BufferCopy::default().size(sz)]); // pos-major copy
+                let b1 = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
+                dv.cmd_pipeline_barrier(cmd, tr, cs, vk::DependencyFlags::empty(), &[b1], &[], &[]);
+                let set = vk_alloc_set(dv, pool, self.p_kvtr.2, &[cache, temp], ub); // dst=cache, src=temp
+                dv.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, self.p_kvtr.1, 0, &[set], &[]);
+                dv.cmd_dispatch(cmd, n.div_ceil(64), 1, 1); // scatter head-major into the cache
+                let b2 = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_READ).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+                dv.cmd_pipeline_barrier(cmd, cs, tr, vk::DependencyFlags::empty(), &[b2], &[], &[]); // before temp is reused
+            }
+        }
+        dv.end_command_buffer(cmd).unwrap();
+        let fence = dv.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+        dv.queue_submit(self.ctx.queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence).unwrap();
+        dv.wait_for_fences(&[fence], true, 5_000_000_000).unwrap();
+        dv.destroy_fence(fence, None); dv.destroy_command_pool(cp, None); dv.destroy_descriptor_pool(pool, None);
+        for (b, m) in [(temp, tmem), (ub, umem)] { dv.unmap_memory(m); dv.destroy_buffer(b, None); dv.free_memory(m, None); }
     }
 
     /// Longest prompt the single-pass batched prefill handles (one coopmat tile). Prompts up to
