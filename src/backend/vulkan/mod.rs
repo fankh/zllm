@@ -664,6 +664,60 @@ impl VkContext {
         unsafe { self.decode_matvec_q4k_inner(spv, weight_bytes, n, nb, x, iters) }
     }
 
+    /// Megakernel FOUNDATION probe: run a PERSISTENT 2-matvec kernel (y1=W1·x →
+    /// grid-sync → y2=W2·y1) in ONE dispatch of `n_wg` workgroups. Tests whether
+    /// an atomic grid-wide barrier is COHERENT on this GPU (WGSL has no device-scope
+    /// barrier; this relies on RDNA3's L2 being the coherence point). If y2 is
+    /// bit-exact, a full megakernel is buildable; a race means it isn't (here).
+    /// `n_wg` MUST be ≤ the max resident workgroups or the spin deadlocks (the
+    /// shader has a spin cap so it can't hang the GPU).
+    pub fn megakernel_poc(&self, spv: &[u32], w1: &[f32], w2: &[f32], x: &[f32], n1: usize, k: usize, n2: usize, n_wg: u32) -> Result<(Vec<f32>, f64), String> {
+        use ash::vk; use std::time::Instant;
+        unsafe {
+            let dev = &self.device;
+            let mkf = |v: &[f32]| -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8), String> {
+                let (b, m, p) = self.uma_buffer((v.len() * 4).max(4) as u64)?;
+                std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8, p, v.len() * 4); Ok((b, m, p))
+            };
+            let (w1b, w1m, _) = mkf(w1)?; let (w2b, w2m, _) = mkf(w2)?; let (xb, xm, _) = mkf(x)?;
+            let (y1b, y1m, _) = self.uma_buffer((n1 * 4) as u64)?;
+            let (y2b, y2m, y2p) = self.uma_buffer((n2 * 4) as u64)?;
+            let (sb, sm, sp) = self.uma_buffer(16)?; std::ptr::write_bytes(sp, 0, 16); // sync counters = 0
+            let (pb, pm, pp) = self.uma_buffer(16)?;
+            std::ptr::copy_nonoverlapping([n1 as u32, k as u32, n2 as u32, n_wg].as_ptr() as *const u8, pp, 16);
+            let spvb: Vec<u8> = spv.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let (pipe, layout, sl, module) = self.make_pipeline_raw(&spvb, 6);
+            let pool = dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&[
+                vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(6),
+                vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(1)]), None).map_err(|e| format!("pool: {e}"))?;
+            let set = dev.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&[sl])).map_err(|e| format!("set: {e}"))?[0];
+            let info = |b| [vk::DescriptorBufferInfo::default().buffer(b).range(vk::WHOLE_SIZE)];
+            let st = [info(w1b), info(w2b), info(xb), info(y1b), info(y2b), info(sb)];
+            let iu = info(pb);
+            let mut wr: Vec<vk::WriteDescriptorSet> = (0..6).map(|b| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(b as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&st[b])).collect();
+            wr.push(vk::WriteDescriptorSet::default().dst_set(set).dst_binding(6).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&iu));
+            dev.update_descriptor_sets(&wr, &[]);
+            let cp = dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(self.queue_family), None).map_err(|e| format!("cp: {e}"))?;
+            let cmd = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cp).command_buffer_count(1)).map_err(|e| format!("cb: {e}"))?[0];
+            dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+            dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe);
+            dev.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+            dev.cmd_dispatch(cmd, n_wg, 1, 1);
+            dev.end_command_buffer(cmd).unwrap();
+            let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+            let t0 = Instant::now();
+            dev.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence).map_err(|e| format!("submit: {e}"))?;
+            dev.wait_for_fences(&[fence], true, 5_000_000_000).map_err(|e| format!("wait/timeout: {e}"))?; // 5s backstop
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            let mut out = vec![0f32; n2];
+            std::ptr::copy_nonoverlapping(y2p as *const f32, out.as_mut_ptr(), n2);
+            dev.destroy_fence(fence, None); dev.destroy_command_pool(cp, None); dev.destroy_descriptor_pool(pool, None);
+            dev.destroy_pipeline(pipe, None); dev.destroy_pipeline_layout(layout, None); dev.destroy_descriptor_set_layout(sl, None); dev.destroy_shader_module(module, None);
+            for (b, m) in [(w1b, w1m), (w2b, w2m), (xb, xm), (y1b, y1m), (y2b, y2m), (sb, sm), (pb, pm)] { dev.unmap_memory(m); dev.destroy_buffer(b, None); dev.free_memory(m, None); }
+            Ok((out, ms))
+        }
+    }
+
     unsafe fn decode_matvec_q4k_inner(&self, spv: &[u32], weight_bytes: &[u8], n: usize, nb: usize, x: &[f32], iters: u32) -> Result<(Vec<f32>, f64), String> {
         use std::time::Instant;
         let dev = &self.device;
@@ -2849,6 +2903,56 @@ mod tests {
     /// an uncached shape — does holding the weight stream constant while growing M give ~M×
     /// aggregate throughput (the batching ceiling that decides if VkModel can beat llama)?
     /// `cargo test --release --features vulkan --lib vk_bmv_scaling -- --ignored --nocapture`
+    /// MEGAKERNEL FOUNDATION: does an atomic grid-wide barrier work coherently on
+    /// this GPU? Persistent 2-matvec kernel (y1=W1·x → grid-sync → y2=W2·y1) in ONE
+    /// dispatch; if y2 is bit-exact vs CPU, the whole-forward megakernel is buildable.
+    /// `cargo test --release --features vulkan --lib vk_megakernel_poc -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vk_megakernel_poc() {
+        const WGSL: &str = r#"
+struct P { n1: u32, k: u32, n2: u32, n_wg: u32 };
+@group(0) @binding(0) var<storage, read>       w1: array<f32>;
+@group(0) @binding(1) var<storage, read>       w2: array<f32>;
+@group(0) @binding(2) var<storage, read>       x:  array<f32>;
+@group(0) @binding(3) var<storage, read_write> y1: array<f32>;
+@group(0) @binding(4) var<storage, read_write> y2: array<f32>;
+@group(0) @binding(5) var<storage, read_write> sync: array<atomic<u32>, 4>;
+@group(0) @binding(6) var<uniform>             p: P;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let gid = wid.x * 64u + lid.x;
+    let nthreads = p.n_wg * 64u;
+    var r = gid;
+    loop { if (r >= p.n1) { break; } var a = 0.0; for (var j = 0u; j < p.k; j = j + 1u) { a = a + w1[r * p.k + j] * x[j]; } y1[r] = a; r = r + nthreads; }
+    workgroupBarrier(); storageBarrier();
+    if (lid.x == 0u) {
+        atomicAdd(&sync[0], 1u);
+        var spin = 0u;
+        loop { if (atomicLoad(&sync[0]) >= p.n_wg) { break; } spin = spin + 1u; if (spin > 10000000u) { break; } }
+    }
+    workgroupBarrier(); storageBarrier();
+    r = gid;
+    loop { if (r >= p.n2) { break; } var a = 0.0; for (var j = 0u; j < p.n1; j = j + 1u) { a = a + w2[r * p.n1 + j] * y1[j]; } y2[r] = a; r = r + nthreads; }
+}
+"#;
+        let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan ({e}); skipping"); return; } };
+        let m = naga::front::wgsl::parse_str(WGSL).expect("wgsl parse");
+        let i = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&m).expect("validate");
+        let spv = naga::back::spv::write_vec(&m, &i, &naga::back::spv::Options::default(), None).expect("spv");
+        let (n1, k, n2, n_wg) = (2048usize, 2048usize, 2048usize, 128u32); // 128 wg = definitely resident
+        let w1: Vec<f32> = (0..n1 * k).map(|i| ((i % 17) as f32 - 8.0) / 20.0).collect();
+        let w2: Vec<f32> = (0..n2 * n1).map(|i| ((i % 13) as f32 - 6.0) / 20.0).collect();
+        let x: Vec<f32> = (0..k).map(|i| ((i % 7) as f32 - 3.0) / 5.0).collect();
+        let mut y1 = vec![0f32; n1]; for r in 0..n1 { let mut a = 0.0; for j in 0..k { a += w1[r * k + j] * x[j]; } y1[r] = a; }
+        let mut y2 = vec![0f32; n2]; for r in 0..n2 { let mut a = 0.0; for j in 0..n1 { a += w2[r * n1 + j] * y1[j]; } y2[r] = a; }
+        let (gpu, ms) = ctx.megakernel_poc(&spv, &w1, &w2, &x, n1, k, n2, n_wg).expect("poc");
+        let mut maxrel = 0f32; for r in 0..n2 { maxrel = maxrel.max((gpu[r] - y2[r]).abs() / (y2[r].abs() + 1e-3)); }
+        eprintln!("megakernel PoC (2 matvec + atomic grid-sync, {n_wg} wg): max rel {maxrel:.3e}, {ms:.2}ms");
+        assert!(maxrel < 1e-3, "GRID-SYNC RACE: y2 wrong (max rel {maxrel}) → device-scope sync NOT coherent in WGSL on this GPU; megakernel not buildable this way");
+        eprintln!("✓ atomic grid-sync is COHERENT on this GPU → megakernel foundation WORKS");
+    }
+
     #[test]
     #[ignore]
     fn vk_bmv_scaling() {
