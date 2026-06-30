@@ -69,7 +69,10 @@ impl RunnerObserver {
     /// the `(1, seq_len, d_model)` tensor down to a `d_model` vector so
     /// hooks see a per-token-equivalent signal without paying for the
     /// full `seq_len * d_model` flatten on every layer.
-    pub fn on_layer(&self, layer_idx: usize, hidden: &CandleTensor) {
+    /// Returns `Some(new_hidden)` when a registered hook contributes a write-back
+    /// to the full `(1, seq_len, d_model)` residual stream (steering / inject);
+    /// `None` = observe-only. The forward continues from the returned tensor.
+    pub fn on_layer(&self, layer_idx: usize, hidden: &CandleTensor) -> Option<CandleTensor> {
         let pooled = match hidden
             .mean(1)
             .and_then(|t| t.squeeze(0))
@@ -78,7 +81,7 @@ impl RunnerObserver {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("RunnerObserver mean-pool failed at layer {layer_idx}: {e}");
-                return;
+                return None;
             }
         };
 
@@ -86,8 +89,9 @@ impl RunnerObserver {
         self.last_confidence.set(confidence);
         self.context.current_confidence.set(confidence);
 
-        // Hooks see &mut Vec<f32>; mutations are computed but discarded
-        // (see struct doc). Capture branches still record correctly.
+        // Observe path: hooks see the pooled `&mut Vec<f32>` (confidence/capture/
+        // early-exit signal). Write-back (full-tensor edits) is the separate
+        // `residual_delta` path below.
         let mut staging = pooled.clone();
         let action = self.hooks.fire(layer_idx, 0, &mut staging, &self.context);
         if let HookAction::EarlyExit { reason } = action {
@@ -102,6 +106,27 @@ impl RunnerObserver {
                 .push(LayerSnapshot::from_hidden_state(layer_idx, 0, &pooled));
         }
         *self.last_hidden.write().unwrap() = pooled;
+
+        // Write-back channel (wired in Phase 2): a hook may add a d_model delta,
+        // broadcast over tokens, to the full residual stream.
+        self.apply_residual_delta(layer_idx, hidden)
+    }
+
+    /// If any hook contributes a `d_model` residual delta for this layer, add it
+    /// (broadcast over the `seq_len` tokens) to the full hidden state and return
+    /// the modified tensor; otherwise `None`.
+    fn apply_residual_delta(&self, layer_idx: usize, hidden: &CandleTensor) -> Option<CandleTensor> {
+        let delta = self.hooks.residual_delta(layer_idx, &self.context)?;
+        let d = delta.len();
+        let dt = CandleTensor::from_vec(delta, (1, 1, d), hidden.device())
+            .and_then(|t| hidden.broadcast_add(&t));
+        match dt {
+            Ok(t) => Some(t),
+            Err(e) => {
+                tracing::warn!("RunnerObserver residual write-back failed at layer {layer_idx}: {e}");
+                None
+            }
+        }
     }
 
     pub fn into_inspection_trace(self) -> Option<InspectionTrace> {
@@ -223,6 +248,29 @@ mod tests {
         let captured = store.query_by_category(&MemoryCategory::Context);
         assert_eq!(captured.len(), 1, "capture_layer 3 should have written exactly one entry");
         assert_eq!(captured[0].metadata.layer_captured, 3);
+    }
+
+    #[test]
+    fn observer_applies_steering_writeback_to_full_tensor() {
+        use crate::engine::hooks::steering::SteeringHook;
+        let mut registry = HookRegistry::new();
+        // Add 0.5 * [1,2,3,4] to the full residual stream (broadcast over tokens) at layer 2.
+        registry.register(Box::new(SteeringHook { vector: vec![1.0, 2.0, 3.0, 4.0], alpha: 0.5, layer: 2 }));
+        let observer = RunnerObserver::new(Arc::new(registry), "test-req");
+
+        // Non-target layer → observe-only, no write-back.
+        assert!(observer.on_layer(0, &fake_hidden(3, 4, 1.0)).is_none());
+
+        // Target layer → hidden(all 1.0) + 0.5*[1,2,3,4] = [1.5, 2.0, 2.5, 3.0] per token.
+        let out = observer
+            .on_layer(2, &fake_hidden(3, 4, 1.0))
+            .expect("steering should return a modified tensor");
+        assert_eq!(out.dims(), &[1, 3, 4]);
+        let v = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let expected = [1.5f32, 2.0, 2.5, 3.0];
+        for (i, &x) in v.iter().enumerate() {
+            assert!((x - expected[i % 4]).abs() < 1e-5, "elem {i} = {x}");
+        }
     }
 
     #[test]

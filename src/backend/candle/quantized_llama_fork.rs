@@ -858,7 +858,7 @@ impl ModelWeights {
         // Delegate to the callback variant with a no-op so we don't duplicate
         // the loop body. Generic over the closure, so monomorphization
         // collapses the empty closure to nothing — no runtime cost.
-        self.forward_with_callback(x, index_pos, |_, _| {})
+        self.forward_with_callback(x, index_pos, |_, _| None)
     }
 
     /// Same as `forward`, but invokes `on_layer(layer_idx, &hidden_state)`
@@ -868,10 +868,10 @@ impl ModelWeights {
     /// observe the residual stream at every depth.
     ///
     /// `hidden_state` is the candle `Tensor` of shape `(1, seq_len, n_embd)`
-    /// for the current forward; the callback gets a borrow, so reading
-    /// it for memory capture is cheap, and writing back (e.g., steering)
-    /// requires building a new tensor and overwriting via a follow-up
-    /// API — kept out of v0.7 scope.
+    /// for the current forward; the callback gets a borrow for cheap reads
+    /// (memory capture, confidence). For **write-back** (steering / memory
+    /// inject), the callback returns `Some(new_hidden)` and the forward
+    /// continues from that tensor; `None` leaves the residual stream untouched.
     /// Clear every layer's KV cache. Call between independent chat
     /// requests — without this the cache keeps growing across requests
     /// and the position counter eventually exceeds the model's
@@ -909,7 +909,7 @@ impl ModelWeights {
         Ok(())
     }
 
-    pub fn forward_with_callback<F: FnMut(usize, &Tensor)>(
+    pub fn forward_with_callback<F: FnMut(usize, &Tensor) -> Option<Tensor>>(
         &mut self,
         x: &Tensor,
         index_pos: usize,
@@ -952,7 +952,11 @@ impl ModelWeights {
             TIMING.add_ffn(t_ffn.elapsed().as_micros() as u64);
             layer_in = x;
 
-            on_layer(layer_idx, &layer_in);
+            // Write-back channel: a hook may return a modified residual stream
+            // (steering / memory inject); `None` = observe-only, stream untouched.
+            if let Some(modified) = on_layer(layer_idx, &layer_in) {
+                layer_in = modified;
+            }
         }
         #[cfg(feature = "profile")]
         let t_norm = std::time::Instant::now();

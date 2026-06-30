@@ -1460,16 +1460,18 @@ fn generate_blocking(
             if inspect_on {
                 let obs = observer.clone();
                 backend.forward_logits_with_observer(input, move |layer_idx, hidden| {
-                    obs.on_layer(layer_idx, hidden);
+                    let writeback = obs.on_layer(layer_idx, hidden);
                     if layer_idx == last_layer {
                         capture_prefill_to_memory(&memory, &req_id, layer_idx, hidden);
                     }
+                    writeback
                 })
             } else {
                 backend.forward_logits_with_observer(input, move |layer_idx, hidden| {
                     if layer_idx == last_layer {
                         capture_prefill_to_memory(&memory, &req_id, layer_idx, hidden);
                     }
+                    None
                 })
             }
         } else if early_exit_on {
@@ -1817,16 +1819,18 @@ fn chat_stream(
                 if inspect_on {
                     let obs = observer.clone();
                     backend.forward_logits_with_observer(input, move |layer_idx, hidden| {
-                        obs.on_layer(layer_idx, hidden);
+                        let writeback = obs.on_layer(layer_idx, hidden);
                         if layer_idx == last_layer {
                             capture_prefill_to_memory(&memory, &req_id, layer_idx, hidden);
                         }
+                        writeback
                     })
                 } else {
                     backend.forward_logits_with_observer(input, move |layer_idx, hidden| {
                         if layer_idx == last_layer {
                             capture_prefill_to_memory(&memory, &req_id, layer_idx, hidden);
                         }
+                        None
                     })
                 }
             } else {

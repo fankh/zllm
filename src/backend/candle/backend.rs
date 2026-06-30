@@ -156,21 +156,21 @@ impl CandleCpuBackend {
     /// `engine::sampler::sample`). The greedy path stays available via
     /// `generate_token`, which delegates here and applies argmax.
     pub fn forward_logits(&mut self, prompt_tokens: &[u32]) -> Result<Vec<f32>> {
-        self.forward_logits_with_observer(prompt_tokens, |_, _| {})
+        self.forward_logits_with_observer(prompt_tokens, |_, _| None)
     }
 
     /// Same as `forward_logits`, but invokes `on_layer(layer_idx, &hidden)`
     /// after every transformer block. `hidden` is the live residual
     /// stream as a borrow on the underlying candle tensor (shape
-    /// `(1, seq_len, n_embd)`). The hook can read it cheaply (no copy)
-    /// for memory capture; mutation requires building a replacement
-    /// tensor and is out of v0.7 scope.
+    /// `(1, seq_len, n_embd)`). The hook reads it cheaply (no copy) for
+    /// memory capture / confidence, and for **write-back** (steering /
+    /// memory inject) returns `Some(new_hidden)`; `None` = observe-only.
     ///
     /// This is the surface the chat handler / inference runner uses to
     /// fire its `HookRegistry` mid-inference — see
     /// `crate::backend::candle::quantized_llama_fork::ModelWeights::forward_with_callback`
     /// for why the fork exists.
-    pub fn forward_logits_with_observer<F: FnMut(usize, &CandleTensor)>(
+    pub fn forward_logits_with_observer<F: FnMut(usize, &CandleTensor) -> Option<CandleTensor>>(
         &mut self,
         prompt_tokens: &[u32],
         on_layer: F,
