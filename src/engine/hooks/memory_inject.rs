@@ -15,7 +15,7 @@ impl Hook for MemoryInjectHook {
     fn on_layer(
         &self,
         layer_idx: usize,
-        loop_idx: usize,
+        _loop_idx: usize,
         hidden_state: &mut Tensor,
         context: &HookContext,
     ) -> HookAction {
@@ -56,31 +56,8 @@ impl Hook for MemoryInjectHook {
             return HookAction::Continue;
         }
 
-        // Inject: at inject_layer (first time through only — once per request,
-        // preserving the v0.1 inline-inject semantic where injection happened
-        // before the reasoning loop began), add relevant memories to hidden
-        // state. Firing on every loop_idx would let the same memory accumulate
-        // too much influence on the hidden state.
-        if layer_idx == self.inject_layer && loop_idx == 0 {
-            // `context` is intentionally unread on the inject path now that
-            // tenancy is gone — keep the param for future use (request_id
-            // could be logged).
-            let _ = context;
-            if let Ok(store) = self.memory.read() {
-                if let Some(injection) = store.build_injection_vector(
-                    hidden_state,
-                    self.max_memories,
-                    self.alpha,
-                ) {
-                    // h_t += injection_vector
-                    for (h, v) in hidden_state.iter_mut().zip(injection.iter()) {
-                        *h += v;
-                    }
-                    return HookAction::ModifyState;
-                }
-            }
-        }
-
+        // Inject is a full-residual-stream edit — see `residual_delta` (the
+        // observe-path `hidden_state` here is a pooled, non-live copy).
         HookAction::Continue
     }
 
@@ -90,5 +67,17 @@ impl Hook for MemoryInjectHook {
 
     fn name(&self) -> &str {
         "memory_inject"
+    }
+
+    /// Inject: at `inject_layer`, retrieve memories relevant to the current
+    /// (pooled) activation and return the injection vector to add to the
+    /// residual stream. Applied to the full hidden state by `RunnerObserver`
+    /// (previously this edited a discarded pooled copy — the v0.9 wake-up).
+    fn residual_delta(&self, layer_idx: usize, hidden: &Tensor, _context: &HookContext) -> Option<Vec<f32>> {
+        if layer_idx != self.inject_layer {
+            return None;
+        }
+        let store = self.memory.read().ok()?;
+        store.build_injection_vector(hidden, self.max_memories, self.alpha)
     }
 }

@@ -105,18 +105,19 @@ impl RunnerObserver {
                 .unwrap()
                 .push(LayerSnapshot::from_hidden_state(layer_idx, 0, &pooled));
         }
+        // Write-back channel: a hook may add a d_model delta (computed from the
+        // pooled state), broadcast over tokens, to the full residual stream.
+        let writeback = self.apply_residual_delta(layer_idx, hidden, &pooled);
         *self.last_hidden.write().unwrap() = pooled;
-
-        // Write-back channel (wired in Phase 2): a hook may add a d_model delta,
-        // broadcast over tokens, to the full residual stream.
-        self.apply_residual_delta(layer_idx, hidden)
+        writeback
     }
 
     /// If any hook contributes a `d_model` residual delta for this layer, add it
     /// (broadcast over the `seq_len` tokens) to the full hidden state and return
-    /// the modified tensor; otherwise `None`.
-    fn apply_residual_delta(&self, layer_idx: usize, hidden: &CandleTensor) -> Option<CandleTensor> {
-        let delta = self.hooks.residual_delta(layer_idx, &self.context)?;
+    /// the modified tensor; otherwise `None`. `pooled` is the d_model state hooks
+    /// use to decide their edit.
+    fn apply_residual_delta(&self, layer_idx: usize, hidden: &CandleTensor, pooled: &[f32]) -> Option<CandleTensor> {
+        let delta = self.hooks.residual_delta(layer_idx, &pooled.to_vec(), &self.context)?;
         let d = delta.len();
         let dt = CandleTensor::from_vec(delta, (1, 1, d), hidden.device())
             .and_then(|t| hidden.broadcast_add(&t));

@@ -31,7 +31,7 @@ impl Hook for SteeringHook {
 
     /// `alpha * concept_vector`, added (broadcast over tokens) to the residual
     /// stream after `self.layer` — the actual steering write-back.
-    fn residual_delta(&self, layer_idx: usize, _context: &HookContext) -> Option<Vec<f32>> {
+    fn residual_delta(&self, layer_idx: usize, _hidden: &Tensor, _context: &HookContext) -> Option<Vec<f32>> {
         if layer_idx != self.layer {
             return None;
         }
@@ -49,8 +49,9 @@ mod tests {
     fn steering_delta_only_fires_on_target_layer() {
         let h = SteeringHook { vector: vec![1.0, 2.0, 3.0, 4.0], alpha: 0.5, layer: 3 };
         let ctx = HookContext::new("t");
-        assert_eq!(h.residual_delta(3, &ctx), Some(vec![0.5, 1.0, 1.5, 2.0]));
-        assert_eq!(h.residual_delta(2, &ctx), None);
+        let dummy = vec![0.0f32; 4]; // steering ignores the current activation
+        assert_eq!(h.residual_delta(3, &dummy, &ctx), Some(vec![0.5, 1.0, 1.5, 2.0]));
+        assert_eq!(h.residual_delta(2, &dummy, &ctx), None);
     }
 
     #[test]
@@ -59,8 +60,9 @@ mod tests {
         reg.register(Box::new(SteeringHook { vector: vec![1.0, 1.0], alpha: 1.0, layer: 5 }));
         reg.register(Box::new(SteeringHook { vector: vec![2.0, 3.0], alpha: 2.0, layer: 5 }));
         let ctx = HookContext::new("t");
+        let dummy = vec![0.0f32; 2];
         // 1*[1,1] + 2*[2,3] = [5, 7]
-        assert_eq!(reg.residual_delta(5, &ctx), Some(vec![5.0, 7.0]));
-        assert_eq!(reg.residual_delta(4, &ctx), None);
+        assert_eq!(reg.residual_delta(5, &dummy, &ctx), Some(vec![5.0, 7.0]));
+        assert_eq!(reg.residual_delta(4, &dummy, &ctx), None);
     }
 }

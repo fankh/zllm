@@ -63,11 +63,13 @@ pub trait Hook: Send + Sync {
 
     /// Optional write-back: a `d_model` vector to ADD to the residual stream
     /// (broadcast over every token position) after `layer_idx`. `None` (default)
-    /// = observe-only. Steering and memory-inject implement this; the
+    /// = observe-only. `hidden` is the pooled `d_model` state at this layer (so a
+    /// hook can decide its edit from the current activation — e.g. memory inject's
+    /// relevance retrieval). Steering and memory-inject implement this; the
     /// candle-aware `RunnerObserver` applies it to the full hidden state. Keeping
     /// it a backend-agnostic `Vec<f32>` (not a candle `Tensor`) keeps hooks
     /// decoupled from the backend.
-    fn residual_delta(&self, _layer_idx: usize, _context: &HookContext) -> Option<Vec<f32>> {
+    fn residual_delta(&self, _layer_idx: usize, _hidden: &Tensor, _context: &HookContext) -> Option<Vec<f32>> {
         None
     }
 }
