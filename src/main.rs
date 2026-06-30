@@ -250,8 +250,10 @@ async fn main() -> anyhow::Result<()> {
 
             // Build the hook registry the chat path consults on every
             // prefill. Default contents:
-            //   - MemoryInjectHook (capture-only effective in v0.8 — see
-            //     RunnerObserver doc; inject branch wakes up in v0.9).
+            //   - MemoryInjectHook: capture (writes Context entries) AND inject
+            //     (adds retrieved memories to the residual stream via the hook
+            //     write-back path). Inject is live once the store has relevant
+            //     entries — alpha/max_memories below tune its strength.
             // The capture/inject layer indices match the InferenceRunner
             // defaults so test parity holds.
             let mut hook_registry = engine::hooks::registry::HookRegistry::new();
