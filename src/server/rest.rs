@@ -696,6 +696,10 @@ struct ChatRequest {
     /// installed-app case.
     #[serde(default)]
     grammar: Option<String>,
+    /// Attach an output-distribution hallucination/uncertainty report to the
+    /// response. Forces the candle path (full per-token logits) like inspection.
+    #[serde(default)]
+    detect_hallucination: Option<bool>,
 }
 
 fn sampler_from_request(
@@ -779,8 +783,11 @@ async fn chat_completions(
         let stream = chat_stream(s.clone(), tokens, max_tokens, sampler_cfg, fsm, id.clone(), model_id);
         Sse::new(stream).into_response()
     } else {
+        let mut detector = req.detect_hallucination.unwrap_or(false)
+            .then(|| crate::engine::hallucination::Detector::new(Default::default()));
         let (text, prompt_tokens, completion_tokens, finish_reason) =
-            generate_blocking(&s, tokens, max_tokens, &sampler_cfg, fsm.as_ref(), &id);
+            generate_blocking(&s, tokens, max_tokens, &sampler_cfg, fsm.as_ref(), &id, detector.as_mut());
+        let hallu = detector.map(|d| hallucination_json(&d.report()));
         let now = unix_secs();
         Json(json!({
             "id": id,
@@ -796,7 +803,8 @@ async fn chat_completions(
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "total_tokens": prompt_tokens + completion_tokens
-            }
+            },
+            "hallucination": hallu
         }))
         .into_response()
     }
@@ -818,6 +826,24 @@ struct CompletionRequest {
     top_k: Option<usize>,
     #[serde(default)]
     grammar: Option<String>,
+    /// Attach an output-distribution hallucination/uncertainty report to the
+    /// response. Forces the candle path (full per-token logits) like inspection.
+    #[serde(default)]
+    detect_hallucination: Option<bool>,
+}
+
+/// Compact JSON view of a hallucination report (the per-token detail is omitted —
+/// the summary is what callers act on). `flagged` uses a 0.5 risk bar.
+fn hallucination_json(r: &crate::engine::hallucination::HallucinationReport) -> serde_json::Value {
+    json!({
+        "risk_score": r.risk_score,
+        "mean_entropy": r.mean_entropy,
+        "normalized_entropy": r.normalized_entropy,
+        "risky_fraction": r.risky_fraction,
+        "n_tokens": r.n_tokens,
+        "peak_token_index": r.peak_token,
+        "flagged": r.flagged(0.5),
+    })
 }
 
 async fn text_completions(
@@ -839,7 +865,10 @@ async fn text_completions(
     let id = format!("cmpl-{}", Uuid::new_v4());
     let sampler_cfg = sampler_from_request(&s.engine, req.temperature, req.top_p, req.top_k);
     let fsm = req.grammar.as_deref().map(LogitFSM::new);
-    let (text, p, c, finish_reason) = generate_blocking(&s, tokens, req.max_tokens, &sampler_cfg, fsm.as_ref(), &id);
+    let mut detector = req.detect_hallucination.unwrap_or(false)
+        .then(|| crate::engine::hallucination::Detector::new(Default::default()));
+    let (text, p, c, finish_reason) = generate_blocking(&s, tokens, req.max_tokens, &sampler_cfg, fsm.as_ref(), &id, detector.as_mut());
+    let hallu = detector.map(|d| hallucination_json(&d.report()));
     let now = unix_secs();
     Json(json!({
         "id": id,
@@ -855,7 +884,8 @@ async fn text_completions(
             "prompt_tokens": p,
             "completion_tokens": c,
             "total_tokens": p + c
-        }
+        },
+        "hallucination": hallu
     }))
     .into_response()
 }
@@ -1329,12 +1359,16 @@ fn generate_blocking(
     sampler_cfg: &SamplerConfig,
     fsm: Option<&LogitFSM>,
     request_id: &str,
+    mut detect: Option<&mut crate::engine::hallucination::Detector>,
 ) -> (String, usize, usize, &'static str) {
     // Spec-decode fast path: redirect to the dedicated handler if every
     // precondition holds. Keeps the main generate_blocking unchanged.
+    // Hallucination detection forces the candle path (it needs full per-token
+    // logits, one token per forward) — like inspection, it disables the fast lanes.
     let inspect_on = s.inspection_enabled.load(Ordering::Relaxed);
     let spec_on = s.spec_decode_enabled.load(Ordering::Relaxed)
         && !inspect_on
+        && detect.is_none()
         && sampler_cfg.temperature == 0.0
         && fsm.is_none();
     if spec_on {
@@ -1354,6 +1388,7 @@ fn generate_blocking(
     #[cfg(feature = "gpu")]
     {
         let gpu_eligible = !inspect_on
+            && detect.is_none()
             && !s.pld_enabled.load(Ordering::Relaxed)
             && !s.early_exit_enabled.load(Ordering::Relaxed)
             && fsm.is_none()
@@ -1370,6 +1405,7 @@ fn generate_blocking(
     #[cfg(feature = "vulkan")]
     {
         let vk_eligible = !inspect_on
+            && detect.is_none()
             && !s.pld_enabled.load(Ordering::Relaxed)
             && !s.early_exit_enabled.load(Ordering::Relaxed)
             && fsm.is_none()
@@ -1485,6 +1521,11 @@ fn generate_blocking(
             }
         }
         let next = sample(&logits, sampler_cfg);
+        // Hallucination/uncertainty: observe the distribution `next` was drawn from
+        // (post-grammar-mask, i.e. exactly what the model chose from).
+        if let Some(d) = detect.as_deref_mut() {
+            d.observe(&logits, next);
+        }
         if inspect_on {
             let tok_text = s.tokenizer.read().unwrap().decode(&[next]).unwrap_or_default();
             observer.record_token(generated_ids.len(), next, tok_text, &logits, 5);
@@ -1504,6 +1545,7 @@ fn generate_blocking(
         // sampling, which is out of scope for this version).
         let pld_on = s.pld_enabled.load(Ordering::Relaxed)
             && !inspect_on
+            && detect.is_none()
             && sampler_cfg.temperature == 0.0;
         if pld_on && generated_ids.len() < max_tokens {
             const LOOKUP_LEN: usize = 2;
