@@ -6,7 +6,6 @@ mod config;
 mod control_plane;
 mod engine;
 mod error;
-mod memory;
 mod metrics;
 mod server;
 

@@ -4,13 +4,20 @@ White-box LLM inference engine with zero-copy latent intercept.
 
 ## Features
 
-- Rust-native control plane (zero Python overhead)
-- Zero-copy hidden state access on UMA (Apple Silicon, Grace Hopper)
-- Mid-layer hook system: activation steering, early exit, hallucination detection
-- Logit FSM for grammar-constrained decoding
-- Paged KV cache with tenant isolation
-- Adaptive Latent Reasoning (latent CoT without thinking tokens)
-- `GoalService` (gRPC) for persistent agent goal / task / status state across requests, backed by the unified memory store
+- From-scratch inference engine in Rust (zero Python) — CPU (AVX-512), plus
+  optional iGPU paths (raw-Vulkan `ZLLM_VK=1` / wgpu) tuned for AMD Strix Halo;
+  beats llama.cpp on single-stream decode (see [BENCHMARKS.md](BENCHMARKS.md))
+- Mid-layer hidden-state access (`RunnerObserver`) with a **hook write-back**
+  path — activation steering and memory inject/capture edit the live residual stream
+- Confidence-driven **early exit** (layer short-circuit during decode)
+- **Hallucination/uncertainty detection** from the output distribution
+  (predictive entropy / top-prob), opt-in via `detect_hallucination`
+- Logit control: token banning (`ban:` mode). *Structured-grammar modes
+  (regex/JSON/BNF) are stubs — not yet implemented.*
+- Paged-KV **continuous batching** (vLLM-style: prefix cache, preemption,
+  chunked prefill, batched spec-decode) on the GPU backend, `ZLLM_CB=1`
+- Goal / task / status API (REST `/v1/goal/*`), disk-persisted, backed by the
+  in-memory store
 
 ## Install
 

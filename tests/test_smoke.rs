@@ -7,7 +7,6 @@ use zllm::engine::memory_store::{MemoryCategory, MemoryMetadata, MemoryStore};
 use zllm::engine::reasoning_budget::{ReasoningBudget, ReasoningState, TokenImportanceScorer};
 use zllm::engine::runner::InferenceRunner;
 use zllm::engine::sampler::{SamplerConfig, sample};
-use zllm::memory::allocator::PagedAllocator;
 
 #[test]
 fn test_dummy_backend() {
@@ -44,19 +43,6 @@ fn test_sampler_temperature() {
     assert!(token < 1000);
 }
 
-#[test]
-fn test_paged_allocator() {
-    let mut alloc = PagedAllocator::new(100);
-    let b1 = alloc.alloc().unwrap();
-    let b2 = alloc.alloc().unwrap();
-    assert_ne!(b1, b2);
-    assert_eq!(alloc.used_count(), 2);
-    assert_eq!(alloc.free_count(), 98);
-
-    alloc.free(b1).unwrap();
-    assert_eq!(alloc.used_count(), 1);
-    assert_eq!(alloc.free_count(), 99);
-}
 
 #[test]
 fn test_hook_registry() {

@@ -17,9 +17,6 @@ pub enum ZllmError {
     #[error("hook error: {0}")]
     Hook(String),
 
-    #[error("tenant not found: {0}")]
-    TenantNotFound(String),
-
     #[error("early exit: {0}")]
     EarlyExit(String),
 
