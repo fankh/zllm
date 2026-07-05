@@ -1384,15 +1384,11 @@ fn generate_vk(
     let eos = s.tokenizer.read().unwrap().eos_token_id().unwrap_or(128001);
     let greedy = sampler_cfg.temperature == 0.0;
     let t_prefill = std::time::Instant::now();
-    // Batched prefill (one coopmat-GEMM pass) wins for longer prompts; sequential
-    // is cheaper for short ones (batched always processes a padded 128 rows).
-    let mut next = if prompt_len > 32 {
-        sample(&model.prefill_forward(prompt_tokens), sampler_cfg)
-    } else {
-        for (i, &tk) in prompt_tokens[..prompt_len - 1].iter().enumerate() { model.prefill_step(tk, i); }
-        let last = prompt_tokens[prompt_len - 1];
-        if greedy { model.forward_argmax(last, prompt_len - 1) } else { sample(&model.forward(last, prompt_len - 1), sampler_cfg) }
-    };
+    // Prefill with cross-request prefix reuse: K/V for the longest common prefix
+    // with the previous request (system prompt, prior chat turns) is already
+    // resident; only the suffix is computed (sequential when short, chunked
+    // batched otherwise). Cold prompts take the plain batched path inside.
+    let mut next = sample(&model.prefill_cached(prompt_tokens), sampler_cfg);
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1e3;
     let mut generated: Vec<u32> = Vec::new();
     let mut finish_reason: &'static str = "length";
@@ -1404,6 +1400,12 @@ fn generate_vk(
         if generated.len() >= max_tokens { break; }
         next = if greedy { model.forward_argmax(next, pos) } else { sample(&model.forward(next, pos), sampler_cfg) };
         pos += 1;
+    }
+    // Extend the reusable prefix with the decoded tokens whose KV is resident:
+    // every generated token was forwarded except the final one (max-tokens break
+    // pushes without forwarding; eos stops before pushing).
+    if !generated.is_empty() {
+        model.note_decoded(&generated[..generated.len() - 1]);
     }
     let dec_s = t_decode.elapsed().as_secs_f64();
     tracing::info!(
@@ -1476,7 +1478,7 @@ fn generate_blocking(
             && !s.early_exit_enabled.load(Ordering::Relaxed)
             && fsm.is_none()
             && plen >= 1
-            && plen.div_ceil(128) * 128 <= crate::backend::vulkan::MAX_SEQ
+            && plen <= crate::backend::vulkan::MAX_SEQ - 128 // = prefill_cap(): padded-tile headroom
             && plen + max_tokens < crate::backend::vulkan::MAX_SEQ;
         if vk_eligible {
             if let Ok(guard) = s.vk.lock() {

@@ -1131,6 +1131,11 @@ pub struct VkModel {
     // mapped embeddings change. Kills ~118ms/call of alloc+record+cleanup (60% of the
     // forward) → ~78ms GPU-exec → ~1641 tok/s @ M=128, beating llama's 1458.
     prefill_rec: std::cell::RefCell<Option<((usize, usize), PfRec)>>, // keyed by (real_m, pos)
+    /// Tokens whose K/V are resident in the cache (positions 0..len), maintained
+    /// by `prefill_cached` + `note_decoded` for cross-request prefix reuse.
+    /// Pos-major mode only (head-major transposes the cache after prefill, so
+    /// continued chunk writes would mix layouts — reuse is disabled there).
+    prompt_cache: std::cell::RefCell<Vec<u32>>,
     // owned resources for cleanup
     bufs: Vec<(ash::vk::Buffer, ash::vk::DeviceMemory)>,
     pipes: Vec<(ash::vk::Pipeline, ash::vk::PipelineLayout, ash::vk::DescriptorSetLayout, ash::vk::ShaderModule)>,
@@ -1507,6 +1512,7 @@ impl VkModel {
             last_rec: std::cell::Cell::new(-1),
             verify_unis, verify_argmax, verify_pool, verify_cmd, verify_fence,
             prefill_rec: std::cell::RefCell::new(None),
+            prompt_cache: std::cell::RefCell::new(Vec::new()),
             bufs, pipes, desc_pool, cmd_pool, cmd, fence, prefill, ctx,
         })
     }
@@ -1540,19 +1546,80 @@ impl VkModel {
     /// batched-decode SDPA (the same offset machinery spec-decode verification
     /// uses). Returns the last real token's logits (from the final chunk).
     pub fn prefill_forward(&self, prompt: &[u32]) -> Vec<f32> {
-        let mut logits = Vec::new();
-        let mut pos = 0usize;
-        while pos < prompt.len() {
-            let end = (pos + PREFILL_MAX_M).min(prompt.len());
-            logits = unsafe { self.prefill_inner(&prompt[pos..end], pos) };
-            pos = end;
-        }
+        let logits = self.prefill_from(prompt, 0);
         // Head-major: the batched prefill wrote the prompt's K/V pos-major (its own
         // prompt self-attention reads pos-major); decode reads head-major, so convert
         // the cache once here (after the LAST chunk — the full prefix at once).
         // Decode-fill paths (forward_argmax) are already head-major.
         if self.headmajor { unsafe { self.transpose_kv_headmajor(prompt.len().min(self.max_seq)); } }
         logits
+    }
+
+    /// Batched prefill of `tokens` at positions `start..start+len` against the
+    /// resident cache (filled through `start`). Tile-sized chunks; returns the
+    /// last token's logits. Pos-major layout only (no head-major transpose —
+    /// `prefill_forward` owns that for whole-prompt fills).
+    pub fn prefill_from(&self, tokens: &[u32], start: usize) -> Vec<f32> {
+        let mut logits = Vec::new();
+        let mut pos = 0usize;
+        while pos < tokens.len() {
+            let end = (pos + PREFILL_MAX_M).min(tokens.len());
+            logits = unsafe { self.prefill_inner(&tokens[pos..end], start + pos) };
+            pos = end;
+        }
+        logits
+    }
+
+    /// Prefill with CROSS-REQUEST PREFIX REUSE: K/V for the longest common
+    /// prefix with the previous request's resident tokens is kept (VkModel never
+    /// clears its cache); only the suffix is prefilled — sequential for short
+    /// suffixes (padded-tile overhead dominates), chunked-at-offset otherwise.
+    /// Always re-runs at least the last prompt token so fresh logits come back.
+    /// Head-major mode falls back to a full prefill (layout mixing).
+    pub fn prefill_cached(&self, prompt: &[u32]) -> Vec<f32> {
+        assert!(!prompt.is_empty() && prompt.len() <= self.prefill_cap());
+        if self.headmajor {
+            self.prompt_cache.borrow_mut().clear();
+            return self.prefill_forward(prompt);
+        }
+        let lcp = {
+            let c = self.prompt_cache.borrow();
+            prompt.iter().zip(c.iter()).take_while(|(a, b)| a == b).count()
+        };
+        let reuse = lcp.min(prompt.len() - 1);
+        let suffix = &prompt[reuse..];
+        let logits = if reuse == 0 && suffix.len() > 32 {
+            self.prefill_from(prompt, 0)
+        } else if suffix.len() > 32 {
+            crate::metrics::prefix_cache_hits().inc();
+            crate::metrics::prefix_cache_tokens_saved().inc_by(reuse as u64);
+            self.prefill_from(suffix, reuse)
+        } else {
+            // Short suffix (or short cold prompt): sequential steps, logits from
+            // the last token's full forward.
+            if reuse > 0 {
+                crate::metrics::prefix_cache_hits().inc();
+                crate::metrics::prefix_cache_tokens_saved().inc_by(reuse as u64);
+            } else {
+                crate::metrics::prefix_cache_misses().inc();
+            }
+            for (i, &t) in suffix[..suffix.len() - 1].iter().enumerate() {
+                self.prefill_step(t, reuse + i);
+            }
+            self.forward(prompt[prompt.len() - 1], prompt.len() - 1)
+        };
+        *self.prompt_cache.borrow_mut() = prompt.to_vec();
+        logits
+    }
+
+    /// Record tokens decoded AFTER a `prefill_cached` prompt whose K/V landed in
+    /// the cache, extending the reusable prefix (chat turns append the previous
+    /// reply, so the next request's LCP runs through it). The caller passes only
+    /// tokens that were actually forwarded (their KV is resident).
+    pub fn note_decoded(&self, tokens: &[u32]) {
+        if !self.headmajor {
+            self.prompt_cache.borrow_mut().extend_from_slice(tokens);
+        }
     }
 
     /// One-time pos-major→head-major transpose of every layer's KV cache, at the
