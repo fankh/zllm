@@ -60,6 +60,8 @@ pub struct GpuContext {
     /// Paged variant of bdsdpa: the KV is a shared block pool and each stream's
     /// key positions are gathered through a per-slot block table (PagedAttention).
     bdsdpa_paged_pipeline: wgpu::ComputePipeline,
+    /// Pack-and-scatter new K/V rows into the packed-f16 block pool.
+    bkv_pack_pipeline: wgpu::ComputePipeline,
     bargmax_pipeline: wgpu::ComputePipeline,
     /// Batched temperature sampling (Gumbel-max argmax over perturbed logits).
     bsample_pipeline: wgpu::ComputePipeline,
@@ -152,6 +154,7 @@ impl GpuContext {
         let bsdpa_pipeline = Self::make_pipeline(&device, "bsdpa", BSDPA_WGSL);
         let bdsdpa_pipeline = Self::make_pipeline(&device, "bdsdpa", BDSDPA_WGSL);
         let bdsdpa_paged_pipeline = Self::make_pipeline(&device, "bdsdpa-paged", BDSDPA_PAGED_WGSL);
+        let bkv_pack_pipeline = Self::make_pipeline(&device, "bkv-pack", BKV_PACK_WGSL);
         let bargmax_pipeline = Self::make_pipeline(&device, "bargmax", BARGMAX_WGSL);
         let bsample_pipeline = Self::make_pipeline(&device, "bsample", BSAMPLE_WGSL);
         let btopk_pipeline = Self::make_pipeline(&device, "btopk", BTOPK_WGSL);
@@ -179,6 +182,7 @@ impl GpuContext {
             bsdpa_pipeline,
             bdsdpa_pipeline,
             bdsdpa_paged_pipeline,
+            bkv_pack_pipeline,
             bargmax_pipeline,
             bsample_pipeline,
             btopk_pipeline,
@@ -275,6 +279,22 @@ impl GpuContext {
         p.set_pipeline(&self.bdsdpa_paged_pipeline); p.set_bind_group(0, &bg, &[]);
         p.dispatch_workgroups(((m * n_head) as u32).div_ceil(64), 1, 1);
     }
+    /// Pack this step's m new K/V rows (f32 staging) into the packed-f16 block
+    /// pool at their physical positions (computed in-shader from slots/posb/
+    /// block_table). One dispatch replaces the old m×2 scatter copies.
+    #[allow(clippy::too_many_arguments)]
+    fn record_bkv_pack(&self, enc: &mut wgpu::CommandEncoder, k_src: &wgpu::Buffer, v_src: &wgpu::Buffer, k_pool: &wgpu::Buffer, v_pool: &wgpu::Buffer, posb: &wgpu::Buffer, slots: &wgpu::Buffer, block_table: &wgpu::Buffer, kv_dim: usize, m: usize, block_size: usize, max_blocks: usize) {
+        use wgpu::util::DeviceExt;
+        let pbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::cast_slice(&[kv_dim as u32, m as u32, block_size as u32, max_blocks as u32]), usage: wgpu::BufferUsages::UNIFORM });
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.bkv_pack_pipeline.get_bind_group_layout(0),
+            entries: &[bge(0, k_src), bge(1, v_src), bge(2, k_pool), bge(3, v_pool), bge(4, posb), bge(5, slots), bge(6, block_table), bge(7, &pbuf)] });
+        let mut p = enc.begin_compute_pass(&Default::default());
+        p.set_pipeline(&self.bkv_pack_pipeline); p.set_bind_group(0, &bg, &[]);
+        p.dispatch_workgroups(((m * kv_dim / 2) as u32).div_ceil(64), 1, 1);
+    }
+
     /// Batched argmax: one workgroup per stream → `out_idx[s]` (m u32 readback).
     fn record_bargmax(&self, enc: &mut wgpu::CommandEncoder, logits: &wgpu::Buffer, out_idx: &wgpu::Buffer, vocab: usize, m: usize) {
         use wgpu::util::DeviceExt;
@@ -1215,10 +1235,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// block_size + t%block_size. Lets sequences hold non-contiguous KV and share a
 /// pool sized for *actual* usage rather than m_max × max_seq.
 const BDSDPA_PAGED_WGSL: &str = r#"
+// Block pool is PACKED F16 (two dims per u32, pack2x16float) — halves KV bytes
+// per token and doubles resident streams per GB. f16 KV is llama.cpp's default
+// precision; unpacked pairs feed the same fp32 online-softmax accumulation.
 struct BP { n_head: u32, n_kv_head: u32, head_dim: u32, m_streams: u32, block_size: u32, max_blocks: u32, p1: u32, p2: u32 };
 @group(0) @binding(0) var<storage, read>       q:    array<f32>;
-@group(0) @binding(1) var<storage, read>       kc:   array<f32>;   // block pool: n_blocks*block_size*kv_dim
-@group(0) @binding(2) var<storage, read>       vc:   array<f32>;
+@group(0) @binding(1) var<storage, read>       kc:   array<u32>;   // packed-f16 pool: n_blocks*block_size*kv_dim/2
+@group(0) @binding(2) var<storage, read>       vc:   array<u32>;
 @group(0) @binding(3) var<storage, read_write> outp: array<f32>;
 @group(0) @binding(4) var<storage, read>       posb: array<u32>;
 @group(0) @binding(5) var<storage, read>       slots: array<u32>;
@@ -1230,6 +1253,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx >= p.m_streams * p.n_head) { return; }
     let s = idx / p.n_head; let h = idx % p.n_head;
     let hd = p.head_dim;
+    let hd2 = hd / 2u;
     let kvh = h / (p.n_head / p.n_kv_head);
     let scale = 1.0 / sqrt(f32(hd));
     let seq_len = posb[s] + 1u;
@@ -1241,17 +1265,55 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var t: u32 = 0u; t < seq_len; t = t + 1u) {
         let phys_block = block_table[bt_base + t / p.block_size];
         let phys_pos = phys_block * p.block_size + (t % p.block_size);
-        let kv_base = (phys_pos * p.n_kv_head + kvh) * hd;
+        let kv_base = (phys_pos * p.n_kv_head + kvh) * hd2;
         var sdot: f32 = 0.0;
-        for (var d: u32 = 0u; d < hd; d = d + 1u) { sdot = sdot + q[q_base + d] * kc[kv_base + d]; }
+        for (var j: u32 = 0u; j < hd2; j = j + 1u) {
+            let k2 = unpack2x16float(kc[kv_base + j]);
+            sdot = sdot + q[q_base + 2u * j] * k2.x + q[q_base + 2u * j + 1u] * k2.y;
+        }
         sdot = sdot * scale;
         let m_new = max(mx, sdot); let corr = exp(mx - m_new); let pe = exp(sdot - m_new);
         l = l * corr + pe;
-        for (var d: u32 = 0u; d < hd; d = d + 1u) { av[d] = av[d] * corr + pe * vc[kv_base + d]; }
+        for (var j: u32 = 0u; j < hd2; j = j + 1u) {
+            let v2 = unpack2x16float(vc[kv_base + j]);
+            av[2u * j] = av[2u * j] * corr + pe * v2.x;
+            av[2u * j + 1u] = av[2u * j + 1u] * corr + pe * v2.y;
+        }
         mx = m_new;
     }
     let inv = 1.0 / l;
     for (var d: u32 = 0u; d < hd; d = d + 1u) { outp[q_base + d] = av[d] * inv; }
+}
+"#;
+
+/// Pack-and-scatter this step's new K/V rows into the packed-f16 block pool.
+/// Replaces the per-row `copy_buffer_to_buffer` scatter (m×2 copy commands with
+/// an f32 pool): one dispatch converts the f32 staging rows → packed f16 at each
+/// row's physical pool position, computed in-shader from (slots, posb,
+/// block_table) — the same indexing the paged SDPA uses for the current token.
+const BKV_PACK_WGSL: &str = r#"
+struct KP { kv_dim: u32, m_rows: u32, block_size: u32, max_blocks: u32 };
+@group(0) @binding(0) var<storage, read>       k_src: array<f32>;   // [m, kv_dim] roped K
+@group(0) @binding(1) var<storage, read>       v_src: array<f32>;   // [m, kv_dim]
+@group(0) @binding(2) var<storage, read_write> k_pool: array<u32>;  // packed f16
+@group(0) @binding(3) var<storage, read_write> v_pool: array<u32>;
+@group(0) @binding(4) var<storage, read>       posb: array<u32>;
+@group(0) @binding(5) var<storage, read>       slots: array<u32>;
+@group(0) @binding(6) var<storage, read>       block_table: array<u32>;
+@group(0) @binding(7) var<uniform>             p: KP;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let kd2 = p.kv_dim / 2u;
+    let idx = gid.x;
+    if (idx >= p.m_rows * kd2) { return; }
+    let s = idx / kd2; let j = idx % kd2;
+    let pos = posb[s];
+    let phys_block = block_table[slots[s] * p.max_blocks + pos / p.block_size];
+    let phys_pos = phys_block * p.block_size + (pos % p.block_size);
+    let src = s * p.kv_dim + 2u * j;
+    let dst = phys_pos * kd2 + j;
+    k_pool[dst] = pack2x16float(vec2<f32>(k_src[src], k_src[src + 1u]));
+    v_pool[dst] = pack2x16float(vec2<f32>(v_src[src], v_src[src + 1u]));
 }
 "#;
 
@@ -2876,10 +2938,12 @@ impl<'a> BatchedDecoder<'a> {
         let row_cap = m_max.max(PREFILL_CHUNK);
         let a = |len: usize| ctx.alloc_activation(len, false);
         let asrc = |len: usize| ctx.alloc_activation(len, true); // COPY_SRC: cache scatter / readback
-        // Shared KV block pool: n_blocks × (block_size positions) × kv_dim, per layer.
+        // Shared KV block pool: n_blocks × (block_size positions) × kv_dim, per layer,
+        // stored as PACKED F16 (two dims per u32) — half the bytes of f32, so twice
+        // the resident streams per GB and half the KV bandwidth per attended token.
         // COPY_SRC (asrc) so blocks can be copied out to host for swap-to-host preemption.
-        let k_pool = (0..model.layers.len()).map(|_| asrc(n_blocks * block_size * kv_dim)).collect();
-        let v_pool = (0..model.layers.len()).map(|_| asrc(n_blocks * block_size * kv_dim)).collect();
+        let k_pool = (0..model.layers.len()).map(|_| asrc(n_blocks * block_size * kv_dim / 2)).collect();
+        let v_pool = (0..model.layers.len()).map(|_| asrc(n_blocks * block_size * kv_dim / 2)).collect();
         let blocks = BlockState {
             free: (0..n_blocks as u32).rev().collect(),
             slot_blocks: vec![Vec::new(); m_max],
@@ -2985,7 +3049,7 @@ impl<'a> BatchedDecoder<'a> {
     fn swap_out(&self, slot: u32, n_pos: usize) -> HostKv {
         let kv_dim = self.model.n_kv_head * self.model.head_dim;
         let nb = n_pos.div_ceil(self.block_size);           // logical blocks holding the KV
-        let blk = self.block_size * kv_dim;                 // f32 per block
+        let blk = self.block_size * kv_dim / 2;             // packed-f16 u32 words per block
         let blkb = (blk * 4) as u64;                        // bytes per block
         let nl = self.model.layers.len();
         let phys: Vec<u32> = { let bs = self.blocks.borrow(); bs.slot_blocks[slot as usize][..nb].to_vec() };
@@ -3008,7 +3072,7 @@ impl<'a> BatchedDecoder<'a> {
         let slice = stage.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         ctx.device.poll(wgpu::Maintain::Wait);
-        let all: Vec<f32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
+        let all: Vec<u32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
         stage.unmap();
         let (k, v) = (all[..half].to_vec(), all[half..].to_vec());
         self.free_slot(slot);                               // release the blocks for others
@@ -3022,7 +3086,7 @@ impl<'a> BatchedDecoder<'a> {
     fn swap_in(&self, slot: u32, host: &HostKv) -> bool {
         if !self.ensure_blocks(slot, host.n_pos) { return false; }
         let kv_dim = self.model.n_kv_head * self.model.head_dim;
-        let blk = self.block_size * kv_dim;
+        let blk = self.block_size * kv_dim / 2;             // packed-f16 u32 words per block
         let blkb = (blk * 4) as u64;
         let nl = self.model.layers.len();
         let nb = host.nb;
@@ -3037,7 +3101,7 @@ impl<'a> BatchedDecoder<'a> {
             usage: wgpu::BufferUsages::COPY_SRC, mapped_at_creation: true });
         {
             let mut mapped = stage.slice(..).get_mapped_range_mut();
-            let f: &mut [f32] = bytemuck::cast_slice_mut(&mut mapped);
+            let f: &mut [u32] = bytemuck::cast_slice_mut(&mut mapped);
             f[..half].copy_from_slice(&host.k);
             f[half..].copy_from_slice(&host.v);
         }
@@ -3386,13 +3450,12 @@ impl<'a> BatchedDecoder<'a> {
             ctx.record_gemm(enc, &layer.wv, &self.normed_b, &self.v_b, n_embd, m, 0);
             ctx.record_brope(enc, &self.q_b, &self.cos_b, &self.sin_b, n_head, head_dim, m);
             ctx.record_brope(enc, &self.k_b, &self.cos_b, &self.sin_b, n_kv_head, head_dim, m);
-            // scatter each row's new K/V into its physical block-pool position
-            for s in 0..m {
-                let dst = (phys[s] * kv_dim * 4) as u64;
-                let src = (s * kv_dim * 4) as u64;
-                enc.copy_buffer_to_buffer(&self.k_b, src, &self.k_pool[li], dst, (kv_dim * 4) as u64);
-                enc.copy_buffer_to_buffer(&self.v_b, src, &self.v_pool[li], dst, (kv_dim * 4) as u64);
-            }
+            // pack+scatter each row's new K/V (f32 staging → packed f16) into its
+            // physical block-pool position — one dispatch, indexes computed
+            // in-shader from (slots, posb, block_table); `phys` stays CPU-side
+            // only for swap bookkeeping.
+            let _ = &phys;
+            ctx.record_bkv_pack(enc, &self.k_b, &self.v_b, &self.k_pool[li], &self.v_pool[li], &self.pos_buf, &self.slots_buf, &self.block_table_buf, kv_dim, m, self.block_size, self.max_blocks_per_seq);
             ctx.record_bdsdpa_paged(enc, &self.q_b, &self.k_pool[li], &self.v_pool[li], &self.attn_b, &self.pos_buf, &self.slots_buf, &self.block_table_buf, n_head, n_kv_head, head_dim, m, self.block_size, self.max_blocks_per_seq);
             ctx.record_gemm(enc, &layer.wo, &self.attn_b, &self.x_b, attn_dim, m, 1);
             ctx.record_bnorm(enc, &self.x_b, &layer.ffn_norm_w, &self.normed_b, n_embd, eps, m);
@@ -3433,7 +3496,7 @@ impl CbSeq {
 /// A sequence's KV cache copied out to host RAM (swap-to-host preemption),
 /// `nb = ceil(n_pos/block_size)` logical blocks per layer, K then V packed in
 /// logical-block order `[layer*nb + lb][block_size*kv_dim]`.
-struct HostKv { n_pos: usize, nb: usize, k: Vec<f32>, v: Vec<f32> }
+struct HostKv { n_pos: usize, nb: usize, k: Vec<u32>, v: Vec<u32> } // packed-f16 pool words (opaque round-trip)
 
 /// A sequence evicted under KV-pool pressure. On reschedule it either:
 /// - `kv = None` (recompute): re-prefills `tokens` (prompt ++ produced); the
