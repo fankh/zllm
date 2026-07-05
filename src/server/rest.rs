@@ -1491,7 +1491,18 @@ fn generate_blocking(
     // common case for sequential traffic).
     let mut slot = acquire_slot(&s.pool);
     let BackendSlot { backend, prompt_cache, .. } = &mut *slot;
-    let prefill_start = prepare_prompt_cache(backend, prompt_cache, &all_tokens);
+    // Hallucination detection needs REPRODUCIBLE logits: prefix-cache reuse
+    // (truncate + re-append KV) shifts logits by numerical epsilons, which
+    // measurably blurs the entropy/risk signal (live A/B: fresh server
+    // discriminated 0.63-flagged vs 0.44; warm slots read 0.49 vs 0.48).
+    // Force a cold full prefill when detecting; normal requests keep the cache.
+    let prefill_start = if detect.is_some() {
+        backend.reset_position();
+        prompt_cache.clear();
+        0
+    } else {
+        prepare_prompt_cache(backend, prompt_cache, &all_tokens)
+    };
     let last_layer = backend.n_layers().saturating_sub(1);
     let inspect_on = s.inspection_enabled.load(Ordering::Relaxed);
     let observer = Arc::new(
