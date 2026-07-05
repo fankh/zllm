@@ -74,7 +74,9 @@ impl Hook for MemoryInjectHook {
     /// residual stream. Applied to the full hidden state by `RunnerObserver`
     /// (previously this edited a discarded pooled copy — the v0.9 wake-up).
     fn residual_delta(&self, layer_idx: usize, hidden: &Tensor, _context: &HookContext) -> Option<Vec<f32>> {
-        if layer_idx != self.inject_layer {
+        // alpha <= 0 = inject disabled (capture-only). Default config; see
+        // `EngineConfig::memory_inject_alpha` for the live A/B that set it.
+        if layer_idx != self.inject_layer || self.alpha <= 0.0 {
             return None;
         }
         let store = self.memory.read().ok()?;

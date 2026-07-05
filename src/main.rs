@@ -249,10 +249,12 @@ async fn main() -> anyhow::Result<()> {
 
             // Build the hook registry the chat path consults on every
             // prefill. Default contents:
-            //   - MemoryInjectHook: capture (writes Context entries) AND inject
-            //     (adds retrieved memories to the residual stream via the hook
-            //     write-back path). Inject is live once the store has relevant
-            //     entries — alpha/max_memories below tune its strength.
+            //   - MemoryInjectHook: capture (writes Context entries) always;
+            //     inject (adds retrieved memories to the residual stream via
+            //     the hook write-back path) only when
+            //     `engine.memory_inject_alpha > 0` — default 0.0 = OFF, because
+            //     the live A/B showed alpha=0.3 derails generation (see
+            //     config.rs). Capture is harmless and keeps inspection useful.
             // The capture/inject layer indices match the InferenceRunner
             // defaults so test parity holds.
             let mut hook_registry = engine::hooks::registry::HookRegistry::new();
@@ -263,7 +265,7 @@ async fn main() -> anyhow::Result<()> {
                     memory: memory_store.clone(),
                     inject_layer,
                     capture_layer,
-                    alpha: 0.3,
+                    alpha: cfg.engine.memory_inject_alpha,
                     max_memories: 5,
                 },
             ));

@@ -7,3 +7,6 @@ models/
 .DS_Store
 .idea/
 .vscode/
+
+# runtime state written by the server (GoalManager persistence)
+configs/goals.json

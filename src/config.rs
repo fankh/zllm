@@ -54,6 +54,14 @@ pub struct EngineConfig {
     /// alongside the main backend. Empty/absent disables spec-decode.
     #[serde(default)]
     pub draft_model_path: Option<String>,
+    /// Strength of the MemoryInjectHook write-back (`h += alpha * retrieved`).
+    /// **Default 0.0 = inject OFF** (capture still runs). Live A/B on the 1B
+    /// showed alpha=0.3 injecting pooled prefill states from unrelated requests
+    /// derails generation ("Paris" → quiz-format gibberish on the identical
+    /// prompt once the store had entries). Opt in deliberately, with a curated
+    /// store and a small alpha.
+    #[serde(default)]
+    pub memory_inject_alpha: f32,
 }
 
 #[derive(Debug, Deserialize, Clone)]
