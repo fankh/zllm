@@ -359,6 +359,7 @@ async fn main() -> anyhow::Result<()> {
                 models_dir,
                 current_model: Arc::new(RwLock::new(current_model)),
                 arch_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
+                token_table: Arc::new(RwLock::new(None)),
                 hooks: Arc::new(hook_registry),
                 inspection_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 pld_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),

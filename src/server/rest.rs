@@ -69,6 +69,10 @@ pub struct AppState {
     /// when there are several large files. Cached for the process
     /// lifetime; invalidated by mtime change.
     pub arch_cache: Arc<RwLock<std::collections::HashMap<std::path::PathBuf, (u64, String)>>>,
+    /// Lazily-built vocab→surface-bytes table for grammar-constrained decoding
+    /// (`regex:` mode). One decode per vocab entry (~100ms for 128k) on first
+    /// grammar request; invalidated on model swap (tokenizer changes).
+    pub token_table: Arc<RwLock<Option<Arc<crate::engine::logit_fsm::TokenByteTable>>>>,
     /// Hook registry consulted on every chat prefill via `RunnerObserver`.
     /// Built once at startup with the default `MemoryInjectHook` plus
     /// anything callers add before serving — see `main.rs`.
@@ -245,7 +249,7 @@ async fn info() -> Json<Value> {
             "hallucination_detection",
             "early_exit",
             "hook_writeback",
-            "logit_fsm_ban_only"
+            "logit_fsm_ban_regex"
         ]
     }))
 }
@@ -652,6 +656,8 @@ async fn select_model(
 
     *s.tokenizer.write().expect("tokenizer poisoned") = new_tok;
     *s.current_model.write().expect("current_model poisoned") = req.id.clone();
+    // Grammar byte table is tokenizer-specific — rebuild lazily on next use.
+    *s.token_table.write().expect("token_table poisoned") = None;
 
     // Selectively clear Context captures — they have an n_embd from
     // the previous model and would dilute injections done on the new
@@ -749,15 +755,18 @@ async fn chat_completions(
     let model_id = s.current_model.read().unwrap().clone();
     let max_tokens = req.max_tokens;
     let sampler_cfg = sampler_from_request(&s.engine, req.temperature, req.top_p, req.top_k);
-    let fsm = req.grammar.as_deref().map(LogitFSM::new);
-    // Unimplemented grammar modes must fail loudly — silently returning
-    // unconstrained output to a caller who asked for a JSON schema is worse
-    // than an error.
-    if let Some(mode) = fsm.as_ref().and_then(|f| f.unsupported_mode()) {
-        return (StatusCode::BAD_REQUEST, Json(json!({
-            "error": format!("grammar mode {mode:?} is not implemented yet; supported: \"ban:<id>,<id>,...\"")
-        }))).into_response();
-    }
+    // Grammar compile errors (bad regex, unimplemented mode) fail loudly —
+    // silently returning unconstrained output to a caller who asked for a
+    // constraint is worse than an error.
+    let fsm = match req.grammar.as_deref() {
+        Some(g) => match fsm_from_grammar(&s, g) {
+            Ok(f) => Some(f),
+            Err(msg) => {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+            }
+        },
+        None => None,
+    };
     // Hallucination detection is only wired into the non-streaming path.
     if req.detect_hallucination.unwrap_or(false) && req.stream {
         return (StatusCode::BAD_REQUEST, Json(json!({
@@ -848,6 +857,33 @@ struct CompletionRequest {
     detect_hallucination: Option<bool>,
 }
 
+/// Build a LogitFSM from a request's `grammar` string, supplying the cached
+/// vocab byte table for `regex:` mode (built on first use, ~one decode per
+/// vocab entry; invalidated on model swap). `Err` = user-facing 400 message
+/// (bad pattern / unimplemented mode / no EOS).
+fn fsm_from_grammar(s: &AppState, grammar: &str) -> Result<LogitFSM, String> {
+    let table = if grammar.trim_start().starts_with("regex:") {
+        if let Some(t) = s.token_table.read().unwrap().as_ref() {
+            Some(t.clone())
+        } else {
+            let tok = s.tokenizer.read().unwrap();
+            let eos = tok.eos_token_id().ok_or("tokenizer has no EOS token; regex grammar unavailable")?;
+            let t0 = std::time::Instant::now();
+            let table = Arc::new(crate::engine::logit_fsm::TokenByteTable {
+                bytes: tok.token_bytes_table(),
+                eos,
+            });
+            tracing::info!("built grammar byte table ({} tokens) in {:.0} ms",
+                table.bytes.len(), t0.elapsed().as_secs_f64() * 1e3);
+            *s.token_table.write().unwrap() = Some(table.clone());
+            Some(table)
+        }
+    } else {
+        None
+    };
+    LogitFSM::compile(grammar, table)
+}
+
 /// Compact JSON view of a hallucination report (the per-token detail is omitted —
 /// the summary is what callers act on). `flagged` uses a 0.5 risk bar.
 fn hallucination_json(r: &crate::engine::hallucination::HallucinationReport) -> serde_json::Value {
@@ -880,14 +916,17 @@ async fn text_completions(
     };
     let id = format!("cmpl-{}", Uuid::new_v4());
     let sampler_cfg = sampler_from_request(&s.engine, req.temperature, req.top_p, req.top_k);
-    let fsm = req.grammar.as_deref().map(LogitFSM::new);
-    // Unimplemented grammar modes fail loudly (silent unconstrained output is
-    // worse than an error) — same contract as the chat endpoint.
-    if let Some(mode) = fsm.as_ref().and_then(|f| f.unsupported_mode()) {
-        return (StatusCode::BAD_REQUEST, Json(json!({
-            "error": format!("grammar mode {mode:?} is not implemented yet; supported: \"ban:<id>,<id>,...\"")
-        }))).into_response();
-    }
+    // Grammar compile errors fail loudly (silent unconstrained output is worse
+    // than an error) — same contract as the chat endpoint.
+    let fsm = match req.grammar.as_deref() {
+        Some(g) => match fsm_from_grammar(&s, g) {
+            Ok(f) => Some(f),
+            Err(msg) => {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+            }
+        },
+        None => None,
+    };
     let mut detector = req.detect_hallucination.unwrap_or(false)
         .then(|| crate::engine::hallucination::Detector::new(Default::default()));
     let (text, p, c, finish_reason) = generate_blocking(&s, tokens, req.max_tokens, &sampler_cfg, fsm.as_ref(), &id, detector.as_mut());
@@ -1546,6 +1585,13 @@ fn generate_blocking(
             }
         }
         let next = sample(&logits, sampler_cfg);
+        // Stateful grammars (regex): feed the sampled token so the next step
+        // masks from the advanced DFA state.
+        if let Some(fsm) = fsm {
+            if fsm.is_active() {
+                fsm.advance(next);
+            }
+        }
         // Hallucination/uncertainty: observe the distribution `next` was drawn from
         // (post-grammar-mask, i.e. exactly what the model chose from).
         if let Some(d) = detect.as_deref_mut() {
@@ -1565,12 +1611,14 @@ fn generate_blocking(
         // Greedy-only fast path: when temperature=0 + PLD enabled, look
         // up an n-gram from the prompt and verify a draft against the
         // main model in one batched forward. Skipped when inspection is
-        // on (observer pipeline assumes one-token-at-a-time semantics)
-        // and when sampling is non-greedy (we'd need rejection
-        // sampling, which is out of scope for this version).
+        // on (observer pipeline assumes one-token-at-a-time semantics),
+        // when a grammar is active (PLD commits draft tokens WITHOUT
+        // masking — it would violate the constraint), and when sampling
+        // is non-greedy (we'd need rejection sampling, out of scope).
         let pld_on = s.pld_enabled.load(Ordering::Relaxed)
             && !inspect_on
             && detect.is_none()
+            && fsm.is_none()
             && sampler_cfg.temperature == 0.0;
         if pld_on && generated_ids.len() < max_tokens {
             const LOOKUP_LEN: usize = 2;
@@ -1877,6 +1925,12 @@ fn chat_stream(
                 }
             }
             let next = sample(&logits, &sampler_cfg);
+            // Stateful grammars: advance the DFA on the sampled token.
+            if let Some(fsm) = &fsm {
+                if fsm.is_active() {
+                    fsm.advance(next);
+                }
+            }
             if inspect_on {
                 let tok_text = s.tokenizer.read().unwrap().decode(&[next]).unwrap_or_default();
                 observer.record_token(generated, next, tok_text, &logits, 5);
@@ -1900,9 +1954,11 @@ fn chat_stream(
             };
             if !send_tok(next, &mut tx) { break; }
 
-            // PLD fast-path (same logic as generate_blocking).
+            // PLD fast-path (same logic as generate_blocking). fsm gate: PLD
+            // commits draft tokens without masking — would violate a grammar.
             let pld_on = s.pld_enabled.load(Ordering::Relaxed)
                 && !inspect_on
+                && fsm.is_none()
                 && sampler_cfg.temperature == 0.0;
             if pld_on && generated < max_tokens {
                 const LOOKUP_LEN: usize = 2;

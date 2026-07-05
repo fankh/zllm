@@ -51,4 +51,22 @@ impl LlamaTokenizer {
             .or_else(|| self.inner.token_to_id("<|end_of_text|>"))
             .or_else(|| self.inner.token_to_id("<|eot_id|>"))
     }
+
+    /// id → decoded surface bytes for every vocab entry, for grammar-constrained
+    /// decoding (the FSM walks these bytes through its DFA). `None` for special
+    /// tokens (decode to "" with skip-special) and tokens that aren't valid UTF-8
+    /// on their own (partial byte-level BPE pieces decode with U+FFFD) — those
+    /// are simply disallowed while a grammar is active. Byte-level BPE (Llama-3)
+    /// round-trips single tokens faithfully; SentencePiece decoders may strip a
+    /// leading space on isolated tokens, so grammar fidelity there is best-effort.
+    /// Cost: one decode per vocab entry (~128k) — build once and cache per model.
+    pub fn token_bytes_table(&self) -> Vec<Option<Vec<u8>>> {
+        let n = self.inner.get_vocab_size(true);
+        (0..n as u32)
+            .map(|id| match self.inner.decode(&[id], true) {
+                Ok(s) if !s.is_empty() && !s.contains('\u{FFFD}') => Some(s.into_bytes()),
+                _ => None,
+            })
+            .collect()
+    }
 }

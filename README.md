@@ -12,8 +12,9 @@ White-box LLM inference engine with zero-copy latent intercept.
 - Confidence-driven **early exit** (layer short-circuit during decode)
 - **Hallucination/uncertainty detection** from the output distribution
   (predictive entropy / top-prob), opt-in via `detect_hallucination`
-- Logit control: token banning (`ban:` mode). *Structured-grammar modes
-  (regex/JSON/BNF) are stubs — not yet implemented.*
+- **Grammar-constrained decoding**: `regex:<pattern>` (anchored byte-DFA token
+  masking — output is guaranteed to match) and `ban:<ids>` token banning.
+  *JSON-schema/BNF modes not yet implemented (requests are rejected with 400).*
 - Paged-KV **continuous batching** (vLLM-style: prefix cache, preemption,
   chunked prefill, batched spec-decode) on the GPU backend, `ZLLM_CB=1`
 - Goal / task / status API (REST `/v1/goal/*`), disk-persisted, backed by the

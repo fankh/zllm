@@ -13,6 +13,10 @@ path = "src/main.rs"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
+# Grammar-constrained decoding: regex -> byte-level DFA for token masking
+# (already in the tree transitively via regex/tokenizers; same 0.4.x version).
+regex-automata = "0.4"
+
 # REST server (axum). gRPC was removed in v0.4 — installed-app surface
 # is REST + chat UI only.
 axum = "0.8"
