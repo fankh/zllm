@@ -242,7 +242,9 @@ async fn info() -> Json<Value> {
             "openai_compat_chat",
             "goal_manager",
             "memory_store",
-            "latent_reasoning_runner",
+            "hallucination_detection",
+            "early_exit",
+            "hook_writeback",
             "logit_fsm_ban_only"
         ]
     }))
@@ -748,6 +750,20 @@ async fn chat_completions(
     let max_tokens = req.max_tokens;
     let sampler_cfg = sampler_from_request(&s.engine, req.temperature, req.top_p, req.top_k);
     let fsm = req.grammar.as_deref().map(LogitFSM::new);
+    // Unimplemented grammar modes must fail loudly — silently returning
+    // unconstrained output to a caller who asked for a JSON schema is worse
+    // than an error.
+    if let Some(mode) = fsm.as_ref().and_then(|f| f.unsupported_mode()) {
+        return (StatusCode::BAD_REQUEST, Json(json!({
+            "error": format!("grammar mode {mode:?} is not implemented yet; supported: \"ban:<id>,<id>,...\"")
+        }))).into_response();
+    }
+    // Hallucination detection is only wired into the non-streaming path.
+    if req.detect_hallucination.unwrap_or(false) && req.stream {
+        return (StatusCode::BAD_REQUEST, Json(json!({
+            "error": "detect_hallucination is not supported with stream=true yet; use stream=false"
+        }))).into_response();
+    }
 
     // Continuous-batching fast lane (ZLLM_CB=1): route eligible chat requests
     // through the shared in-flight batcher (vLLM-style) instead of the candle
@@ -755,7 +771,7 @@ async fn chat_completions(
     // the candle-only features (grammar / spec-decode / PLD / early-exit) are on,
     // since the CB engine doesn't implement those. Greedy or temp/top-k/top-p.
     #[cfg(feature = "gpu")]
-    if let Some(server) = cb_chat_server(&s, fsm.is_none()) {
+    if let Some(server) = cb_chat_server(&s, fsm.is_none() && !req.detect_hallucination.unwrap_or(false)) {
         let prompt_tokens = tokens.len();
         let temp = sampler_cfg.temperature;
         let params = if temp <= 0.0 {
@@ -865,6 +881,13 @@ async fn text_completions(
     let id = format!("cmpl-{}", Uuid::new_v4());
     let sampler_cfg = sampler_from_request(&s.engine, req.temperature, req.top_p, req.top_k);
     let fsm = req.grammar.as_deref().map(LogitFSM::new);
+    // Unimplemented grammar modes fail loudly (silent unconstrained output is
+    // worse than an error) — same contract as the chat endpoint.
+    if let Some(mode) = fsm.as_ref().and_then(|f| f.unsupported_mode()) {
+        return (StatusCode::BAD_REQUEST, Json(json!({
+            "error": format!("grammar mode {mode:?} is not implemented yet; supported: \"ban:<id>,<id>,...\"")
+        }))).into_response();
+    }
     let mut detector = req.detect_hallucination.unwrap_or(false)
         .then(|| crate::engine::hallucination::Detector::new(Default::default()));
     let (text, p, c, finish_reason) = generate_blocking(&s, tokens, req.max_tokens, &sampler_cfg, fsm.as_ref(), &id, detector.as_mut());

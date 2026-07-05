@@ -73,11 +73,39 @@ impl LogitFSM {
     pub fn is_active(&self) -> bool {
         !self.banned.is_empty()
     }
+
+    /// `Some(mode)` when the requested grammar names a mode that is NOT yet
+    /// implemented (regex / json / json_schema / bnf — recognized but stubbed).
+    /// Handlers should reject such requests with a 4xx instead of silently
+    /// generating unconstrained output (which is what happens if this is
+    /// ignored — `is_active()` stays false and `apply_mask` is a no-op).
+    pub fn unsupported_mode(&self) -> Option<&str> {
+        for mode in ["regex", "json_schema", "json", "bnf"] {
+            if self.grammar.strip_prefix(mode).is_some_and(|r| r.starts_with(':')) {
+                return Some(mode);
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_modes_are_reported_not_silent() {
+        for g in ["regex:a+b", "json:{}", "json_schema:{\"type\":\"object\"}", "bnf:root ::= x"] {
+            let f = LogitFSM::new(g);
+            assert!(f.unsupported_mode().is_some(), "{g} should report unsupported");
+            assert!(!f.is_active());
+        }
+        // supported / no-constraint forms are NOT flagged
+        assert_eq!(LogitFSM::new("ban:1,2").unsupported_mode(), None);
+        assert_eq!(LogitFSM::new("").unsupported_mode(), None);
+        // json_schema must not be mis-detected as json
+        assert_eq!(LogitFSM::new("json_schema:{}").unsupported_mode(), Some("json_schema"));
+    }
 
     #[test]
     fn empty_grammar_is_inactive() {

@@ -41,7 +41,8 @@ pub fn sample(logits: &Tensor, config: &SamplerConfig) -> u32 {
     // Top-k filtering
     if config.top_k > 0 && config.top_k < logits.len() {
         let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        // total_cmp: NaN-safe (partial_cmp().unwrap() would panic on a NaN logit)
+        indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
         let threshold = indexed[config.top_k - 1].1;
         for l in logits.iter_mut() {
             if *l < threshold {
@@ -58,7 +59,8 @@ pub fn sample(logits: &Tensor, config: &SamplerConfig) -> u32 {
     // Top-p (nucleus) filtering
     let probs = if config.top_p < 1.0 {
         let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        // total_cmp: NaN-safe (see top-k note)
+        indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         let mut cumsum = 0.0;
         let mut filtered = vec![0.0; probs.len()];
