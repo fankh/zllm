@@ -68,10 +68,16 @@ const SKINNY_GEMM_Q4K_RP_SPV: &[u8] = include_bytes!("shaders/skinny_gemm_q4k_rp
 const BMV_F16_SPV: &[u8] = include_bytes!("shaders/batched_matvec_f16.spv");
 const BMV_Q6K_SPV: &[u8] = include_bytes!("shaders/batched_matvec_q6k.spv");
 
-/// Max prompt length for the raw-Vulkan server fast-lane. Prefill is sequential
-/// (one forward per prompt token) so this is kept modest; batched prefill via
-/// the coopmat GEMM is the follow-up that would raise it.
-pub const MAX_PREFILL_M: usize = 128;
+/// Max prompt length for the raw-Vulkan server fast-lane = the batched-prefill
+/// tile cap (`PREFILL_MAX_M`): prompts up to this run one coopmat-GEMM prefill
+/// pass on the iGPU. (The old 128 cap predated batched prefill — it left
+/// 129..=1024-token prompts on the candle CPU path, measured 9.5 s TTFT for a
+/// 902-token prompt vs ~0.5 s here.) Precision note: batched prefill stages
+/// activations as f16 (fp32 accumulate), so long-prompt outputs carry the same
+/// f16 tolerance llama.cpp's pipeline has (cosine ~0.9995 vs the pure-decode
+/// path, occasional greedy divergence) — the tolerance already shipped for
+/// 33..=128-token prompts; this extends it to the full tile.
+pub const MAX_PREFILL_M: usize = PREFILL_MAX_M;
 const INC_SPV: &[u8] = include_bytes!("shaders/inc.spv");
 const INC_COH_SPV: &[u8] = include_bytes!("shaders/inc_coh.spv");
 
