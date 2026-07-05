@@ -79,7 +79,7 @@ fn naga_const_wg_probe() {
 #[test]
 #[ignore]
 fn gen_headmajor_spv() {
-    for stem in ["kv_write_hm", "sdpa_flash_partial_hm", "kv_transpose_hm"] {
+    for stem in ["kv_write_hm", "sdpa_flash_partial_hm", "kv_transpose_hm", "bsdpa_offset"] {
         let wgsl = std::fs::read_to_string(format!("src/backend/vulkan/shaders/{stem}.wgsl")).unwrap();
         let words = compile_wgsl(&wgsl);
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();

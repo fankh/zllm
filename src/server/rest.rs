@@ -1463,15 +1463,21 @@ fn generate_blocking(
             }
         }
     }
-    // Raw-Vulkan decode fast-lane (same gate, prompt cap is the VkModel's).
+    // Raw-Vulkan decode fast-lane (same gate). Prompt bound is the resident
+    // KV-cache capacity, not the prefill tile — longer prompts run as chunked
+    // batched prefill inside prefill_forward. Two fit checks: the padded
+    // prefill tiles (128-multiples) and the decode positions must both fit.
     #[cfg(feature = "vulkan")]
     {
+        let plen = prompt_tokens.len();
         let vk_eligible = !inspect_on
             && detect.is_none()
             && !s.pld_enabled.load(Ordering::Relaxed)
             && !s.early_exit_enabled.load(Ordering::Relaxed)
             && fsm.is_none()
-            && (1..=crate::backend::vulkan::MAX_PREFILL_M).contains(&prompt_tokens.len());
+            && plen >= 1
+            && plen.div_ceil(128) * 128 <= crate::backend::vulkan::MAX_SEQ
+            && plen + max_tokens < crate::backend::vulkan::MAX_SEQ;
         if vk_eligible {
             if let Ok(guard) = s.vk.lock() {
                 if let Some(model) = guard.as_ref() {

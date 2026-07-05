@@ -58,6 +58,7 @@ const BNORM_SPV: &[u8] = include_bytes!("shaders/bnorm.spv");
 const BROPE_SPV: &[u8] = include_bytes!("shaders/brope.spv");
 const BSDPA_SPV: &[u8] = include_bytes!("shaders/bsdpa.spv");
 const BSDPA_DECODE_SPV: &[u8] = include_bytes!("shaders/bsdpa_decode.spv");
+const BSDPA_OFFSET_SPV: &[u8] = include_bytes!("shaders/bsdpa_offset.spv"); // chunked-prefill offset SDPA (naga-gen)
 const BSDPA_SLOT_SPV: &[u8] = include_bytes!("shaders/bsdpa_slot.spv");
 const KVWRITE_SLOT_SPV: &[u8] = include_bytes!("shaders/kvwrite_slot.spv");
 const BSILU_SPV: &[u8] = include_bytes!("shaders/bsilu.spv");
@@ -78,6 +79,10 @@ const BMV_Q6K_SPV: &[u8] = include_bytes!("shaders/batched_matvec_q6k.spv");
 /// path, occasional greedy divergence) — the tolerance already shipped for
 /// 33..=128-token prompts; this extends it to the full tile.
 pub const MAX_PREFILL_M: usize = PREFILL_MAX_M;
+/// Resident KV-cache capacity in tokens (positions). Prompts longer than one
+/// prefill tile are served by CHUNKED prefill (tile-sized pieces at position
+/// offsets), so the fast-lane prompt bound is this cache size, not the tile.
+pub const MAX_SEQ: usize = 4096;
 const INC_SPV: &[u8] = include_bytes!("shaders/inc.spv");
 const INC_COH_SPV: &[u8] = include_bytes!("shaders/inc_coh.spv");
 
@@ -992,7 +997,7 @@ impl PfRec {
 struct PrefillRes {
     w: Vec<PrefillW>,
     p_q4: Pipe3, p_f16: Pipe3, p_bn: Pipe3, p_br: Pipe3, p_bs: Pipe3, p_bsi: Pipe3, p_t16: Pipe3,
-    p_add: Pipe3, p_q6k: Pipe3, p_bsd: Pipe3,
+    p_add: Pipe3, p_q6k: Pipe3, p_bsd: Pipe3, p_bso: Pipe3,
     // Small-M weight-stationary matvecs for spec-decode verify (M = draft window).
     p_bmq4: Pipe3, p_bmf16: Pipe3, p_bmq6: Pipe3,
     p_skinny: Pipe3,  // column-tiled skinny Q4 GEMM (faster batched matvec; ZLLM_VERIFY_BMV forces bmv)
@@ -1125,7 +1130,7 @@ pub struct VkModel {
     // sets/uniforms are recorded once (keyed on real_m) and reused — per call only the
     // mapped embeddings change. Kills ~118ms/call of alloc+record+cleanup (60% of the
     // forward) → ~78ms GPU-exec → ~1641 tok/s @ M=128, beating llama's 1458.
-    prefill_rec: std::cell::RefCell<Option<(usize, PfRec)>>,
+    prefill_rec: std::cell::RefCell<Option<((usize, usize), PfRec)>>, // keyed by (real_m, pos)
     // owned resources for cleanup
     bufs: Vec<(ash::vk::Buffer, ash::vk::DeviceMemory)>,
     pipes: Vec<(ash::vk::Pipeline, ash::vk::PipelineLayout, ash::vk::DescriptorSetLayout, ash::vk::ShaderModule)>,
@@ -1159,7 +1164,7 @@ impl VkModel {
         let kv_dim = n_kv * hd;
         let attn_dim = n_head * hd;
         let half = hd / 2;
-        let max_seq = 4096usize;
+        let max_seq = MAX_SEQ;
 
         let dv = &ctx.device;
         let mut bufs: Vec<(vk::Buffer, vk::DeviceMemory)> = Vec::new();
@@ -1439,6 +1444,7 @@ impl VkModel {
         let p_br = mkp(BROPE_SPV, 3, false);
         let p_bs = mkp(BSDPA_SPV, 4, false);
         let p_bsd = mkp(BSDPA_DECODE_SPV, 4, false);
+        let p_bso = mkp(BSDPA_OFFSET_SPV, 4, false); // workgroup-per-(query,head) offset SDPA for chunked prefill
         let p_bsi = mkp(BSILU_SPV, 2, false);
         let p_t16 = mkp(TO_F16_SPV, 2, false);
         let p_add = mkp(RESIDUAL_ADD_SPV, 2, false);
@@ -1463,7 +1469,7 @@ impl VkModel {
         let (pf_logits, pf_logits_ptr) = vk_zeros(&ctx, &mut bufs, vocab);
         let (pf_vlogits, _) = vk_zeros(&ctx, &mut bufs, VERIFY_MAX_M * vocab);
         PrefillRes {
-            w: pw, p_q4, p_f16, p_bn, p_br, p_bs, p_bsi, p_t16, p_add, p_q6k, p_bsd, p_bmq4, p_skinny, p_bmf16, p_bmq6,
+            w: pw, p_q4, p_f16, p_bn, p_br, p_bs, p_bsi, p_t16, p_add, p_q6k, p_bsd, p_bso, p_bmq4, p_skinny, p_bmf16, p_bmq6,
             vlogits: pf_vlogits,
             lm_ql, lm_qh, lm_scl, lm_dd, final_norm, logits: pf_logits, logits_ptr: pf_logits_ptr,
             x32: pf_x32, x32_ptr: pf_x32_ptr, x16: pf_x16, n32: pf_n32, n16: pf_n16, q: pf_q, qk: pf_qk,
@@ -1527,12 +1533,25 @@ impl VkModel {
     /// GEMMs, filling the resident KV cache for positions 0..prompt.len().
     /// Returns the last token's logits; decode continues from pos=prompt.len().
     /// M is padded to PREFILL_MAX_M (128) — padding rows are zero and never read.
+    /// Batched prefill over the whole prompt. Prompts longer than one coopmat
+    /// tile (`PREFILL_MAX_M`) run as a sequence of tile-sized CHUNKS at position
+    /// offsets: each chunk writes its K/V into the resident cache at
+    /// `pos*kv_dim` and its self-attention attends `[0..pos+row]` via the
+    /// batched-decode SDPA (the same offset machinery spec-decode verification
+    /// uses). Returns the last real token's logits (from the final chunk).
     pub fn prefill_forward(&self, prompt: &[u32]) -> Vec<f32> {
-        let logits = unsafe { self.prefill_inner(prompt) };
+        let mut logits = Vec::new();
+        let mut pos = 0usize;
+        while pos < prompt.len() {
+            let end = (pos + PREFILL_MAX_M).min(prompt.len());
+            logits = unsafe { self.prefill_inner(&prompt[pos..end], pos) };
+            pos = end;
+        }
         // Head-major: the batched prefill wrote the prompt's K/V pos-major (its own
         // prompt self-attention reads pos-major); decode reads head-major, so convert
-        // the cache once here. Decode-fill paths (forward_argmax) are already head-major.
-        if self.headmajor { unsafe { self.transpose_kv_headmajor(prompt.len().min(PREFILL_MAX_M)); } }
+        // the cache once here (after the LAST chunk — the full prefix at once).
+        // Decode-fill paths (forward_argmax) are already head-major.
+        if self.headmajor { unsafe { self.transpose_kv_headmajor(prompt.len().min(self.max_seq)); } }
         logits
     }
 
@@ -1577,11 +1596,18 @@ impl VkModel {
         for (b, m) in [(temp, tmem), (ub, umem)] { dv.unmap_memory(m); dv.destroy_buffer(b, None); dv.free_memory(m, None); }
     }
 
-    /// Longest prompt the single-pass batched prefill handles (one coopmat tile). Prompts up to
-    /// this fill the shared KV in one batched forward; longer ones need chunked prefill.
-    pub fn prefill_cap(&self) -> usize { PREFILL_MAX_M }
+    /// Longest prompt `prefill_forward` accepts. Prompts beyond one coopmat tile
+    /// (`PREFILL_MAX_M`) run as CHUNKED batched prefill, so the bound is the
+    /// resident-cache capacity minus the last chunk's 128-row padding headroom.
+    pub fn prefill_cap(&self) -> usize { self.max_seq - 128 }
 
-    unsafe fn prefill_inner(&self, prompt: &[u32]) -> Vec<f32> {
+    /// One prefill chunk of ≤ PREFILL_MAX_M tokens at position offset `pos`
+    /// (`pos == 0` = the classic whole-prompt tile; `pos > 0` = a continuation
+    /// chunk against the resident cache). At `pos > 0` the K/V cache writes are
+    /// bound at `pos*kv_dim` and the SDPA switches from the within-tile causal
+    /// kernel to the batched-decode kernel (query row i at `pos+i` attends the
+    /// cache `[0..=pos+i]` — same shader spec-decode verification uses).
+    unsafe fn prefill_inner(&self, prompt: &[u32], pos: usize) -> Vec<f32> {
         use ash::vk;
         let dv = &self.ctx.device;
         let pf = &self.prefill;
@@ -1592,18 +1618,23 @@ impl VkModel {
         // Pad to the next 128-multiple (cap PREFILL_MAX_M), NOT always to the max: short prompts
         // stay M=128 (no padding waste), longer ones get the GEMM-efficient larger tile.
         let m = (real_m.div_ceil(128) * 128).min(PREFILL_MAX_M);
+        assert!(pos + m <= self.max_seq, "prefill chunk (pos {pos} + padded m {m}) exceeds max_seq {}", self.max_seq);
 
-        // Inputs: x = embeddings (padding rows zero), cos/sin for positions 0..m.
+        // Inputs: x = embeddings (padding rows zero), cos/sin for positions pos..pos+m.
         std::ptr::write_bytes(pf.x32_ptr, 0, m * n_embd * 4);
         for (i, &tk) in prompt.iter().take(real_m).enumerate() {
             std::ptr::copy_nonoverlapping(self.embed[tk as usize * n_embd..].as_ptr() as *const u8, pf.x32_ptr.add(i * n_embd * 4), n_embd * 4);
         }
-        std::ptr::copy_nonoverlapping(self.cos[..m * half].as_ptr() as *const u8, pf.cosb_ptr, m * half * 4);
-        std::ptr::copy_nonoverlapping(self.sin[..m * half].as_ptr() as *const u8, pf.sinb_ptr, m * half * 4);
+        std::ptr::copy_nonoverlapping(self.cos[pos * half..(pos + m) * half].as_ptr() as *const u8, pf.cosb_ptr, m * half * 4);
+        std::ptr::copy_nonoverlapping(self.sin[pos * half..(pos + m) * half].as_ptr() as *const u8, pf.sinb_ptr, m * half * 4);
 
-        // Record the 128-row command ONCE per real_m — only the mapped embeddings above
-        // change per call — then reuse it, killing per-call alloc+record+cleanup (60%).
-        let need_build = self.prefill_rec.borrow().as_ref().map_or(true, |(rm, _)| *rm != real_m);
+        // Record the 128-row command ONCE per (real_m, pos) — only the mapped
+        // embeddings above change per call — then reuse it, killing per-call
+        // alloc+record+cleanup (60%). Offset chunks of a long prompt each rebuild
+        // (different pos baked into uniforms/regions); GPU exec dominates there.
+        let kv_off = (pos * kv_dim * 4) as u64;                  // byte offset of this chunk's KV rows
+        let kv_rng = (m * kv_dim * 4) as u64;
+        let need_build = self.prefill_rec.borrow().as_ref().map_or(true, |(key, _)| *key != (real_m, pos));
         if need_build {
         if let Some((_, old)) = self.prefill_rec.borrow_mut().take() { old.destroy(dv); }
         let ub = std::cell::RefCell::new(Vec::<(vk::Buffer, vk::DeviceMemory)>::new());
@@ -1618,6 +1649,11 @@ impl VkModel {
             vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count((self.n_layers * 20 + 8) as u32),
         ]), None).unwrap();
         let mkset = |sl: vk::DescriptorSetLayout, sb: &[vk::Buffer], u: vk::Buffer| vk_alloc_set(dv, pool, sl, sb, u);
+        // Offset variant for chunked prefill: binds the K/V cache at this chunk's
+        // byte offset so the tile's GEMM/rope writes land at rows pos..pos+m.
+        // (kv_off is kv_dim*4-aligned = 2 KB for the 1B — satisfies any
+        // minStorageBufferOffsetAlignment.)
+        let mkset_off = |sl: vk::DescriptorSetLayout, sb: &[(vk::Buffer, u64, u64)], u: vk::Buffer| vk_alloc_set_off(dv, pool, sl, sb, u);
         let cmd_pool = dv.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(self.ctx.queue_family), None).unwrap();
         let cmd = dv.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).command_buffer_count(1)).unwrap()[0];
         dv.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
@@ -1651,10 +1687,10 @@ impl VkModel {
             if let Some(wqk) = l.wqk {
                 let nqk = n_embd + kv_dim;
                 disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.n16, wqk, pf.qk], uni([m as u32, nqk as u32, n_embd as u32, (n_embd / 256) as u32])), (nqk / 128) as u32, (m / 128) as u32);
-                disp(pf.p_f16, mkset(pf.p_f16.2, &[pf.n16, l.wv_f16, l.vc], uni([m as u32, kv_dim as u32, n_embd as u32, 0])), (kv_dim / 64) as u32, (m / 64) as u32);
+                disp(pf.p_f16, mkset_off(pf.p_f16.2, &[(pf.n16, 0, vk::WHOLE_SIZE), (l.wv_f16, 0, vk::WHOLE_SIZE), (l.vc, kv_off, kv_rng)], uni([m as u32, kv_dim as u32, n_embd as u32, 0])), (kv_dim / 64) as u32, (m / 64) as u32);
                 bar_c2t();
                 let qreg: Vec<vk::BufferCopy> = (0..m).map(|t| vk::BufferCopy::default().src_offset((t * nqk * 4) as u64).dst_offset((t * n_embd * 4) as u64).size((n_embd * 4) as u64)).collect();
-                let kreg: Vec<vk::BufferCopy> = (0..m).map(|t| vk::BufferCopy::default().src_offset(((t * nqk + n_embd) * 4) as u64).dst_offset((t * kv_dim * 4) as u64).size((kv_dim * 4) as u64)).collect();
+                let kreg: Vec<vk::BufferCopy> = (0..m).map(|t| vk::BufferCopy::default().src_offset(((t * nqk + n_embd) * 4) as u64).dst_offset(kv_off + (t * kv_dim * 4) as u64).size((kv_dim * 4) as u64)).collect();
                 dv.cmd_copy_buffer(cmd, pf.qk, pf.q, &qreg);
                 dv.cmd_copy_buffer(cmd, pf.qk, l.kc, &kreg);
                 // Final: both the de-interleave (transfer) AND wv (compute write l.vc) → rope/SDPA reads.
@@ -1662,14 +1698,24 @@ impl VkModel {
                 dv.cmd_pipeline_barrier(cmd, cs | tr, cs, vk::DependencyFlags::empty(), &[bc], &[], &[]);
             } else {
             disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.n16, l.wq, pf.q], uni([m as u32, n_embd as u32, n_embd as u32, (n_embd / 256) as u32])), (n_embd / 128) as u32, (m / 128) as u32);
-            disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.n16, l.wk, l.kc], uni([m as u32, kv_dim as u32, n_embd as u32, (n_embd / 256) as u32])), (kv_dim / 128) as u32, (m / 128) as u32);
-            disp(pf.p_f16, mkset(pf.p_f16.2, &[pf.n16, l.wv_f16, l.vc], uni([m as u32, kv_dim as u32, n_embd as u32, 0])), (kv_dim / 64) as u32, (m / 64) as u32); bar();
+            disp(pf.p_q4, mkset_off(pf.p_q4.2, &[(pf.n16, 0, vk::WHOLE_SIZE), (l.wk, 0, vk::WHOLE_SIZE), (l.kc, kv_off, kv_rng)], uni([m as u32, kv_dim as u32, n_embd as u32, (n_embd / 256) as u32])), (kv_dim / 128) as u32, (m / 128) as u32);
+            disp(pf.p_f16, mkset_off(pf.p_f16.2, &[(pf.n16, 0, vk::WHOLE_SIZE), (l.wv_f16, 0, vk::WHOLE_SIZE), (l.vc, kv_off, kv_rng)], uni([m as u32, kv_dim as u32, n_embd as u32, 0])), (kv_dim / 64) as u32, (m / 64) as u32); bar();
             } } else { bar(); }
-            // RoPE q, k (k in the cache).
+            // RoPE q, k (k in the cache, at this chunk's offset rows).
             disp(pf.p_br, mkset(pf.p_br.2, &[pf.q, pf.cosb, pf.sinb], uni([n_head as u32, hd as u32, m as u32, 0])), c64(m * n_head * half), 1);
-            disp(pf.p_br, mkset(pf.p_br.2, &[l.kc, pf.cosb, pf.sinb], uni([n_kv as u32, hd as u32, m as u32, 0])), c64(m * n_kv * half), 1); bar();
-            // causal SDPA -> attn
-            if !skip_sdpa { disp(pf.p_bs, mkset(pf.p_bs.2, &[pf.q, l.kc, l.vc, pf.attn32], uni([n_head as u32, n_kv as u32, hd as u32, m as u32])), (m * n_head) as u32, 1); } bar(); // workgroup per (query,head)
+            disp(pf.p_br, mkset_off(pf.p_br.2, &[(l.kc, kv_off, kv_rng), (pf.cosb, 0, vk::WHOLE_SIZE), (pf.sinb, 0, vk::WHOLE_SIZE)], uni([n_kv as u32, hd as u32, m as u32, 0])), c64(m * n_kv * half), 1); bar();
+            // Causal SDPA -> attn. pos==0: within-tile causal kernel (unchanged
+            // fast path). pos>0 (continuation chunk): offset kernel — query row i
+            // (position pos+i) attends the resident cache [0..=pos+i]. One
+            // workgroup per (query,head) (p_bso; the thread-per-query p_bsd
+            // measured 387 tok/s chunked prefill — 64x less parallel).
+            if !skip_sdpa {
+                if pos == 0 {
+                    disp(pf.p_bs, mkset(pf.p_bs.2, &[pf.q, l.kc, l.vc, pf.attn32], uni([n_head as u32, n_kv as u32, hd as u32, m as u32])), (m * n_head) as u32, 1); // workgroup per (query,head)
+                } else {
+                    disp(pf.p_bso, mkset(pf.p_bso.2, &[pf.q, l.kc, l.vc, pf.attn32], uni5([n_head as u32, n_kv as u32, hd as u32, m as u32, pos as u32])), (m * n_head) as u32, 1); // workgroup per (query,head)
+                }
+            } bar();
             // Wo: attn->f16, GEMM->o32, residual x += o32
             if !skip_f16 { disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.attn32, pf.attn16], uni([(m * n_embd) as u32, 0, 0, 0])), c64(m * n_embd), 1); } bar();
             if !skip_gemm { disp(pf.p_q4, mkset(pf.p_q4.2, &[pf.attn16, l.wo, pf.o32], uni([m as u32, n_embd as u32, n_embd as u32, (n_embd / 256) as u32])), (n_embd / 128) as u32, (m / 128) as u32); } bar();
@@ -1723,7 +1769,7 @@ impl VkModel {
         }
         dv.end_command_buffer(cmd).unwrap();
         let fence = dv.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
-        *self.prefill_rec.borrow_mut() = Some((real_m, PfRec { cmd, pool, cmd_pool, fence, unis: ub.into_inner() }));
+        *self.prefill_rec.borrow_mut() = Some(((real_m, pos), PfRec { cmd, pool, cmd_pool, fence, unis: ub.into_inner() }));
         } // end if need_build
 
         // Reuse the recorded command (resources owned by prefill_rec; freed on rebuild/Drop).
@@ -2074,7 +2120,7 @@ mod tests {
         use ash::vk;
         let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan ({e}); skipping"); return; } };
         let (n_head, n_kv, hd, seq) = (4usize, 2usize, 32usize, 70usize);
-        let max_seq = 4096usize; // must equal MAX_SEQ in the shaders (engine cache cap)
+        let max_seq = MAX_SEQ; // must equal MAX_SEQ in the shaders (engine cache cap)
         let kv_dim = n_kv * hd;  // 64 ≠ the 1B's 512
         let scale = 1.0f32 / (hd as f32).sqrt();
         let f = |a: usize, b: usize| (((a * 7 + b * 13) % 17) as f32) * 0.1 - 0.8; // deterministic synthetic
