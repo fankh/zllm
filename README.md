@@ -31,38 +31,80 @@ Prebuilt binaries for the latest release: <https://github.com/fankh/zllm/release
 | Linux x86_64 | CUDA 12 (sm_89) | `zllm-vX.Y.Z-linux-x86_64-cuda.tar.gz` |
 | macOS aarch64 | Metal | `zllm-vX.Y.Z-macos-aarch64.tar.gz` |
 
-Each archive contains the `zllm` binary, `configs/default.toml`, `README.md`, `LICENSE`, and `CHANGELOG.md`. CUDA artifacts target `sm_89` (Ada Lovelace / RTX 40-series); newer architectures are covered by PTX JIT, older cards are not. CUDA binaries are built but not runtime-tested in CI — validate on a real GPU box before relying on them.
+Each archive contains the `zllm` binary, `configs/default.toml`, `README.md`, `LICENSE`, and `CHANGELOG.md`. CUDA artifacts target `sm_89` (Ada Lovelace / RTX 40-series); newer architectures are covered by PTX JIT, older cards are not. CUDA binaries are built but not runtime-tested in CI — validate on a real GPU box before relying on them. The AMD iGPU paths (`vulkan`/`gpu` features, below) are **source-build only** — no prebuilt archive.
 
 ```bash
 # Linux example
-tar xzf zllm-v0.1.3-linux-x86_64-cpu.tar.gz
-cd zllm-v0.1.3-linux-x86_64-cpu
+tar xzf zllm-vX.Y.Z-linux-x86_64-cpu.tar.gz
+cd zllm-vX.Y.Z-linux-x86_64-cpu
 ./zllm serve --config configs/default.toml
+```
+
+## Get a model
+
+zllm loads **GGUF** models (same files llama.cpp uses) plus a HuggingFace
+`tokenizer.json` from the same model family:
+
+1. Download a GGUF, e.g. `Llama-3.2-1B-Instruct-Q4_K_M.gguf`
+   (all-Q4 quantizations give the best GPU-path numbers — see BENCHMARKS.md).
+2. Put a matching `tokenizer.json` next to it (from the model's HF repo).
+3. Point the config at both:
+
+```toml
+# configs/default.toml
+[model]
+path = "C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+tokenizer_path = ""   # empty = tokenizer.json next to `path`
 ```
 
 ## Build from source
 
+No non-Rust build dependencies (stable toolchain only).
+
 ```bash
-# Build
+# CPU (default; AVX-512 used automatically via target-cpu=native)
 cargo build --release
 
-# Build with CUDA (requires CUDA 12.x toolkit + nvcc)
+# AMD iGPU, raw-Vulkan fast path (the headline single-stream decode engine)
+cargo build --release --features vulkan
+
+# AMD iGPU, wgpu path (continuous batching / serving stack)
+cargo build --release --features gpu
+
+# NVIDIA CUDA (requires CUDA 12.x toolkit + nvcc)
 cargo build --release --features cuda
 
-# Build with Metal (macOS only)
+# Apple Metal (macOS only)
 cargo build --release --features metal
-
-# Run server
-cargo run -- serve --config configs/default.toml
-
-# Health check
-curl http://localhost:8080/health
-
-# CLI help
-cargo run -- --help
 ```
 
-The build script needs `protoc` (Protocol Buffers compiler) on PATH. CUDA builds without a local GPU should set `CUDA_COMPUTE_CAP` explicitly (e.g. `CUDA_COMPUTE_CAP=89`) so `candle-kernels` doesn't try to autodetect via `nvidia-smi`.
+CUDA builds without a local GPU should set `CUDA_COMPUTE_CAP` explicitly (e.g.
+`CUDA_COMPUTE_CAP=89`) so `candle-kernels` doesn't try to autodetect via `nvidia-smi`.
+
+## Run
+
+```bash
+# Server (REST + chat UI) — CPU path
+./target/release/zllm serve --config configs/default.toml
+
+# Server with the raw-Vulkan iGPU fast lane (needs --features vulkan build)
+ZLLM_VK=1 ./target/release/zllm serve --config configs/default.toml
+
+# Server with vLLM-style continuous batching (needs --features gpu build)
+ZLLM_CB=1 ./target/release/zllm serve --config configs/default.toml
+
+# Health check (default port 8080; see [server].rest_port in the config)
+curl http://localhost:8080/health
+
+# One-shot CLI generation, no server
+./target/release/zllm generate \
+  --model C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
+  --tokenizer C:/models/llama-3.2-1b/tokenizer.json \
+  --prompt "The capital of France is" --max-tokens 32
+
+# CLI help
+./target/release/zllm --help
+```
 
 ## Architecture
 

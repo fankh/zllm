@@ -3,7 +3,9 @@ rest_port = 8080
 max_concurrent = 32
 
 [model]
-path = "models/llama3.1-8b-q4.bin"
+# GGUF model (same files llama.cpp uses). Needs a HF tokenizer.json —
+# by default looked up next to `path`.
+path = "models/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
 quantization = "q4"
 max_seq_len = 8192
 # Optional: defaults to tokenizer.json next to `path`.
@@ -17,6 +19,10 @@ confidence_threshold = 0.9
 default_temperature = 1.0
 default_top_k = 50
 default_top_p = 0.9
+# Memory-inject write-back strength (h += alpha * retrieved memories).
+# 0.0 (default) = inject OFF, capture-only — injecting uncurated captures
+# was measured to derail small models; opt in deliberately.
+memory_inject_alpha = 0.0
 
 [memory]
 block_size = 16
