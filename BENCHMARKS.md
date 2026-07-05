@@ -310,3 +310,27 @@ VK_SEQ=512 cargo test --release --features vulkan --lib vk_fused_decode_throughp
 cargo test --release --features vulkan --lib vk_barrier_coherence_probe     -- --ignored --nocapture  # barrier cost/coherence (VK_EXECBAR/VK_NOBAR show staleness)
 # Diagnostics: VK_SKIP=sdpa,norm,rope,silu attributes per-op cost; VK_FUSE=1 shows the silu-fusion backfire
 ```
+
+## Addendum 2026-07-05 — TTFT arc + f16 KV (commits 825cc73..d0a4f16)
+
+**Server TTFT (VK fast lane, end-to-end, 1B):** the 128-token lane cap was stale
+(predated batched prefill) and left long prompts on the candle CPU path.
+
+| prompt tokens | before | after | mechanism |
+|---|---|---|---|
+| 911 | 9.5 s (CPU path) | **0.49 s** (prefill 427 ms) | lane cap 128→1024 |
+| 2036 | ~20 s (CPU path) | **1.2 s** (prefill 1085 ms) | chunked prefill (`bsdpa_offset.wgsl`) |
+| 3536 | CPU path | **2.7 s** (4 chunks) | 〃 |
+| 906 warm (same system prefix) | 9.5 s | **0.16 s** (prefill 48 ms) | cross-request prefix cache |
+
+Correctness: chunk-boundary needle recall exact; long-prompt output token-identical
+to the candle path; warm-cache output identical to cold restart; decode unchanged
+(24/24 vs candle). Long-prompt outputs carry batched prefill's documented
+f16-activation tolerance (fp32 accumulate), same as llama.cpp's pipeline.
+
+**Batched serving (wgpu CB): packed-f16 KV pool** (two dims per u32; llama.cpp's
+default KV precision) — half the KV bytes/token, 2× resident streams per GB;
+swap round-trip still bit-exact (opaque words). All paged/CB tests pass. Aggregate
+decode (short-ctx, single-stream baseline 53 tok/s wgpu): M=8 117 tok/s (2.2×),
+M=16 213 (4.1×), M=32 338 (6.4×). CB PLD: 4.3× fewer forwards, bit-identical.
+VkModel (single-stream flagship) keeps f32 KV to preserve bit-exactness.
