@@ -1,0 +1,105 @@
+// Strided-batched f16 coopmat GEMM for PREFILL ATTENTION (both halves):
+//   QK:  S_h[M,seq]  = scale * Q_h[M,hd] · K_h[seq,hd]^T      (transb=0)
+//   PV:  O_h[M,hd]   =         P_h[M,seq] · V_h[seq,hd]       (transb=1)
+// The prefill SDPA was 34% of prefill at ~1.2 TFLOP/s (scalar bsdpa); these are
+// GEMMs — run them on WMMA. Per-head STRIDED views via explicit lda/ldb/ldc +
+// per-head offsets (coopMatLoad's stride arg means no transposes anywhere);
+// heads are batched over gl_WorkGroupID.z (global head = zbase + z, GQA maps
+// B's head to (zbase+z)/gqa). C offset uses local z (per-batch scratch) or
+// global head (final output) per `cglobal`. A is pre-scaled at staging (folds
+// 1/sqrt(hd) into QK). BM=128; BN compile-time (-DBN64 → 64 for the PV output
+// tile, hd=64). M,N mult of tile; K mult of 32. fp32 accumulate.
+// Compile: glslangValidator --target-env vulkan1.3 -V coopmat_attn_gemm.comp -o coopmat_attn_gemm.spv
+//          glslangValidator --target-env vulkan1.3 -DBN64 -V coopmat_attn_gemm.comp -o coopmat_attn_gemm_n64.spv
+#version 450 core
+#extension GL_KHR_cooperative_matrix          : require
+#extension GL_KHR_memory_scope_semantics      : require
+#extension GL_KHR_shader_subgroup_basic       : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#pragma use_vulkan_memory_model
+
+layout(local_size_x = 512) in;   // 16 wave32 subgroups
+
+layout(binding = 0) readonly  buffer A_ { float16_t a[]; };
+layout(binding = 1) readonly  buffer B_ { float16_t b[]; };
+layout(binding = 2) writeonly buffer C_ { float     c[]; };
+layout(binding = 3) uniform   P_ {
+    uint M; uint N; uint K;
+    uint lda; uint ldb; uint ldc;
+    uint da; uint db; uint dc;      // per-head element offsets for A / B / C
+    uint zbase; uint gqa;           // global head = zbase + z; B head = h / gqa
+    uint transb;                    // 0: B[n,k] = b[n*ldb+k] (K matrix) ; 1: B[k,n] = b[k*ldb+n] (V matrix)
+    uint aglobal;                   // A offset uses global head (1: Q) or batch-local z (0: per-batch probs)
+    uint cglobal;                   // C offset uses global head (1: attn out) or batch-local z (0: per-batch S)
+    float scale;                    // folded into A staging
+} p;
+
+const uint BM = 128u;
+#ifdef BN64
+const uint BN = 64u;
+#else
+const uint BN = 128u;
+#endif
+const uint BK = 32u;
+const uint MM = 2u;
+const uint MN = BN / 64u;           // subgroup grid stays 4x4: BN=128 → 2 N-frags, BN=64 → 1
+shared float16_t As[BM * BK];       // 8 KB
+shared float16_t Bs[BK * BN];       // 8 or 4 KB
+
+void main() {
+    uint tileM = gl_WorkGroupID.y * BM;
+    uint tileN = gl_WorkGroupID.x * BN;
+    uint z = gl_WorkGroupID.z;
+    uint h = p.zbase + z;
+    uint offa = (p.aglobal == 1u ? h : z) * p.da;
+    uint offb = (h / p.gqa) * p.db;
+    uint offc = (p.cglobal == 1u ? h : z) * p.dc;
+    uint sg = gl_SubgroupID;
+    uint sr = sg / 4u;
+    uint scg = sg % 4u;
+    uint tid = gl_LocalInvocationID.x;
+    float16_t sc16 = float16_t(p.scale);
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[MM][MN];
+    for (uint i = 0u; i < MM; i++)
+        for (uint j = 0u; j < MN; j++)
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint k0 = 0u; k0 < p.K; k0 += BK) {
+        for (uint i = tid; i < BM * BK; i += 512u) {
+            uint r = i / BK; uint cc = i % BK;
+            As[i] = a[offa + (tileM + r) * p.lda + k0 + cc] * sc16;
+        }
+        for (uint i = tid; i < BK * BN; i += 512u) {
+            uint kk = i / BN; uint nn = i % BN;
+            // Bs[kk][nn] = matmul-B[k][n]: K-matrix source is [N,K] row-major
+            // (read transposed); V-matrix source is [K,N] row-major (read direct).
+            Bs[i] = (p.transb == 1u)
+                ? b[offb + (k0 + kk) * p.ldb + tileN + nn]
+                : b[offb + (tileN + nn) * p.ldb + k0 + kk];
+        }
+        barrier();
+        for (uint kk = 0u; kk < BK; kk += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> af[MM];
+            for (uint i = 0u; i < MM; i++)
+                coopMatLoad(af[i], As, (sr * 32u + i * 16u) * BK + kk, BK, gl_CooperativeMatrixLayoutRowMajor);
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bf[MN];
+            for (uint j = 0u; j < MN; j++)
+                coopMatLoad(bf[j], Bs, kk * BN + scg * (MN * 16u) + j * 16u, BN, gl_CooperativeMatrixLayoutRowMajor);
+            for (uint i = 0u; i < MM; i++)
+                for (uint j = 0u; j < MN; j++)
+                    acc[i][j] = coopMatMulAdd(af[i], bf[j], acc[i][j]);
+        }
+        barrier();
+    }
+
+    // Column mapping: subgroup col-group scg covers MN*16 columns — BN=128:
+    // scg*32 (2 frags), BN=64: scg*16 (1 frag) — all 16 subgroups distinct.
+    for (uint i = 0u; i < MM; i++) {
+        for (uint j = 0u; j < MN; j++) {
+            uint r0 = tileM + sr * 32u + i * 16u;
+            uint c0 = tileN + scg * (MN * 16u) + j * 16u;
+            coopMatStore(acc[i][j], c, offc + r0 * p.ldc + c0, p.ldc, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+}

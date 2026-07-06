@@ -1,0 +1,37 @@
+// Causal row softmax between the two attention GEMMs: S[z][mp][seq] f32 →
+// probs16[z][mp][seq] f16. Row r (query position pos+r) keeps cols 0..=pos+r,
+// writes ZERO to masked cols (the PV GEMM then sums exact zeros — the causal
+// mask costs nothing there). Max-subtracted softmax (no overflow, padding rows
+// included — their outputs are discarded downstream). One 256-thread workgroup
+// per (row, batch-local head): grid (mp, zcount).
+// Compile: glslangValidator --target-env vulkan1.3 -V causal_softmax.comp -o causal_softmax.spv
+#version 450 core
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly  buffer S_ { float     s[];  };
+layout(binding = 1) writeonly buffer P_ { float16_t pr[]; };
+layout(binding = 2) uniform   U_ { uint mp; uint seq; uint pos; uint p0; } u;
+shared float red[256];
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint z = gl_WorkGroupID.y;
+    uint t = gl_LocalInvocationID.x;
+    uint base = (z * u.mp + r) * u.seq;
+    uint keep = min(u.pos + r + 1u, u.seq);   // causal: cols 0..keep-1 live
+    // max over live cols
+    float mx = -1e30;
+    for (uint cc = t; cc < keep; cc += 256u) { mx = max(mx, s[base + cc]); }
+    red[t] = mx; barrier();
+    for (uint st = 128u; st > 0u; st >>= 1u) { if (t < st) { red[t] = max(red[t], red[t + st]); } barrier(); }
+    mx = red[0]; barrier();
+    // exp + sum
+    float ls = 0.0;
+    for (uint cc = t; cc < keep; cc += 256u) { ls += exp(s[base + cc] - mx); }
+    red[t] = ls; barrier();
+    for (uint st = 128u; st > 0u; st >>= 1u) { if (t < st) { red[t] += red[t + st]; } barrier(); }
+    float inv = 1.0 / red[0];
+    // write probs (f16), zeros beyond the causal edge
+    for (uint cc = t; cc < u.seq; cc += 256u) {
+        pr[base + cc] = (cc < keep) ? float16_t(exp(s[base + cc] - mx) * inv) : float16_t(0.0);
+    }
+}

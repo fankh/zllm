@@ -59,6 +59,9 @@ const BROPE_SPV: &[u8] = include_bytes!("shaders/brope.spv");
 const BSDPA_SPV: &[u8] = include_bytes!("shaders/bsdpa.spv");
 const BSDPA_DECODE_SPV: &[u8] = include_bytes!("shaders/bsdpa_decode.spv");
 const BSDPA_OFFSET_SPV: &[u8] = include_bytes!("shaders/bsdpa_offset.spv"); // chunked-prefill offset SDPA (naga-gen)
+const COOPMAT_ATTN_GEMM_SPV: &[u8] = include_bytes!("shaders/coopmat_attn_gemm.spv"); // prefill attention QK^T on WMMA
+const COOPMAT_ATTN_GEMM_N64_SPV: &[u8] = include_bytes!("shaders/coopmat_attn_gemm_n64.spv"); // BN=64 variant (PV, N=hd)
+const CAUSAL_SOFTMAX_SPV: &[u8] = include_bytes!("shaders/causal_softmax.spv");
 const BSDPA_SLOT_SPV: &[u8] = include_bytes!("shaders/bsdpa_slot.spv");
 const KVWRITE_SLOT_SPV: &[u8] = include_bytes!("shaders/kvwrite_slot.spv");
 const BSILU_SPV: &[u8] = include_bytes!("shaders/bsilu.spv");
@@ -1010,6 +1013,11 @@ struct PrefillRes {
     attn32: ash::vk::Buffer, attn16: ash::vk::Buffer, gu: ash::vk::Buffer,
     h32: ash::vk::Buffer, h16: ash::vk::Buffer, o32: ash::vk::Buffer, ffn32: ash::vk::Buffer,
     cosb: ash::vk::Buffer, cosb_ptr: *mut u8, sinb: ash::vk::Buffer, sinb_ptr: *mut u8,
+    // Coopmat attention (prefill SDPA on WMMA — was 34% of prefill at 2% of peak):
+    // f16 views of Q/K/V, per-8-head-batch S scratch + f16 probs, GEMM + softmax pipes.
+    p_cma: Pipe3, p_cma64: Pipe3, p_smax: Pipe3,
+    q16: ash::vk::Buffer, k16: ash::vk::Buffer, v16: ash::vk::Buffer,
+    s32: ash::vk::Buffer, prob16: ash::vk::Buffer,
 }
 
 // A loaded weight: Q4_K (raw bytes) or Q6_K (repacked SoA). nb = cols/256.
@@ -1473,6 +1481,19 @@ impl VkModel {
         let (pf_sinb, pf_sinb_ptr) = vk_zeros(&ctx, &mut bufs, mm * half);
         let (pf_logits, pf_logits_ptr) = vk_zeros(&ctx, &mut bufs, vocab);
         let (pf_vlogits, _) = vk_zeros(&ctx, &mut bufs, VERIFY_MAX_M * vocab);
+        // Coopmat attention scratch: f16 Q/K/V views + per-8-head-batch S (f32)
+        // and probs (f16). ZB=8 keeps the S/prob working set at 48 MB — mostly
+        // L2-resident between the QK → softmax → PV phases. (An all-32-heads
+        // variant with one dispatch per phase was MEASURED SLOWER, 306 vs 289 ms:
+        // 384 MB of scratch traffic per layer stops caching.)
+        let p_cma = mkp(COOPMAT_ATTN_GEMM_SPV, 3, true);
+        let p_cma64 = mkp(COOPMAT_ATTN_GEMM_N64_SPV, 3, true);
+        let p_smax = mkp(CAUSAL_SOFTMAX_SPV, 2, false);
+        let pf_q16 = f16buf(&mut bufs, mm * attn_dim);
+        let pf_k16 = f16buf(&mut bufs, mm * kv_dim);
+        let pf_v16 = f16buf(&mut bufs, mm * kv_dim);
+        let (pf_s32, _) = vk_zeros(&ctx, &mut bufs, 8 * mm * mm);
+        let pf_prob16 = f16buf(&mut bufs, 8 * mm * mm);
         PrefillRes {
             w: pw, p_q4, p_f16, p_bn, p_br, p_bs, p_bsi, p_t16, p_add, p_q6k, p_bsd, p_bso, p_bmq4, p_skinny, p_bmf16, p_bmq6,
             vlogits: pf_vlogits,
@@ -1480,6 +1501,8 @@ impl VkModel {
             x32: pf_x32, x32_ptr: pf_x32_ptr, x16: pf_x16, n32: pf_n32, n16: pf_n16, q: pf_q, qk: pf_qk,
             attn32: pf_attn32, attn16: pf_attn16, gu: pf_gu, h32: pf_h32, h16: pf_h16, o32: pf_o32, ffn32: pf_ffn32,
             cosb: pf_cosb, cosb_ptr: pf_cosb_ptr, sinb: pf_sinb, sinb_ptr: pf_sinb_ptr,
+            p_cma, p_cma64, p_smax,
+            q16: pf_q16, k16: pf_k16, v16: pf_v16, s32: pf_s32, prob16: pf_prob16,
         }
         };
 
@@ -1711,9 +1734,13 @@ impl VkModel {
         let uni5 = |d: [u32; 5]| -> vk::Buffer {
             let (b, mm, p) = self.ctx.uma_buffer(20).unwrap(); std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, p, 20); ub.borrow_mut().push((b, mm)); b
         };
-        let pool = dv.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets((self.n_layers * 20 + 8) as u32).pool_sizes(&[
-            vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count((self.n_layers * 80 + 16) as u32),
-            vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count((self.n_layers * 20 + 8) as u32),
+        // Coopmat-attention GEMM params (15 fields, 60 B — see coopmat_attn_gemm.comp).
+        let uni15 = |d: [u32; 15]| -> vk::Buffer {
+            let (b, mm, p) = self.ctx.uma_buffer(64).unwrap(); std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, p, 60); ub.borrow_mut().push((b, mm)); b
+        };
+        let pool = dv.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets((self.n_layers * 40 + 8) as u32).pool_sizes(&[
+            vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count((self.n_layers * 160 + 16) as u32),
+            vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count((self.n_layers * 40 + 8) as u32),
         ]), None).unwrap();
         let mkset = |sl: vk::DescriptorSetLayout, sb: &[vk::Buffer], u: vk::Buffer| vk_alloc_set(dv, pool, sl, sb, u);
         // Offset variant for chunked prefill: binds the K/V cache at this chunk's
@@ -1733,6 +1760,12 @@ impl VkModel {
             dv.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p.0);
             dv.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, p.1, 0, &[set], &[]);
             dv.cmd_dispatch(cmd, gx, gy, 1);
+        };
+        // 3D variant for the head-batched attention GEMMs (gz = heads per batch).
+        let disp3 = |p: Pipe3, set: vk::DescriptorSet, gx: u32, gy: u32, gz: u32| {
+            dv.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p.0);
+            dv.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, p.1, 0, &[set], &[]);
+            dv.cmd_dispatch(cmd, gx, gy, gz);
         };
         let c64 = |x: usize| ((x + 63) / 64) as u32;
         let u_eps = uni([n_embd as u32, self.eps.to_bits(), 0, 0]);
@@ -1777,7 +1810,41 @@ impl VkModel {
             // workgroup per (query,head) (p_bso; the thread-per-query p_bsd
             // measured 387 tok/s chunked prefill — 64x less parallel).
             if !skip_sdpa {
-                if pos == 0 {
+                let scalar_sdpa = std::env::var("VK_SCALAR_SDPA").is_ok(); // A/B: old scalar kernel
+                if pos == 0 && !scalar_sdpa {
+                    // COOPMAT ATTENTION: S=Q·K^T and O=P·V run on WMMA (the scalar
+                    // bsdpa was 34% of prefill at ~2% of peak). f16 views of the
+                    // roped Q and the cache's K/V rows 0..m, then per-8-head
+                    // batches: QK GEMM → causal softmax (f16 probs, zeros beyond
+                    // the diagonal so PV needs no mask) → PV GEMM (BN=64, N=hd).
+                    let seq = m; // pos==0: keys 0..m
+                    let attn_dim = n_head * hd;
+                    let gqa = (n_head / n_kv) as u32;
+                    let scale = 1.0f32 / (hd as f32).sqrt();
+                    disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.q, pf.q16], uni([(m * attn_dim) as u32, 0, 0, 0])), c64(m * attn_dim), 1);
+                    disp(pf.p_t16, mkset(pf.p_t16.2, &[l.kc, pf.k16], uni([(m * kv_dim) as u32, 0, 0, 0])), c64(m * kv_dim), 1);
+                    disp(pf.p_t16, mkset(pf.p_t16.2, &[l.vc, pf.v16], uni([(m * kv_dim) as u32, 0, 0, 0])), c64(m * kv_dim), 1);
+                    bar();
+                    // 8-head batches: QK → causal softmax → PV per batch. The batch
+                    // barriers cost less than losing L2 residency on the S planes
+                    // (all-heads-at-once measured slower — see the scratch comment).
+                    for zb in (0..n_head).step_by(8) {
+                        // S[z][m][seq] = scale * Q_h[m,hd] · K_h[seq,hd]^T  (A global-head, C batch-local)
+                        disp3(pf.p_cma, mkset(pf.p_cma.2, &[pf.q16, pf.k16, pf.s32],
+                            uni15([m as u32, seq as u32, hd as u32, attn_dim as u32, kv_dim as u32, seq as u32,
+                                   hd as u32, hd as u32, (m * seq) as u32, zb as u32, gqa, 0, 1, 0, scale.to_bits()])),
+                            (seq / 128) as u32, (m / 128) as u32, 8);
+                        bar();
+                        disp3(pf.p_smax, mkset(pf.p_smax.2, &[pf.s32, pf.prob16], uni([m as u32, seq as u32, pos as u32, 0])), m as u32, 8, 1);
+                        bar();
+                        // O_h[m,hd] = P[m,seq] · V_h[seq,hd]  (A batch-local, C global-head, B=V direct)
+                        disp3(pf.p_cma64, mkset(pf.p_cma64.2, &[pf.prob16, pf.v16, pf.attn32],
+                            uni15([m as u32, hd as u32, seq as u32, seq as u32, kv_dim as u32, attn_dim as u32,
+                                   (m * seq) as u32, hd as u32, hd as u32, zb as u32, gqa, 1, 0, 1, 1.0f32.to_bits()])),
+                            (hd / 64) as u32, (m / 128) as u32, 8);
+                        bar();
+                    }
+                } else if pos == 0 {
                     disp(pf.p_bs, mkset(pf.p_bs.2, &[pf.q, l.kc, l.vc, pf.attn32], uni([n_head as u32, n_kv as u32, hd as u32, m as u32])), (m * n_head) as u32, 1); // workgroup per (query,head)
                 } else {
                     disp(pf.p_bso, mkset(pf.p_bso.2, &[pf.q, l.kc, l.vc, pf.attn32], uni5([n_head as u32, n_kv as u32, hd as u32, m as u32, pos as u32])), (m * n_head) as u32, 1); // workgroup per (query,head)
