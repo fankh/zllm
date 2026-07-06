@@ -62,6 +62,8 @@ pub struct GpuContext {
     bdsdpa_paged_pipeline: wgpu::ComputePipeline,
     /// Pack-and-scatter new K/V rows into the packed-f16 block pool.
     bkv_pack_pipeline: wgpu::ComputePipeline,
+    /// Skinny Q4_K GEMM (M<=8, K-parallel register dequant) for batched decode.
+    q4k_skinny_pipeline: wgpu::ComputePipeline,
     bargmax_pipeline: wgpu::ComputePipeline,
     /// Batched temperature sampling (Gumbel-max argmax over perturbed logits).
     bsample_pipeline: wgpu::ComputePipeline,
@@ -155,6 +157,7 @@ impl GpuContext {
         let bdsdpa_pipeline = Self::make_pipeline(&device, "bdsdpa", BDSDPA_WGSL);
         let bdsdpa_paged_pipeline = Self::make_pipeline(&device, "bdsdpa-paged", BDSDPA_PAGED_WGSL);
         let bkv_pack_pipeline = Self::make_pipeline(&device, "bkv-pack", BKV_PACK_WGSL);
+        let q4k_skinny_pipeline = Self::make_pipeline(&device, "q4k-skinny", Q4K_SKINNY_WGSL);
         let bargmax_pipeline = Self::make_pipeline(&device, "bargmax", BARGMAX_WGSL);
         let bsample_pipeline = Self::make_pipeline(&device, "bsample", BSAMPLE_WGSL);
         let btopk_pipeline = Self::make_pipeline(&device, "btopk", BTOPK_WGSL);
@@ -183,6 +186,7 @@ impl GpuContext {
             bdsdpa_pipeline,
             bdsdpa_paged_pipeline,
             bkv_pack_pipeline,
+            q4k_skinny_pipeline,
             bargmax_pipeline,
             bsample_pipeline,
             btopk_pipeline,
@@ -200,12 +204,38 @@ impl GpuContext {
         (buf, gx)
     }
     fn record_gemm(&self, enc: &mut wgpu::CommandEncoder, w: &ResidentWeight, x: &wgpu::Buffer, out: &wgpu::Buffer, n_cols: usize, m_rows: usize, acc: u32) {
+        use wgpu::util::DeviceExt;
         let n_rows = w.n_rows();
-        let (pbuf, gx) = self.gemm_params(n_rows, n_cols, m_rows, acc);
+        // Skinny decode batches (M<=8) starve the tiled GEMM's M-parallel dot
+        // phase (8/64 threads active). The skinny variant is K-parallel with
+        // register dequant and 8 output rows per workgroup (shared x tile);
+        // the tiled kernel keeps prefill (M>=128 chunks).
+        // Measured crossover (Strix Halo, 1B): skinny wins at M<=2 (M=1 41.4 vs
+        // 64.5 ms/step, M=2 50.9 vs 64.0); the tiled kernel wins again by M=4
+        // (its M-parallel dot amortizes; skinny's per-thread MAC chain grows
+        // linearly with M and its column-per-thread weight reads are
+        // non-coalesced — fixing THAT needs the repacked-weight variant, see
+        // vulkan/shaders/skinny_gemm_q4k_rp.comp for the design).
+        let skinny = m_rows <= 2 && matches!(w, ResidentWeight::Q4(_));
+        let (pbuf, gx, gy) = if skinny {
+            let ngroups = (n_rows as u32).div_ceil(64); // one thread per output column
+            let gx = ngroups.min(65535);
+            let pbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&[n_rows as u32, (n_cols / 256) as u32, n_cols as u32, m_rows as u32, gx, acc, 0u32, 0u32]),
+                usage: wgpu::BufferUsages::UNIFORM });
+            (pbuf, gx, ngroups.div_ceil(gx))
+        } else {
+            let (pbuf, gx) = self.gemm_params(n_rows, n_cols, m_rows, acc);
+            (pbuf, gx, (n_rows as u32).div_ceil(gx))
+        };
         let (pipe, bg) = match w {
-            ResidentWeight::Q4(w) => (&self.q4k_gemm_pipeline, self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None, layout: &self.q4k_gemm_pipeline.get_bind_group_layout(0),
-                entries: &[bge(0, &w.w_buf), bge(1, x), bge(2, out), bge(3, &pbuf)] })),
+            ResidentWeight::Q4(w) => {
+                let pipe = if skinny { &self.q4k_skinny_pipeline } else { &self.q4k_gemm_pipeline };
+                (pipe, self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None, layout: &pipe.get_bind_group_layout(0),
+                entries: &[bge(0, &w.w_buf), bge(1, x), bge(2, out), bge(3, &pbuf)] }))
+            },
             ResidentWeight::Q6(w) => (&self.q6k_gemm_pipeline, self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None, layout: &self.q6k_gemm_pipeline.get_bind_group_layout(0),
                 entries: &[bge(0, &w.ql), bge(1, &w.qh), bge(2, &w.scales), bge(3, &w.d), bge(4, x), bge(5, out), bge(6, &pbuf)] })),
@@ -214,7 +244,7 @@ impl GpuContext {
         let mut p = enc.begin_compute_pass(&Default::default());
         p.set_pipeline(pipe);
         p.set_bind_group(0, &bg, &[]);
-        p.dispatch_workgroups(gx, (n_rows as u32).div_ceil(gx), 1);
+        p.dispatch_workgroups(gx, gy, 1);
     }
     fn record_bnorm(&self, enc: &mut wgpu::CommandEncoder, x: &wgpu::Buffer, wgt: &wgpu::Buffer, y: &wgpu::Buffer, n: usize, eps: f32, m_rows: usize) {
         use wgpu::util::DeviceExt;
@@ -656,6 +686,90 @@ pub fn enumerate() -> Vec<String> {
 /// the f16 super-scales (`unpack2x16float`), the 6-bit sub-scales/mins,
 /// and the 4-bit quants entirely in-shader — the same math as the CPU
 /// `dequantize_q4k_block`. f32 activation, f32 accumulation.
+// SKINNY Q4_K GEMM (decode batching, M <= 8). The tiled GEMM above parallelizes
+// its dot phase over M — at M=8 only 8 of 64 threads work (12.5% utilization);
+// that thread starvation, not LDS bandwidth, was the measured "skinny wall"
+// (~104 tok/s aggregate vs llama's 710 at M=8). Here threads parallelize over K
+// like the matvec: one workgroup per output row; thread t owns (sub-block t/8,
+// qs word t%8) of each 256-col block, dequantizes IN REGISTERS (no weight LDS,
+// weights stream from global exactly once), multiplies its 4 nibbles into M
+// per-thread accumulators against an LDS-staged x tile, and a final LDS tree
+// folds the 64 partial sums per m. Weight traffic = matvec-optimal; x is tiny
+// (M*K) and L2-resident. Same uniform/bind layout as the tiled GEMM.
+// WGSL port of the vulkan backend's proven skinny_gemm_q4k.comp design:
+//   * one THREAD = one output column (row of W), fully reducing its K — no
+//     cross-thread reduction, acc[M] is the only register array;
+//   * A[M, 256-chunk] staged in LDS once per chunk, REUSED by all 64 columns
+//     (A streams N/64 times, not N times — kills the x-reread);
+//   * scalar-fold dequant (d*sc*q - dmin*mn) — no multi-array register blocking
+//     (that miscompiled under glslang; kept scalar here too).
+const Q4K_SKINNY_WGSL: &str = r#"
+struct GP { n_rows: u32, nb: u32, n_cols: u32, m_rows: u32, gx: u32, acc: u32, p0: u32, p1: u32 };
+@group(0) @binding(0) var<storage, read>       wq:   array<u32>;
+@group(0) @binding(1) var<storage, read>       x:    array<f32>;
+@group(0) @binding(2) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(3) var<uniform>             p:    GP;
+const BLOCK_U32: u32 = 36u;
+const MMAX: u32 = 8u;
+const TILE: u32 = 256u;                // K-chunk = one Q4_K super-block
+var<workgroup> xs: array<f32, 2048>;   // A[M, chunk] = 8 KB, shared across 64 columns
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let t = lid.x;
+    let col = (wid.x + wid.y * p.gx) * 64u + t;   // output column owned by this thread
+    let mm = min(p.m_rows, MMAX);
+    var acc: array<f32, 8>;
+    for (var m: u32 = 0u; m < MMAX; m = m + 1u) { acc[m] = 0.0; }
+    for (var b: u32 = 0u; b < p.nb; b = b + 1u) {
+        // Stage A[0..mm, b*256 .. +256] into LDS (64 threads, coalesced).
+        var idx = t;
+        while (idx < mm * TILE) {
+            let m = idx / TILE; let kk = idx % TILE;
+            xs[idx] = x[m * p.n_cols + b * TILE + kk];
+            idx = idx + 64u;
+        }
+        workgroupBarrier();
+        if (col < p.n_rows) {
+            let blk = (col * p.nb + b) * BLOCK_U32;
+            let dd = unpack2x16float(wq[blk]);
+            let d = dd.x; let dmin = dd.y;
+            var u0 = wq[blk + 1u]; var u1 = wq[blk + 2u]; var u2 = wq[blk + 3u];
+            let u3 = ((u2 >> 4u) & 0x0f0f0f0fu) | (((u1 >> 6u) & 0x03030303u) << 4u);
+            let uaux = u1 & 0x3f3f3f3fu;
+            u1 = (u2 & 0x0f0f0f0fu) | (((u0 >> 6u) & 0x03030303u) << 4u);
+            u2 = uaux; u0 = u0 & 0x3f3f3f3fu;
+            for (var sub: u32 = 0u; sub < 8u; sub = sub + 1u) {
+                var sc: f32; var mn: f32;
+                if (sub < 4u) { sc = f32((u0 >> (sub*8u)) & 0xffu); mn = f32((u2 >> (sub*8u)) & 0xffu); }
+                else          { sc = f32((u1 >> ((sub-4u)*8u)) & 0xffu); mn = f32((u3 >> ((sub-4u)*8u)) & 0xffu); }
+                let coef = d * sc; let coefmn = dmin * mn;
+                let qs0 = blk + 4u + (sub / 2u) * 8u;
+                let hi = (sub & 1u) == 1u;
+                for (var w: u32 = 0u; w < 8u; w = w + 1u) {
+                    let word = wq[qs0 + w];
+                    for (var bsel: u32 = 0u; bsel < 4u; bsel = bsel + 1u) {
+                        let byte = (word >> (bsel * 8u)) & 0xffu;
+                        var q: u32; if (hi) { q = byte >> 4u; } else { q = byte & 0x0fu; }
+                        let wval = coef * f32(q) - coefmn;
+                        let kpos = sub * 32u + w * 4u + bsel;
+                        for (var m: u32 = 0u; m < mm; m = m + 1u) {
+                            acc[m] = acc[m] + wval * xs[m * TILE + kpos];
+                        }
+                    }
+                }
+            }
+        }
+        workgroupBarrier();
+    }
+    if (col < p.n_rows) {
+        for (var m: u32 = 0u; m < mm; m = m + 1u) {
+            let oi = m * p.n_rows + col;
+            if (p.acc == 1u) { outp[oi] = outp[oi] + acc[m]; } else { outp[oi] = acc[m]; }
+        }
+    }
+}
+"#;
+
 const Q4K_MATVEC_WGSL: &str = r#"
 struct Params { n_rows: u32, nb_per_row: u32, gx: u32, acc: u32, out_base: u32, p0: u32, p1: u32, p2: u32 };
 @group(0) @binding(0) var<storage, read>       wq: array<u32>;
