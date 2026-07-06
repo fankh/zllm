@@ -1,0 +1,151 @@
+// FUSED coopmat flash attention for prefill: O_h = softmax(scale*Q_h.K_h^T).V_h
+// with S NEVER materialized in global memory. The 3-phase coopmat attention
+// (QK GEMM -> causal softmax -> PV GEMM) moves ~1.5 GB of S/prob scratch per
+// 1024-tok prefill and is bandwidth-bound on it; here each query-block streams
+// K/V blocks through LDS, does the online-softmax merge in LDS (KHR coopmat v1
+// fragments have implementation-defined layouts — no portable per-row math on
+// fragments, so S/P/O round-trip 8-16 KB LDS tiles instead), and writes O once.
+// One workgroup = 64 query rows x one head; 128 threads = 4 wave32 subgroups.
+// Per K-block (32 cols): S=Q.K^T on WMMA (K^T via ColumnMajor load — no
+// transpose staging), scalar causal-masked online softmax + O rescale in LDS,
+// PV on WMMA into fresh accumulators merged into O_lds. hd = 64 fixed.
+// Compile: glslangValidator --target-env vulkan1.3 -V coopmat_flash_attn.comp -o coopmat_flash_attn.spv
+#version 450 core
+#extension GL_KHR_cooperative_matrix          : require
+#extension GL_KHR_memory_scope_semantics      : require
+#extension GL_KHR_shader_subgroup_basic       : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#pragma use_vulkan_memory_model
+
+layout(local_size_x = 128) in;   // 4 wave32 subgroups
+
+layout(binding = 0) readonly  buffer Q_  { float16_t q16[]; };  // [m, n_head*hd] roped
+layout(binding = 1) readonly  buffer K_  { float16_t k16[]; };  // [seq, kv_dim] roped
+layout(binding = 2) readonly  buffer V_  { float16_t v16[]; };  // [seq, kv_dim]
+layout(binding = 3) writeonly buffer O_  { float     outp[]; }; // [m, n_head*hd] f32
+layout(binding = 4) uniform   U_ {
+    uint m;      // padded query rows (mult of 64)
+    uint seq;    // key rows resident (pos + m)
+    uint pos;    // position offset of query row 0
+    uint gqa;    // n_head / n_kv
+    uint lda;    // q16 row stride   (n_head*hd)
+    uint ldkv;   // k16/v16 row stride (kv_dim)
+    uint ldo;    // outp row stride  (n_head*hd)
+    uint pad0;
+    float scale;
+} u;
+
+const uint HD = 64u;
+const uint BR = 64u;   // query rows per workgroup
+const uint BC = 32u;   // key cols per block
+shared float16_t Qs[BR * HD];      //  8 KB (loaded once)
+shared float16_t Ks[BC * HD];      //  4 KB (per block)
+shared float16_t Vs[BC * HD];      //  4 KB
+shared float     Sl[BR * BC];      //  8 KB (S tile, then holds exp values scaled)
+shared float16_t Pl[BR * BC];      //  4 KB (f16 probs for the PV MulAdd)
+shared float     Ol[BR * HD];      // 16 KB (running O accumulator)
+shared float     Ot[BR * HD];      // 16 KB (this block's PV before merge)
+shared float     mrow[BR];         // running row max
+shared float     lrow[BR];         // running row sum
+
+void main() {
+    uint qb = gl_WorkGroupID.x;        // query block
+    uint h  = gl_WorkGroupID.y;        // head
+    uint t  = gl_LocalInvocationID.x;  // 0..128
+    uint sg = gl_SubgroupID;           // 0..4  (16 query rows each)
+    uint qoff = h * HD;                // column offset of this head in q16/outp
+    uint kvoff = (h / u.gqa) * HD;     // column offset in k16/v16
+    uint r0 = qb * BR;                 // first query row of this block
+
+    // Load the query block once; zero the accumulators.
+    for (uint i = t; i < BR * HD; i += 128u) {
+        Qs[i] = q16[(r0 + i / HD) * u.lda + qoff + i % HD];
+        Ol[i] = 0.0;
+    }
+    if (t < BR) { mrow[t] = -1e30; lrow[t] = 0.0; }
+    barrier();
+
+    // Causal bound: the last key this block's queries may see is pos + r0 + BR - 1.
+    uint kend = min(u.seq, u.pos + r0 + BR);
+    uint nblk = (kend + BC - 1u) / BC;
+    for (uint b = 0u; b < nblk; b++) {
+        uint c0 = b * BC;
+        // Stage this K/V block (rows c0..c0+BC of the caches).
+        for (uint i = t; i < BC * HD; i += 128u) {
+            uint rr = i / HD; uint cc = i % HD;
+            Ks[i] = k16[(c0 + rr) * u.ldkv + kvoff + cc];
+            Vs[i] = v16[(c0 + rr) * u.ldkv + kvoff + cc];
+        }
+        barrier();
+
+        // S tile [BR, BC] = Qs [BR, HD] x Ks^T: subgroup sg owns rows sg*16,
+        // 1x2 fragments; B = K^T loaded ColumnMajor straight from Ks.
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> sacc[2];
+        sacc[0] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        sacc[1] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        for (uint kk = 0u; kk < HD; kk += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> af;
+            coopMatLoad(af, Qs, (sg * 16u) * HD + kk, HD, gl_CooperativeMatrixLayoutRowMajor);
+            for (uint j = 0u; j < 2u; j++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bf;
+                // Bmat[k][n] = K[n][k]: ColumnMajor view of Ks rows (j*16..)+16
+                coopMatLoad(bf, Ks, (j * 16u) * HD + kk, HD, gl_CooperativeMatrixLayoutColumnMajor);
+                sacc[j] = coopMatMulAdd(af, bf, sacc[j]);
+            }
+        }
+        coopMatStore(sacc[0], Sl, (sg * 16u) * BC, BC, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(sacc[1], Sl, (sg * 16u) * BC + 16u, BC, gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+
+        // Online softmax in LDS: thread t < BR owns query row t.
+        if (t < BR) {
+            uint grow = u.pos + r0 + t;              // global query position
+            float mold = mrow[t];
+            float mnew = mold;
+            for (uint cc = 0u; cc < BC; cc++) {
+                uint gcol = c0 + cc;
+                float s = (gcol < u.seq && gcol <= grow) ? Sl[t * BC + cc] * u.scale : -1e30;
+                Sl[t * BC + cc] = s;
+                mnew = max(mnew, s);
+            }
+            float corr = exp(mold - mnew);
+            float ls = lrow[t] * corr;
+            for (uint cc = 0u; cc < BC; cc++) {
+                float e = exp(Sl[t * BC + cc] - mnew);
+                Pl[t * BC + cc] = float16_t(e);
+                ls += e;
+            }
+            mrow[t] = mnew; lrow[t] = ls;
+            // Rescale the running O row by corr (skip when corr == 1).
+            if (corr != 1.0) {
+                for (uint cc = 0u; cc < HD; cc++) { Ol[t * HD + cc] *= corr; }
+            }
+        }
+        barrier();
+
+        // PV: Ot [BR, HD] = Pl [BR, BC] x Vs [BC, HD]; subgroup sg rows sg*16, 1x4 frags.
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> oacc[4];
+        for (uint j = 0u; j < 4u; j++) oacc[j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        for (uint kk = 0u; kk < BC; kk += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> pf;
+            coopMatLoad(pf, Pl, (sg * 16u) * BC + kk, BC, gl_CooperativeMatrixLayoutRowMajor);
+            for (uint j = 0u; j < 4u; j++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> vf;
+                coopMatLoad(vf, Vs, kk * HD + j * 16u, HD, gl_CooperativeMatrixLayoutRowMajor);
+                oacc[j] = coopMatMulAdd(pf, vf, oacc[j]);
+            }
+        }
+        for (uint j = 0u; j < 4u; j++)
+            coopMatStore(oacc[j], Ot, (sg * 16u) * HD + j * 16u, HD, gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+        // Merge this block into the running accumulator.
+        for (uint i = t; i < BR * HD; i += 128u) { Ol[i] += Ot[i]; }
+        barrier();
+    }
+
+    // Normalize + write out (strided per head).
+    for (uint i = t; i < BR * HD; i += 128u) {
+        uint rr = i / HD; uint cc = i % HD;
+        outp[(r0 + rr) * u.ldo + qoff + cc] = Ol[i] / lrow[rr];
+    }
+}

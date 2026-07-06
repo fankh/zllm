@@ -62,6 +62,7 @@ const BSDPA_OFFSET_SPV: &[u8] = include_bytes!("shaders/bsdpa_offset.spv"); // c
 const COOPMAT_ATTN_GEMM_SPV: &[u8] = include_bytes!("shaders/coopmat_attn_gemm.spv"); // prefill attention QK^T on WMMA
 const COOPMAT_ATTN_GEMM_N64_SPV: &[u8] = include_bytes!("shaders/coopmat_attn_gemm_n64.spv"); // BN=64 variant (PV, N=hd)
 const CAUSAL_SOFTMAX_SPV: &[u8] = include_bytes!("shaders/causal_softmax.spv");
+const COOPMAT_FLASH_ATTN_SPV: &[u8] = include_bytes!("shaders/coopmat_flash_attn.spv"); // fused FA (S never global)
 const BSDPA_SLOT_SPV: &[u8] = include_bytes!("shaders/bsdpa_slot.spv");
 const KVWRITE_SLOT_SPV: &[u8] = include_bytes!("shaders/kvwrite_slot.spv");
 const BSILU_SPV: &[u8] = include_bytes!("shaders/bsilu.spv");
@@ -1015,7 +1016,7 @@ struct PrefillRes {
     cosb: ash::vk::Buffer, cosb_ptr: *mut u8, sinb: ash::vk::Buffer, sinb_ptr: *mut u8,
     // Coopmat attention (prefill SDPA on WMMA — was 34% of prefill at 2% of peak):
     // f16 views of Q/K/V, per-8-head-batch S scratch + f16 probs, GEMM + softmax pipes.
-    p_cma: Pipe3, p_cma64: Pipe3, p_smax: Pipe3,
+    p_cma: Pipe3, p_cma64: Pipe3, p_smax: Pipe3, p_cfa: Pipe3,
     q16: ash::vk::Buffer, k16: ash::vk::Buffer, v16: ash::vk::Buffer,
     s32: ash::vk::Buffer, prob16: ash::vk::Buffer,
 }
@@ -1489,6 +1490,7 @@ impl VkModel {
         let p_cma = mkp(COOPMAT_ATTN_GEMM_SPV, 3, true);
         let p_cma64 = mkp(COOPMAT_ATTN_GEMM_N64_SPV, 3, true);
         let p_smax = mkp(CAUSAL_SOFTMAX_SPV, 2, false);
+        let p_cfa = mkp(COOPMAT_FLASH_ATTN_SPV, 4, true); // fused flash attention (VK_FUSED_FA)
         let pf_q16 = f16buf(&mut bufs, mm * attn_dim);
         let pf_k16 = f16buf(&mut bufs, mm * kv_dim);
         let pf_v16 = f16buf(&mut bufs, mm * kv_dim);
@@ -1501,7 +1503,7 @@ impl VkModel {
             x32: pf_x32, x32_ptr: pf_x32_ptr, x16: pf_x16, n32: pf_n32, n16: pf_n16, q: pf_q, qk: pf_qk,
             attn32: pf_attn32, attn16: pf_attn16, gu: pf_gu, h32: pf_h32, h16: pf_h16, o32: pf_o32, ffn32: pf_ffn32,
             cosb: pf_cosb, cosb_ptr: pf_cosb_ptr, sinb: pf_sinb, sinb_ptr: pf_sinb_ptr,
-            p_cma, p_cma64, p_smax,
+            p_cma, p_cma64, p_smax, p_cfa,
             q16: pf_q16, k16: pf_k16, v16: pf_v16, s32: pf_s32, prob16: pf_prob16,
         }
         };
@@ -1825,6 +1827,18 @@ impl VkModel {
                     disp(pf.p_t16, mkset(pf.p_t16.2, &[l.kc, pf.k16], uni([(m * kv_dim) as u32, 0, 0, 0])), c64(m * kv_dim), 1);
                     disp(pf.p_t16, mkset(pf.p_t16.2, &[l.vc, pf.v16], uni([(m * kv_dim) as u32, 0, 0, 0])), c64(m * kv_dim), 1);
                     bar();
+                    if !std::env::var("VK_FA3").is_ok() {
+                        // FUSED flash attention (default): S never leaves LDS
+                        // (online softmax + O accumulation per 64-row query
+                        // block). One workgroup per (query block, head).
+                        // Measured 262 ms vs 295 (3-phase, VK_FA3=1) vs 341
+                        // (scalar, VK_SCALAR_SDPA=1) for the 1024-tok prefill.
+                        disp3(pf.p_cfa, mkset(pf.p_cfa.2, &[pf.q16, pf.k16, pf.v16, pf.attn32],
+                            uni15([m as u32, seq as u32, pos as u32, gqa, attn_dim as u32, kv_dim as u32,
+                                   attn_dim as u32, 0, scale.to_bits(), 0, 0, 0, 0, 0, 0])),
+                            (m / 64) as u32, n_head as u32, 1);
+                        bar();
+                    } else {
                     // 8-head batches: QK → causal softmax → PV per batch. The batch
                     // barriers cost less than losing L2 residency on the S planes
                     // (all-heads-at-once measured slower — see the scratch comment).
@@ -1843,6 +1857,7 @@ impl VkModel {
                                    (m * seq) as u32, hd as u32, hd as u32, zb as u32, gqa, 1, 0, 1, 1.0f32.to_bits()])),
                             (hd / 64) as u32, (m / 128) as u32, 8);
                         bar();
+                    }
                     }
                 } else if pos == 0 {
                     disp(pf.p_bs, mkset(pf.p_bs.2, &[pf.q, l.kc, l.vc, pf.attn32], uni([n_head as u32, n_kv as u32, hd as u32, m as u32])), (m * n_head) as u32, 1); // workgroup per (query,head)
