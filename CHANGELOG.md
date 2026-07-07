@@ -46,7 +46,7 @@ B=8 0.16x (the remaining gap; wgpu backend). See BENCHMARKS.md.
 ### Code organization
 - Binary now consumes the library crate (no dual compilation of the module
   tree). ZERO build warnings across default/vulkan/gpu configs.
-- TESTING.md manual playbook; BENCHMARKS.md head-to-head + addenda.
+- docs/TESTING.md manual playbook; BENCHMARKS.md head-to-head + addenda.
 
 
 ## v0.8.0 — 2026-06-16

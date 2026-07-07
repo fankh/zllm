@@ -67,7 +67,7 @@ bytemuck = { version = "1", features = ["derive"], optional = true }
 # Raw-Vulkan compute path (the `vulkan` feature) — accesses
 # VK_KHR_cooperative_matrix (the iGPU's WMMA), which wgpu/WGSL cannot. Shaders
 # are GLSL compiled OFFLINE to SPIR-V (committed .spv, include_bytes!) so the
-# build needs no glslang/SDK at compile time. See VULKAN_PLAN.md Phase 2.
+# build needs no glslang/SDK at compile time. See docs/VULKAN_PLAN.md Phase 2.
 ash = { version = "0.38", optional = true }
 half = { version = "2", optional = true }
 
@@ -100,7 +100,7 @@ default = []
 # AMD iGPU compute path via wgpu/Vulkan. Build with `--features gpu`.
 gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 # Raw-Vulkan (ash) path for cooperative-matrix kernels. Build with
-# `--features vulkan`. Off by default. See VULKAN_PLAN.md Phase 2.
+# `--features vulkan`. Off by default. See docs/VULKAN_PLAN.md Phase 2.
 vulkan = ["dep:ash", "dep:bytemuck", "dep:half"]
 # Enable in-process per-layer timing inside the Candle forward path.
 # Off by default (timing calls have non-zero cost). Build with

@@ -131,8 +131,13 @@ A/B + diagnostics (regression comparison, not for production): `VK_FA3`,
 `ZLLM_SWAP` (swap-to-host preemption — loses on UMA, keep off),
 `ZLLM_Q3_GATEUP`/`ZLLM_FUSED_QKV` (measured-parity experiments, keep off).
 Runtime toggles (REST): `/v1/inspect/enabled`, `/v1/early_exit/enabled`(+`/config`),
-`/v1/pld/enabled`, `/v1/spec_decode/enabled`. See TESTING.md for a full playbook.
+`/v1/pld/enabled`, `/v1/spec_decode/enabled`. See [docs/TESTING.md](docs/TESTING.md) for a full playbook.
 
-## Architecture
+## Architecture & docs
+
+Engineering docs live in [`docs/`](docs/): [SUMMARY](docs/SUMMARY.md) (project
+on-ramp: status, techniques, dead-ends), [TESTING](docs/TESTING.md) (manual
+playbook), [VULKAN_PLAN](docs/VULKAN_PLAN.md) (iGPU research notes), and the
+plugin/instrumentation design plans.
 
 See [ai-inference-engine docs](https://github.com/fankh/new-research/tree/main/ai-inference-engine) for full architecture specification.

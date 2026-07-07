@@ -128,11 +128,11 @@ cargo test --release --features vulkan --lib vk_prefill_vs_candle -- --ignored -
 ```
 **Thermal caveat**: absolute tok/s varies ±15% with chassis temperature
 (10-rep runs can be *slower* than 3-rep = throttling). Compare A/B numbers
-from the same session only. Reference numbers: BENCHMARKS.md.
+from the same session only. Reference numbers: ../BENCHMARKS.md.
 
 Continuous batching (separate build): `cargo build --release --features gpu`,
 run with `ZLLM_CB=1`, POST to `/v1/cb/completions`; aggregate throughput
-scales ~5.6× at 8 concurrent (see BENCHMARKS.md §3).
+scales ~5.6× at 8 concurrent (see ../BENCHMARKS.md §3).
 
 ## 8. Unit/integration suite
 

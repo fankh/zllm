@@ -3,7 +3,7 @@
 A from-scratch Rust LLM inference engine + white-box control plane. This doc is the
 fast on-ramp for a new session (human or AI): what exists, what's proven, what's a
 dead end, and which pieces transfer to other LLM work. For numbers see
-[BENCHMARKS.md](BENCHMARKS.md); for history see [CHANGELOG.md](CHANGELOG.md).
+[BENCHMARKS.md](../BENCHMARKS.md); for history see [CHANGELOG.md](../CHANGELOG.md).
 
 ## Target & the one constraint that shapes everything
 

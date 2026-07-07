@@ -2,7 +2,7 @@
 //! `VK_KHR_cooperative_matrix` — the iGPU's WMMA matrix instructions, which
 //! wgpu/WGSL cannot express. This module proves the whole pipeline end to end
 //! (committed SPIR-V → ash device with the coopmat feature chain → RDNA3.5
-//! WMMA → validated result) before the full kernel port. See VULKAN_PLAN.md.
+//! WMMA → validated result) before the full kernel port. See docs/VULKAN_PLAN.md.
 //!
 //! Shaders are GLSL compiled OFFLINE to SPIR-V (committed `.spv`, embedded via
 //! `include_bytes!`), so the build needs no glslang/SDK.
