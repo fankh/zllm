@@ -814,7 +814,7 @@ async fn chat_completions(
             generate_blocking(&s, tokens, max_tokens, &sampler_cfg, fsm.as_ref(), &id, detector.as_mut());
         let hallu = detector.map(|d| hallucination_json(&d.report()));
         let now = unix_secs();
-        Json(json!({
+        let mut resp = json!({
             "id": id,
             "object": "chat.completion",
             "created": now,
@@ -828,10 +828,15 @@ async fn chat_completions(
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "total_tokens": prompt_tokens + completion_tokens
-            },
-            "hallucination": hallu
-        }))
-        .into_response()
+            }
+        });
+        // Only present when detection was requested — a null field on every
+        // response breaks byte-untouched middleware contracts (found by the
+        // llm-probe proxy's T2 battery test).
+        if let Some(h) = hallu {
+            resp["hallucination"] = h;
+        }
+        Json(resp).into_response()
     }
 }
 
@@ -932,7 +937,7 @@ async fn text_completions(
     let (text, p, c, finish_reason) = generate_blocking(&s, tokens, req.max_tokens, &sampler_cfg, fsm.as_ref(), &id, detector.as_mut());
     let hallu = detector.map(|d| hallucination_json(&d.report()));
     let now = unix_secs();
-    Json(json!({
+    let mut resp = json!({
         "id": id,
         "object": "text_completion",
         "created": now,
@@ -946,10 +951,13 @@ async fn text_completions(
             "prompt_tokens": p,
             "completion_tokens": c,
             "total_tokens": p + c
-        },
-        "hallucination": hallu
-    }))
-    .into_response()
+        }
+    });
+    // Only present when detection was requested (see the chat handler note).
+    if let Some(h) = hallu {
+        resp["hallucination"] = h;
+    }
+    Json(resp).into_response()
 }
 
 #[derive(Deserialize)]
