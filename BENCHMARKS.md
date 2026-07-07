@@ -334,3 +334,19 @@ swap round-trip still bit-exact (opaque words). All paged/CB tests pass. Aggrega
 decode (short-ctx, single-stream baseline 53 tok/s wgpu): M=8 117 tok/s (2.2×),
 M=16 213 (4.1×), M=32 338 (6.4×). CB PLD: 4.3× fewer forwards, bit-identical.
 VkModel (single-stream flagship) keeps f32 KV to preserve bit-exactness.
+
+## Head-to-head 2026-07-07 (same session, GPU-exclusive per run, post fused-FA)
+
+| dimension | zllm | llama.cpp Vulkan | ratio |
+|---|---|---|---|
+| **decode sustained** (all-Q4, tg128 ×30) | **213.6 tok/s** (bit-exact 24/24) | 191.8 ± 18.9 | **1.11× zllm** |
+| **prefill 1024** (Q4_K_M) | 252 ms = **4063 tok/s** (fused coopmat FA) | 4722 tok/s | 0.86× |
+| prefill 2048 (chunked; chunk 2 still scalar SDPA) | ~1825 tok/s | 3648 | 0.50× |
+| batched decode B=8 (Q4_K_M; wgpu CB) | 117 tok/s | 711 | 0.16× |
+| batched decode B=32 | 338 | 1422 | 0.24× |
+
+Notes: prefill@1024 was 0.49× before the 2026-07-06 attention arc (scalar SDPA →
+3-phase coopmat → fused flash attention). Batched runs on the wgpu backend
+(functionally complete CB stack; per-step cost is the known skinny-GEMM/backend
+gap — the fast single-stream engine is the raw-Vulkan path, which has no
+batching). Day-to-day thermal variance is real: quote sustained (r=30) numbers.
