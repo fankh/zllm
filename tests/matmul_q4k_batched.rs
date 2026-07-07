@@ -8,7 +8,7 @@ use candle_core::{Device, Tensor};
 use candle_nn::Module;
 use std::time::Instant;
 
-use zllm::backend::candle::q4k_avx512::{matmul_q4k_q8k_par, vec_dot_q4k_q8k};
+use zllm::backend::candle::q4k_avx512::matmul_q4k_q8k_par;
 use zllm::backend::candle::q4k_repack::{quantize_q8_k, BlockQ4K, BlockQ8K, QK_K};
 
 fn deterministic_f32(n: usize, seed: u64) -> Vec<f32> {

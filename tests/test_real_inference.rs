@@ -9,7 +9,6 @@ use zllm::engine::hooks::early_exit::EarlyExitHook;
 use zllm::engine::hooks::traits::{Hook, HookAction, HookContext};
 use zllm::engine::memory_store::{MemoryStore, MemoryMetadata, MemoryCategory};
 use zllm::engine::reasoning_budget::ReasoningBudget;
-use zllm::engine::sampler::{SamplerConfig, sample};
 
 const MODEL_PATH: &str = "models/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
 const TOKENIZER_PATH: &str = "models/tokenizer.json";
@@ -215,7 +214,7 @@ fn test_memory_store_with_real_tokens() {
         return;
     }
 
-    let tokenizer = LlamaTokenizer::from_file(TOKENIZER_PATH).unwrap();
+    let _tokenizer = LlamaTokenizer::from_file(TOKENIZER_PATH).unwrap();
     let mut store = MemoryStore::new(100, 50);
 
     // Simulate storing a finding from a security analysis
