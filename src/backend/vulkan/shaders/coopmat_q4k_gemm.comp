@@ -5,12 +5,16 @@
 // (one Q4_K sub-block): stage 128x32 of A and a dequantized 32x128 weight tile
 // into LDS, then 2 k-slices of 4 coopMatMulAdds per subgroup between one barrier
 // pair. M,N mult of 128; K mult of 256. fp32 accumulate.
-// Tuning ledger (1024-tok prefill GPU-exec, glslang 16.3, 2026-07-06):
+// Tuning ledger (1024-tok prefill GPU-exec, glslang 16.3, 2026-07-06/07):
 //   BK=16 (original) 348ms | BK=32 340ms (+2%, SHIPPED) | column-grouped Bs
 //   reads 370ms (LDS write bank conflicts) | 2x4 frag tile @256 threads 352ms
-//   (staging parallelism loss). Kernel is insensitive to the classic levers —
-//   the next real steps need a profiler (RGP) or register-prefetch double
-//   buffering (glslang miscompiled multi-register-array kernels before; risky).
+//   (staging parallelism loss).
+//   NOLOAD probe (staging writes constants — zero global reads, zero dequant):
+//   211-216ms of the 252ms full prefill remain. CONCLUSION: the kernel is
+//   ISSUE/LDS-bound on the coopmat core (~9.5 TFLOP/s ceiling in this shape);
+//   ALL memory+dequant work costs only ~40ms. Register-prefetch double
+//   buffering is therefore NOT worth building (≤40ms theoretical, high risk).
+//   Further gains need a different fragment/LDS shape found via profiler (RGP).
 // Compile: C:/tools/glslang/bin/glslangValidator --target-env vulkan1.3 -V coopmat_q4k_gemm.comp -o coopmat_q4k_gemm.spv
 #version 450 core
 #extension GL_KHR_cooperative_matrix          : require
