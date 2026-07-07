@@ -1492,8 +1492,10 @@ impl VkModel {
         let p_smax = mkp(CAUSAL_SOFTMAX_SPV, 2, false);
         let p_cfa = mkp(COOPMAT_FLASH_ATTN_SPV, 4, true); // fused flash attention (VK_FUSED_FA)
         let pf_q16 = f16buf(&mut bufs, mm * attn_dim);
-        let pf_k16 = f16buf(&mut bufs, mm * kv_dim);
-        let pf_v16 = f16buf(&mut bufs, mm * kv_dim);
+        // K/V f16 views sized for the WHOLE resident prefix (max_seq rows), not
+        // one tile: chunked prefill's fused attention reads keys 0..pos+m.
+        let pf_k16 = f16buf(&mut bufs, max_seq * kv_dim);
+        let pf_v16 = f16buf(&mut bufs, max_seq * kv_dim);
         let (pf_s32, _) = vk_zeros(&ctx, &mut bufs, 8 * mm * mm);
         let pf_prob16 = f16buf(&mut bufs, 8 * mm * mm);
         PrefillRes {
@@ -1812,14 +1814,33 @@ impl VkModel {
             // workgroup per (query,head) (p_bso; the thread-per-query p_bsd
             // measured 387 tok/s chunked prefill — 64x less parallel).
             if !skip_sdpa {
-                let scalar_sdpa = std::env::var("VK_SCALAR_SDPA").is_ok(); // A/B: old scalar kernel
-                if pos == 0 && !scalar_sdpa {
-                    // COOPMAT ATTENTION: S=Q·K^T and O=P·V run on WMMA (the scalar
-                    // bsdpa was 34% of prefill at ~2% of peak). f16 views of the
-                    // roped Q and the cache's K/V rows 0..m, then per-8-head
-                    // batches: QK GEMM → causal softmax (f16 probs, zeros beyond
-                    // the diagonal so PV needs no mask) → PV GEMM (BN=64, N=hd).
-                    let seq = m; // pos==0: keys 0..m
+                let scalar_sdpa = std::env::var("VK_SCALAR_SDPA").is_ok(); // A/B: old scalar kernels
+                let fa3 = std::env::var("VK_FA3").is_ok();                 // A/B: 3-phase coopmat (pos==0 only)
+                if !scalar_sdpa && !fa3 {
+                    // FUSED coopmat flash attention (default, ANY pos): S never
+                    // leaves LDS (online softmax + O accumulation per 64-row query
+                    // block); query rows sit at positions pos..pos+m and attend the
+                    // resident keys 0..pos+row. f16 views: Q = this chunk's m rows,
+                    // K/V = the WHOLE prefix 0..seq. Measured at 1024 tok: 262 ms
+                    // vs 295 (VK_FA3=1) vs 341 (VK_SCALAR_SDPA=1).
+                    let seq = pos + m;
+                    let attn_dim = n_head * hd;
+                    let gqa = (n_head / n_kv) as u32;
+                    let scale = 1.0f32 / (hd as f32).sqrt();
+                    disp(pf.p_t16, mkset(pf.p_t16.2, &[pf.q, pf.q16], uni([(m * attn_dim) as u32, 0, 0, 0])), c64(m * attn_dim), 1);
+                    disp(pf.p_t16, mkset(pf.p_t16.2, &[l.kc, pf.k16], uni([(seq * kv_dim) as u32, 0, 0, 0])), c64(seq * kv_dim), 1);
+                    disp(pf.p_t16, mkset(pf.p_t16.2, &[l.vc, pf.v16], uni([(seq * kv_dim) as u32, 0, 0, 0])), c64(seq * kv_dim), 1);
+                    bar();
+                    disp3(pf.p_cfa, mkset(pf.p_cfa.2, &[pf.q16, pf.k16, pf.v16, pf.attn32],
+                        uni15([m as u32, seq as u32, pos as u32, gqa, attn_dim as u32, kv_dim as u32,
+                               attn_dim as u32, 0, scale.to_bits(), 0, 0, 0, 0, 0, 0])),
+                        (m / 64) as u32, n_head as u32, 1);
+                    bar();
+                } else if pos == 0 && !scalar_sdpa {
+                    // 3-PHASE coopmat attention (VK_FA3=1 A/B; pos==0 only — its S
+                    // scratch is sized for one tile): QK GEMM → causal softmax →
+                    // PV GEMM through global S/prob planes.
+                    let seq = m;
                     let attn_dim = n_head * hd;
                     let gqa = (n_head / n_kv) as u32;
                     let scale = 1.0f32 / (hd as f32).sqrt();
@@ -1827,18 +1848,7 @@ impl VkModel {
                     disp(pf.p_t16, mkset(pf.p_t16.2, &[l.kc, pf.k16], uni([(m * kv_dim) as u32, 0, 0, 0])), c64(m * kv_dim), 1);
                     disp(pf.p_t16, mkset(pf.p_t16.2, &[l.vc, pf.v16], uni([(m * kv_dim) as u32, 0, 0, 0])), c64(m * kv_dim), 1);
                     bar();
-                    if !std::env::var("VK_FA3").is_ok() {
-                        // FUSED flash attention (default): S never leaves LDS
-                        // (online softmax + O accumulation per 64-row query
-                        // block). One workgroup per (query block, head).
-                        // Measured 262 ms vs 295 (3-phase, VK_FA3=1) vs 341
-                        // (scalar, VK_SCALAR_SDPA=1) for the 1024-tok prefill.
-                        disp3(pf.p_cfa, mkset(pf.p_cfa.2, &[pf.q16, pf.k16, pf.v16, pf.attn32],
-                            uni15([m as u32, seq as u32, pos as u32, gqa, attn_dim as u32, kv_dim as u32,
-                                   attn_dim as u32, 0, scale.to_bits(), 0, 0, 0, 0, 0, 0])),
-                            (m / 64) as u32, n_head as u32, 1);
-                        bar();
-                    } else {
+                    {
                     // 8-head batches: QK → causal softmax → PV per batch. The batch
                     // barriers cost less than losing L2 residency on the S planes
                     // (all-heads-at-once measured slower — see the scratch comment).
