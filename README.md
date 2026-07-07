@@ -11,7 +11,9 @@ White-box LLM inference engine with zero-copy latent intercept.
   path — activation steering and memory inject/capture edit the live residual stream
 - Confidence-driven **early exit** (layer short-circuit during decode)
 - **Hallucination/uncertainty detection** from the output distribution
-  (predictive entropy / top-prob), opt-in via `detect_hallucination`
+  (predictive entropy / top-prob), opt-in via `detect_hallucination` — also
+  available for *other* servers (llama.cpp, vLLM, ...) via the spin-off
+  [zllm-probe](https://github.com/fankh/zllm-probe) drop-in proxy
 - **Grammar-constrained decoding**: `regex:<pattern>` (anchored byte-DFA token
   masking — output is guaranteed to match) and `ban:<ids>` token banning.
   *JSON-schema/BNF modes not yet implemented (requests are rejected with 400).*
@@ -139,5 +141,10 @@ Engineering docs live in [`docs/`](docs/): [SUMMARY](docs/SUMMARY.md) (project
 on-ramp: status, techniques, dead-ends), [TESTING](docs/TESTING.md) (manual
 playbook), [VULKAN_PLAN](docs/VULKAN_PLAN.md) (iGPU research notes), and the
 plugin/instrumentation design plans.
+
+Related: [**zllm-probe**](https://github.com/fankh/zllm-probe) — the
+cross-engine spin-off that brings zllm's uncertainty instrumentation to any
+OpenAI-compatible server (llama.cpp `llama-server`, vLLM, ...) as a drop-in
+proxy; zllm is its reference engine for the deep (hidden-state) tier.
 
 See [ai-inference-engine docs](https://github.com/fankh/new-research/tree/main/ai-inference-engine) for full architecture specification.
