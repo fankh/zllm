@@ -2,7 +2,7 @@ use crate::backend::candle::quantized_llama_fork::ModelWeights;
 use crate::backend::traits::*;
 use crate::error::{Result, ZllmError};
 use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device, Tensor as CandleTensor};
+use candle_core::{Device, Tensor as CandleTensor};
 use std::path::Path;
 
 pub struct CandleCpuBackend {

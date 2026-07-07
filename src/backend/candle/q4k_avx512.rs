@@ -15,7 +15,9 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::backend::candle::q4k_repack::{BlockQ4K, BlockQ8K, QK_K};
+use crate::backend::candle::q4k_repack::{BlockQ4K, BlockQ8K};
+#[cfg(test)]
+use crate::backend::candle::q4k_repack::QK_K;
 
 const KMASK1: u32 = 0x3f3f3f3f;
 const KMASK2: u32 = 0x0f0f0f0f;
@@ -494,7 +496,7 @@ mod tests {
             off += 4;
         }
         // Weights: nb_per_row BlockQ4K's.
-        let block_sz = std::mem::size_of::<BlockQ4K>();
+        let _block_sz = std::mem::size_of::<BlockQ4K>();
         let row_blocks: &[BlockQ4K] = unsafe {
             std::slice::from_raw_parts(
                 bytes[off..].as_ptr() as *const BlockQ4K, nb_per_row,
@@ -715,7 +717,7 @@ mod tests {
     /// bugs that synthetic byte-fill data misses.
     #[test]
     fn matches_candle_qmatmul_real_q4k() {
-        use candle_core::{Device, Tensor, DType};
+        use candle_core::{Device, Tensor};
         use candle_core::quantized::{QTensor, GgmlDType, QMatMul};
 
         let dev = Device::Cpu;

@@ -1,4 +1,4 @@
-use crate::backend::traits::{Backend, Tensor};
+use crate::backend::traits::Backend;
 use crate::engine::hooks::registry::HookRegistry;
 use crate::engine::hooks::traits::{HookAction, HookContext};
 use crate::engine::memory_store::{InspectionTrace, LayerSnapshot, MemoryStore};

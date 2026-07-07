@@ -17,7 +17,6 @@ const COOPMAT_Q4K_GEMM_SPV: &[u8] = include_bytes!("shaders/coopmat_q4k_gemm.spv
 const COOPMAT_Q4K_GEMM_M16_SPV: &[u8] = include_bytes!("shaders/coopmat_q4k_gemm_m16.spv");
 const DECODE_MATVEC_Q4K_SPV: &[u8] = include_bytes!("shaders/decode_matvec_q4k.spv");
 const DECODE_MATVEC_Q3K_SPV: &[u8] = include_bytes!("shaders/decode_matvec_q3k.spv"); // gate+up→Q3 (naga-gen)
-const DECODE_MATVEC_DOWN_Q4K_SPV: &[u8] = include_bytes!("shaders/decode_matvec_down_q4k.spv");
 const DECODE_MATVEC_Q4K_ROPE_SPV: &[u8] = include_bytes!("shaders/decode_matvec_q4k_rope.spv");
 const RMSNORM_SPV: &[u8] = include_bytes!("shaders/rmsnorm.spv");
 const ROPE_SPV: &[u8] = include_bytes!("shaders/rope.spv");
@@ -48,6 +47,19 @@ const Q6K_MEGAKERNEL_PROBE_SPV: &[u8] = include_bytes!("shaders/q6k_megakernel_p
 #[cfg(test)]
 const FFN_MEGAKERNEL_SPV: &[u8] = include_bytes!("shaders/ffn_megakernel.spv");
 const KV_WRITE_SPV: &[u8] = include_bytes!("shaders/kv_write.spv");
+// Test-only shaders (ignored GPU tests: slot-indirection, rp-skinny bench, barrier probes).
+#[cfg(test)]
+const DECODE_MATVEC_DOWN_Q4K_SPV: &[u8] = include_bytes!("shaders/decode_matvec_down_q4k.spv");
+#[cfg(test)]
+const BSDPA_SLOT_SPV: &[u8] = include_bytes!("shaders/bsdpa_slot.spv");
+#[cfg(test)]
+const KVWRITE_SLOT_SPV: &[u8] = include_bytes!("shaders/kvwrite_slot.spv");
+#[cfg(test)]
+const SKINNY_GEMM_Q4K_RP_SPV: &[u8] = include_bytes!("shaders/skinny_gemm_q4k_rp.spv");
+#[cfg(test)]
+const INC_SPV: &[u8] = include_bytes!("shaders/inc.spv");
+#[cfg(test)]
+const INC_COH_SPV: &[u8] = include_bytes!("shaders/inc_coh.spv");
 const KV_WRITE_HM_SPV: &[u8] = include_bytes!("shaders/kv_write_hm.spv"); // head-major write (ZLLM_HEADMAJOR_KV)
 const SDPA_FLASH_PARTIAL_HM_SPV: &[u8] = include_bytes!("shaders/sdpa_flash_partial_hm.spv"); // head-major partial (naga-gen)
 const KV_TRANSPOSE_HM_SPV: &[u8] = include_bytes!("shaders/kv_transpose_hm.spv"); // pos→head-major cache transpose (naga-gen)
@@ -63,13 +75,10 @@ const COOPMAT_ATTN_GEMM_SPV: &[u8] = include_bytes!("shaders/coopmat_attn_gemm.s
 const COOPMAT_ATTN_GEMM_N64_SPV: &[u8] = include_bytes!("shaders/coopmat_attn_gemm_n64.spv"); // BN=64 variant (PV, N=hd)
 const CAUSAL_SOFTMAX_SPV: &[u8] = include_bytes!("shaders/causal_softmax.spv");
 const COOPMAT_FLASH_ATTN_SPV: &[u8] = include_bytes!("shaders/coopmat_flash_attn.spv"); // fused FA (S never global)
-const BSDPA_SLOT_SPV: &[u8] = include_bytes!("shaders/bsdpa_slot.spv");
-const KVWRITE_SLOT_SPV: &[u8] = include_bytes!("shaders/kvwrite_slot.spv");
 const BSILU_SPV: &[u8] = include_bytes!("shaders/bsilu.spv");
 const TO_F16_SPV: &[u8] = include_bytes!("shaders/to_f16.spv");
 const BMV_Q4K_SPV: &[u8] = include_bytes!("shaders/batched_matvec_q4k.spv");
 const SKINNY_GEMM_Q4K_SPV: &[u8] = include_bytes!("shaders/skinny_gemm_q4k.spv");
-const SKINNY_GEMM_Q4K_RP_SPV: &[u8] = include_bytes!("shaders/skinny_gemm_q4k_rp.spv");
 const BMV_F16_SPV: &[u8] = include_bytes!("shaders/batched_matvec_f16.spv");
 const BMV_Q6K_SPV: &[u8] = include_bytes!("shaders/batched_matvec_q6k.spv");
 
@@ -87,8 +96,6 @@ pub const MAX_PREFILL_M: usize = PREFILL_MAX_M;
 /// prefill tile are served by CHUNKED prefill (tile-sized pieces at position
 /// offsets), so the fast-lane prompt bound is this cache size, not the tile.
 pub const MAX_SEQ: usize = 4096;
-const INC_SPV: &[u8] = include_bytes!("shaders/inc.spv");
-const INC_COH_SPV: &[u8] = include_bytes!("shaders/inc_coh.spv");
 
 /// A minimal raw-Vulkan compute context with cooperative matrix enabled.
 pub struct VkContext {
@@ -1009,7 +1016,7 @@ struct PrefillRes {
     lm_ql: ash::vk::Buffer, lm_qh: ash::vk::Buffer, lm_scl: ash::vk::Buffer, lm_dd: ash::vk::Buffer,
     final_norm: ash::vk::Buffer, logits: ash::vk::Buffer, logits_ptr: *mut u8,
     // scratch (sized for PREFILL_MAX_M rows)
-    x32: ash::vk::Buffer, x32_ptr: *mut u8, x16: ash::vk::Buffer,
+    x32: ash::vk::Buffer, x32_ptr: *mut u8, #[allow(dead_code)] x16: ash::vk::Buffer, // kept: pre-fused-QKV staging, still allocated
     n32: ash::vk::Buffer, n16: ash::vk::Buffer, q: ash::vk::Buffer, qk: ash::vk::Buffer,
     attn32: ash::vk::Buffer, attn16: ash::vk::Buffer, gu: ash::vk::Buffer,
     h32: ash::vk::Buffer, h16: ash::vk::Buffer, o32: ash::vk::Buffer, ffn32: ash::vk::Buffer,
@@ -1082,7 +1089,7 @@ unsafe fn vk_mk_mv(ctx: &VkContext, pool: ash::vk::DescriptorPool, mv_sl: ash::v
 
 #[derive(Clone)]
 struct VkLayerOps {
-    attn_norm: ash::vk::DescriptorSet, wq: Mv, wk: Mv, wv: Mv,
+    attn_norm: ash::vk::DescriptorSet, #[allow(dead_code)] wq: Mv, #[allow(dead_code)] wk: Mv, wv: Mv, // wq/wk superseded by the fused mvrope sets
     wq_rope: ash::vk::DescriptorSet, wk_rope: ash::vk::DescriptorSet, // QKV+rope fused (q/k)
     wqk_rope: Option<ash::vk::DescriptorSet>, // ZLLM_FUSED_QKV: one mvrope over concat wq+wk
     kvw_k: ash::vk::DescriptorSet, kvw_v: ash::vk::DescriptorSet, sdpa: ash::vk::DescriptorSet,
@@ -1104,7 +1111,7 @@ pub struct VkModel {
     l1_ptr: *mut u8, l2_ptr: *mut u8, // hierarchical-combine L1/L2 uniforms (refreshed per token)
     // descriptor sets
     layers: Vec<VkLayerOps>,
-    s_rope_q: ash::vk::DescriptorSet, s_rope_k: ash::vk::DescriptorSet, s_silu: ash::vk::DescriptorSet,
+    #[allow(dead_code)] s_rope_q: ash::vk::DescriptorSet, #[allow(dead_code)] s_rope_k: ash::vk::DescriptorSet, s_silu: ash::vk::DescriptorSet, // rope sets superseded by fused mvrope
     s_final_norm: ash::vk::DescriptorSet, s_lm: ash::vk::DescriptorSet, s_argmax: ash::vk::DescriptorSet,
     lm_q4: bool, // tied LM head is Q4_K (all-Q4 model) → Q4 matvec instead of Q6 (decode path)
     argmax_ptr: *mut u8,
@@ -1115,7 +1122,7 @@ pub struct VkModel {
     // pipelines (pipeline, layout)
     p_rms: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_mv: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     p_q3: (ash::vk::Pipeline, ash::vk::PipelineLayout), // Q3_K decode matvec (gate+up→Q3)
-    p_rope: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_kvw: (ash::vk::Pipeline, ash::vk::PipelineLayout),
+    #[allow(dead_code)] p_rope: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_kvw: (ash::vk::Pipeline, ash::vk::PipelineLayout), // p_rope superseded by fused mvrope
     p_sdpa: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_fp: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     p_fc: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_silu: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     p_ch: (ash::vk::Pipeline, ash::vk::PipelineLayout), // hierarchical (tree) flash combine
@@ -1124,7 +1131,7 @@ pub struct VkModel {
     p_fp2_hm: (ash::vk::Pipeline, ash::vk::PipelineLayout), // head-major flash partial (ZLLM_HEADMAJOR_KV)
     p_kvtr: (ash::vk::Pipeline, ash::vk::PipelineLayout, ash::vk::DescriptorSetLayout), // pos→head-major transpose
 
-    p_add: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_q6k: (ash::vk::Pipeline, ash::vk::PipelineLayout),
+    #[allow(dead_code)] p_add: (ash::vk::Pipeline, ash::vk::PipelineLayout), p_q6k: (ash::vk::Pipeline, ash::vk::PipelineLayout), // p_add superseded by acc-folded matvecs
     p_argmax: Pipe3, p_mvrope: (ash::vk::Pipeline, ash::vk::PipelineLayout),
     // Pre-allocated scratch for verify_forward (spec-decode), reused every call so
     // it doesn't vkAllocateMemory ~280 uniforms per verification (the overhead that
@@ -1304,10 +1311,10 @@ impl VkModel {
         let (v_buf, _) = vk_zeros(&ctx, &mut bufs, kv_dim);
         let (qk_buf, _) = vk_zeros(&ctx, &mut bufs, attn_dim + kv_dim); // fused QKV: q | k (q,k roped together)
         let (attn, _) = vk_zeros(&ctx, &mut bufs, attn_dim);
-        let (o_buf, _) = vk_zeros(&ctx, &mut bufs, n_embd);
+        let (_o_buf, _) = vk_zeros(&ctx, &mut bufs, n_embd);
         let (gu, _) = vk_zeros(&ctx, &mut bufs, n_inter * 2); // [gate(n_inter); up(n_inter)]
         let (hbuf, _) = vk_zeros(&ctx, &mut bufs, n_inter);
-        let (ffn_buf, _) = vk_zeros(&ctx, &mut bufs, n_embd);
+        let (_ffn_buf, _) = vk_zeros(&ctx, &mut bufs, n_embd);
         let (logits, logits_ptr) = vk_zeros(&ctx, &mut bufs, vocab);
         let nblk_max = max_seq.div_ceil(SDPA_FLASH_BLOCK);
         let (part, _) = vk_zeros(&ctx, &mut bufs, n_head * nblk_max * (hd + 2));
@@ -1323,7 +1330,7 @@ impl VkModel {
         let (u_l1, l1_ptr) = vk_uni8p(&ctx, &mut bufs, [n_head as u32, n_kv as u32, hd as u32, 1, SDPA_SUPER as u32, 0, 0, 0]);
         let (u_l2, l2_ptr) = vk_uni8p(&ctx, &mut bufs, [n_head as u32, n_kv as u32, hd as u32, 1, 1, 1, 0, 0]);
         let (u_silu, _) = vk_uni(&ctx, &mut bufs, [n_inter as u32, 0, 0, 0]);
-        let (u_add, _) = vk_uni(&ctx, &mut bufs, [n_embd as u32, 0, 0, 0]);
+        let (_u_add, _) = vk_uni(&ctx, &mut bufs, [n_embd as u32, 0, 0, 0]);
         let gxof = |n: usize| (n as u32).min(65535);
         let (u_lm, _) = vk_uni(&ctx, &mut bufs, [vocab as u32, lm_nb as u32, gxof(vocab), 0]);
 
@@ -1347,7 +1354,7 @@ impl VkModel {
         let (f2hm_p, f2hm_l, _f2hm_sl) = mkpipe(SDPA_FLASH_PARTIAL_HM_SPV, 4);   // head-major partial (same {q,kc,vc,part}+uniform layout as fp2)
         let (kvtr_p, kvtr_l, kvtr_sl) = mkpipe(KV_TRANSPOSE_HM_SPV, 2);          // one-time pos→head-major cache transpose
         let (silu_p, silu_l, silu_sl) = mkpipe(SILU_MUL_SPV, 3);
-        let (add_p, add_l, add_sl) = mkpipe(RESIDUAL_ADD_SPV, 2);
+        let (add_p, add_l, _add_sl) = mkpipe(RESIDUAL_ADD_SPV, 2);
         let (q6k_p, q6k_l, q6k_sl) = mkpipe(DECODE_MATVEC_Q6K_SPV, 6);
         let (argmax_p, argmax_l, argmax_sl) = mkpipe(ARGMAX_SPV, 2);
         let (mvr_p, mvr_l, mvr_sl) = mkpipe(DECODE_MATVEC_Q4K_ROPE_SPV, 5); // fused QKV+rope (q/k)
@@ -2700,8 +2707,8 @@ mod tests {
     #[test]
     #[ignore]
     fn vk_fused_decode_throughput() {
-        use candle_core::{Device, Tensor};
-        use candle_core::quantized::{QTensor, GgmlDType};
+        
+        
         let ctx = match VkContext::new() {
             Ok(c) => c,
             Err(e) => { eprintln!("no Vulkan coopmat device ({e}); skipping"); return; }
@@ -3150,7 +3157,7 @@ mod tests {
             (n, next, pos)
         }
         fn dec_cb(m: &mut CandleCpuBackend, mut next: u32, dur: Duration) -> (usize, u32) {
-            use crate::backend::traits::Backend;
+            
             let am = |v: &[f32]| -> u32 { let mut bi = 0u32; let mut bv = f32::MIN; for (i, &x) in v.iter().enumerate() { if x > bv { bv = x; bi = i as u32; } } bi };
             let t = Instant::now(); let mut n = 0usize;
             while t.elapsed() < dur { next = am(&m.forward_logits(&[next]).unwrap()); n += 1; }
@@ -3594,7 +3601,7 @@ unsafe fn sdpa_bench_inner(ctx: &VkContext) {
     let seq: usize = std::env::var("ZLLM_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(2048);
     let (n_head, n_kv, hd) = (32usize, 8usize, 64usize);
     let nblk = seq.div_ceil(SDPA_FLASH_BLOCK);
-    let rnd = |i: usize, s: usize| (((i.wrapping_mul(2654435761).wrapping_add(s.wrapping_mul(40503))) & 0xFFFF) as f32 / 32768.0 - 1.0);
+    let rnd = |i: usize, s: usize| ((i.wrapping_mul(2654435761).wrapping_add(s.wrapping_mul(40503))) & 0xFFFF) as f32 / 32768.0 - 1.0;
     let mk = |data: Vec<f32>| { let (b, _m, p) = ctx.uma_buffer((data.len() * 4) as u64).unwrap(); std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, p, data.len() * 4); b };
     let q = mk((0..n_head * hd).map(|i| rnd(i, 1)).collect());
     let kc = mk((0..seq * n_kv * hd).map(|i| rnd(i, 2)).collect());
@@ -4054,7 +4061,7 @@ unsafe fn sdpa_case(ctx: &VkContext, seq_len: usize, flash: bool) {
     let dev = &ctx.device;
     let (n_head, n_kv, hd) = (32usize, 8usize, 64usize);
     let qn = n_head * hd; let kvn = seq_len * n_kv * hd;
-    let rnd = |i: usize, s: usize| (((i.wrapping_mul(2654435761).wrapping_add(s.wrapping_mul(40503))) & 0xFFFF) as f32 / 32768.0 - 1.0);
+    let rnd = |i: usize, s: usize| ((i.wrapping_mul(2654435761).wrapping_add(s.wrapping_mul(40503))) & 0xFFFF) as f32 / 32768.0 - 1.0;
     let qd: Vec<f32> = (0..qn).map(|i| rnd(i, 1)).collect();
     let kd: Vec<f32> = (0..kvn).map(|i| rnd(i, 2)).collect();
     let vd: Vec<f32> = (0..kvn).map(|i| rnd(i, 3)).collect();

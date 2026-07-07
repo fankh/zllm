@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.9.0 — 2026-07-07
+
+Performance: prefill rebuilt around WMMA attention; TTFT transformed; the
+white-box feature set made real and live-verified. Head-to-head vs llama.cpp
+Vulkan (same box/model/session): decode 1.11x FASTER (213.6 vs 191.8 tok/s,
+bit-exact), prefill@1024 0.86x (4063 vs 4722 tok/s, was 0.49x), batched
+B=8 0.16x (the remaining gap; wgpu backend). See BENCHMARKS.md.
+
+### Prefill / TTFT (raw-Vulkan engine)
+- Fused coopmat FLASH ATTENTION (default): S never materialized; online causal
+  softmax in LDS between WMMA GEMM halves. Prefill SDPA 115 -> ~37 ms; 1024-tok
+  prefill 341 -> 262 ms. A/B: VK_FA3 (3-phase), VK_SCALAR_SDPA (scalar).
+- Chunked batched prefill at position offsets: prompts beyond one 1024 tile run
+  as tiles against the resident cache (bsdpa_offset -> fused FA). 2036-tok
+  prompt: ~20 s (CPU fallback) -> 0.83 s end-to-end.
+- Fast-lane prompt cap 128 -> 4096 (stale gate; 902-tok TTFT 9.5 s -> 0.49 s).
+- Cross-request PREFIX CACHE on the fast lane: warm system-prompt turns
+  prefill only the suffix (906-tok prefix: 424 -> 48 ms).
+- Coopmat GEMM: BK=32 sub-block alignment (+2%); NOLOAD probe showed the core
+  is issue-bound (~40 ms total memory work) — double-buffering rejected by data.
+- glslang 16.3 toolchain installed (C:/tools/glslang), byte-identical rebuilds.
+
+### Decode / long context
+- Head-major KV cache (ZLLM_HEADMAJOR_KV): contiguous per-head reads,
+  +5-12% at depth, model-general (hd<=64), bit-exact, opt-in.
+
+### Batched serving (wgpu CB)
+- Packed-f16 KV block pool: half the KV bytes, 2x resident streams per GB;
+  pack-scatter kernel replaces per-row copies; swap round-trip still bit-exact.
+- Skinny Q4_K GEMM for M<=2 decode batches (+56% at M=1); single-stream wgpu
+  decode 53 -> 80 tok/s. Skinny wall decomposed into 3 documented limits.
+
+### White-box features (audited: real, live-verified)
+- Hallucination/uncertainty detection (detect_hallucination): per-token
+  entropy/top-prob report; cold-prefill for bit-reproducible scores.
+- Hook WRITE-BACK: per-layer callback returns Option<Tensor>; steering and
+  memory-inject edit the live residual stream (inject gated OFF by default —
+  engine.memory_inject_alpha, live A/B showed uncurated inject derails a 1B).
+- Grammar-constrained decoding: regex mode (anchored byte-DFA token masking,
+  EOS only at full match); ban: mode; json/bnf reject with 400.
+- Honest surfaces: /v1/info reflects reality; unimplemented options fail loud;
+  README/SUMMARY rewritten to match the code; dead scaffolds deleted.
+
+### Code organization
+- Binary now consumes the library crate (no dual compilation of the module
+  tree). ZERO build warnings across default/vulkan/gpu configs.
+- TESTING.md manual playbook; BENCHMARKS.md head-to-head + addenda.
+
+
 ## v0.8.0 — 2026-06-16
 
 Inference performance: CPU brought to parity with llama.cpp, and a new

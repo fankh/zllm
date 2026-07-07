@@ -107,6 +107,32 @@ curl http://localhost:8080/health
 ./target/release/zllm --help
 ```
 
+## Configuration reference
+
+Config file (`configs/*.toml`): `[server]` rest_port, max_concurrent; `[model]`
+path (GGUF), tokenizer_path, dir (picker scan); `[engine]` backend_pool_size,
+draft_model_path (spec-decode), memory_inject_alpha (0.0 = inject off),
+default_temperature/top_k/top_p.
+
+Environment flags (deployment / opt-in features):
+
+| flag | effect |
+|---|---|
+| `ZLLM_VK=1` | load the raw-Vulkan iGPU fast lane (needs `--features vulkan`) |
+| `ZLLM_CB=1` | continuous-batching server (needs `--features gpu`; `ZLLM_CB_SLOTS`, `ZLLM_CB_PLD`) |
+| `ZLLM_HEADMAJOR_KV=1` | head-major KV layout: +5-12% long-context decode (opt-in) |
+| `ZLLM_NO_PIN=1` | disable physical-core pinning of the rayon pool |
+| `RUST_LOG` / `RAYON_NUM_THREADS` | standard logging / CPU worker cap |
+
+A/B + diagnostics (regression comparison, not for production): `VK_FA3`,
+`VK_SCALAR_SDPA` (attention kernel generations), `ZLLM_FLAT_COMBINE`,
+`ZLLM_ONLINE_PARTIAL`, `VK_MVONLY`/`VK_NO*`/`VK_PF_*` (cost attribution),
+`VK_PFTIME` (prefill timing), `ZLLM_FIRST_FIT` (cache-reclaim policy),
+`ZLLM_SWAP` (swap-to-host preemption — loses on UMA, keep off),
+`ZLLM_Q3_GATEUP`/`ZLLM_FUSED_QKV` (measured-parity experiments, keep off).
+Runtime toggles (REST): `/v1/inspect/enabled`, `/v1/early_exit/enabled`(+`/config`),
+`/v1/pld/enabled`, `/v1/spec_decode/enabled`. See TESTING.md for a full playbook.
+
 ## Architecture
 
 See [ai-inference-engine docs](https://github.com/fankh/new-research/tree/main/ai-inference-engine) for full architecture specification.

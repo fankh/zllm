@@ -532,7 +532,7 @@ pub unsafe fn gemv_q4_k_8x8_q8_k_avx2(
     weights: &[BlockQ4Kx8],
     activation: &[BlockQ8K],
     output: &mut [f32; 8],
-) {
+) { unsafe {
     use std::arch::x86_64::*;
     assert_eq!(weights.len(), activation.len(),
         "weight and activation block counts must match");
@@ -731,7 +731,7 @@ pub unsafe fn gemv_q4_k_8x8_q8_k_avx2(
     let acc_row = _mm256_permutevar8x32_ps(acc_row, finalpermutemask);
     let result = _mm256_sub_ps(acc_row, acc_min_rows);
     _mm256_storeu_ps(output.as_mut_ptr(), result);
-}
+}}
 
 /// Reverse the repack: `BlockQ4Kx8` → `[BlockQ4K; 8]`.
 /// Inverse of `repack_q4_k_to_q4_kx8`. Lets us validate that the
@@ -926,7 +926,7 @@ pub fn quantize_mat_q8_k_4x8_scalar(x: &[f32], y: &mut [BlockQ8Kx4], k: usize) {
 /// to support AVX2 + AVX (caller must check `is_x86_feature_detected!`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
-pub unsafe fn quantize_mat_q8_k_4x8_avx2(x: &[f32], y: &mut [BlockQ8Kx4], k: usize) {
+pub unsafe fn quantize_mat_q8_k_4x8_avx2(x: &[f32], y: &mut [BlockQ8Kx4], k: usize) { unsafe {
     use std::arch::x86_64::*;
     assert_eq!(k % QK_K, 0, "k must be a multiple of QK_K=256");
     assert_eq!(x.len(), 4 * k, "x must hold 4 rows of k floats");
@@ -1083,7 +1083,7 @@ pub unsafe fn quantize_mat_q8_k_4x8_avx2(x: &[f32], y: &mut [BlockQ8Kx4], k: usi
             }
         }
     }
-}
+}}
 
 /// Public dispatcher — picks AVX2 path when supported, scalar otherwise.
 /// Output is byte-identical between the two paths (verified by tests).
@@ -1218,8 +1218,8 @@ mod tests {
     ) -> (Vec<BlockQ4Kx8>, Vec<BlockQ8K>) {
         let inputs: [BlockQ4K; 8] = std::array::from_fn(|r| {
             let mut scales = [0u8; K_SCALE_SIZE];
-            let ls: [u8; 8] = std::array::from_fn(|j| (5 + ((j + r) as u32 + seed) as u8 % 8));
-            let lm: [u8; 8] = std::array::from_fn(|j| (3 + ((j + r * 2) as u32 + seed * 3) as u8 % 8));
+            let ls: [u8; 8] = std::array::from_fn(|j| 5 + ((j + r) as u32 + seed) as u8 % 8);
+            let lm: [u8; 8] = std::array::from_fn(|j| 3 + ((j + r * 2) as u32 + seed * 3) as u8 % 8);
             for j in 0..4 {
                 scales[j] = ls[j];
                 scales[j + 4] = lm[j];
@@ -1457,8 +1457,8 @@ mod tests {
         let inputs: [BlockQ4K; 8] = std::array::from_fn(|r| {
             let mut scales = [0u8; K_SCALE_SIZE];
             // ls/lm per sub-block — small values for sane dequant.
-            let ls: [u8; 8] = std::array::from_fn(|j| (5 + (j + r) as u8 % 8));
-            let lm: [u8; 8] = std::array::from_fn(|j| (3 + (j + r * 2) as u8 % 8));
+            let ls: [u8; 8] = std::array::from_fn(|j| 5 + (j + r) as u8 % 8);
+            let lm: [u8; 8] = std::array::from_fn(|j| 3 + (j + r * 2) as u8 % 8);
             for j in 0..4 {
                 scales[j] = ls[j];
                 scales[j + 4] = lm[j];
@@ -1577,7 +1577,7 @@ mod tests {
         // shift/mask plumbing).
         let inputs: [BlockQ4K; 8] = std::array::from_fn(|i| BlockQ4K {
             d: 0, dmin: 0,
-            scales: std::array::from_fn(|j| ((i as u8 * 13).wrapping_add(j as u8 * 7))),
+            scales: std::array::from_fn(|j| (i as u8 * 13).wrapping_add(j as u8 * 7)),
             qs: [0; QK_K / 2],
         });
         let out = repack_q4_k_to_q4_kx8(&inputs);
@@ -1654,6 +1654,7 @@ mod tests {
         }
         let scalar_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
+        #[allow(unused_assignments)] // overwritten on x86_64 (the only tested arch)
         let mut have_avx2 = false;
         #[cfg(target_arch = "x86_64")]
         {
@@ -1703,6 +1704,7 @@ mod tests {
         for _ in 0..iters { quantize_mat_q8_k_4x8_scalar(&x, &mut y, k); }
         let scalar_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
+        #[allow(unused_assignments)] // overwritten on x86_64 (the only tested arch)
         let mut have_avx2 = false;
         #[cfg(target_arch = "x86_64")]
         {

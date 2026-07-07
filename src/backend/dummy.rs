@@ -5,7 +5,7 @@ use std::path::Path;
 
 pub struct DummyBackend {
     vocab_size: usize,
-    d_model: usize,
+    #[allow(dead_code)] d_model: usize, // part of the Backend construction contract
     n_layers: usize,
     next_block_id: BlockId,
     hidden_states: Vec<Tensor>,

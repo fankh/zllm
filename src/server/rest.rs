@@ -697,7 +697,7 @@ struct ChatRequest {
     top_k: Option<usize>,
     /// Optional RNG seed for reproducible sampling (continuous-batching lane).
     #[serde(default)]
-    seed: Option<u32>,
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))] seed: Option<u32>, // consumed by the CB fast lane (feature = "gpu")
     /// Optional logit-constraint string. v0.5 supports `"ban:<id>,<id>,…"`;
     /// see `engine::logit_fsm::LogitFSM` for the full list of modes.
     /// Non-OpenAI-standard but cheap to add and useful for the
@@ -953,6 +953,7 @@ async fn text_completions(
 }
 
 #[derive(Deserialize)]
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))] // consumed only by the CB fast lane
 struct CbRequest {
     prompt: String,
     #[serde(default = "default_max_tokens")]
@@ -970,7 +971,7 @@ struct CbRequest {
     top_p: Option<f32>,
     /// Optional RNG seed for reproducible sampling.
     #[serde(default)]
-    seed: Option<u32>,
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))] seed: Option<u32>, // consumed by the CB fast lane (feature = "gpu")
 }
 
 /// Continuous-batching completion (`/v1/cb/completions`). Routes to the
@@ -1240,7 +1241,7 @@ fn generate_spec_decode(
     s: &AppState,
     prompt_tokens: Vec<u32>,
     max_tokens: usize,
-    sampler_cfg: &SamplerConfig,
+    _sampler_cfg: &SamplerConfig,
 ) -> (String, usize, usize, &'static str) {
     let prompt_len = prompt_tokens.len();
     let eos = s.tokenizer.read().unwrap().eos_token_id().unwrap_or(128001);
@@ -1272,7 +1273,7 @@ fn generate_spec_decode(
     };
 
     const SPEC_K: usize = 5;
-    let mut finish_reason: &'static str = "stop";
+    let finish_reason: &'static str = "stop";
     while generated_ids.len() < max_tokens {
         let iter = crate::engine::spec_decode::spec_iter(
             backend, draft, &last_main_logit, &last_draft_logit, SPEC_K,

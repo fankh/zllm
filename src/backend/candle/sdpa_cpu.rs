@@ -24,7 +24,9 @@
 //! path — its arithmetic intensity is high enough that the copies
 //! amortize.
 
-use candle_core::{Device, DType, Result, Storage, Tensor, WithDType};
+use candle_core::{Result, Storage, Tensor, WithDType};
+#[cfg(test)]
+use candle_core::Device;
 
 /// Compute `softmax(Q·Kᵀ / √d) · V` with GQA: each Q head reads from
 /// the KV head at index `q_head / (n_head / n_kv_head)`.
@@ -101,7 +103,6 @@ pub fn sdpa_gqa_decode(
                     &mut out, &mut scores,
                 );
             }
-            drop(qd); drop(kd); drop(vd);
             drop(qs); drop(ks); drop(vs);
             return Tensor::from_vec(out, (1, 1, n_head * head_dim), q.device());
         }
@@ -115,7 +116,6 @@ pub fn sdpa_gqa_decode(
         &mut out, &mut scores,
     );
 
-    drop(qd); drop(kd); drop(vd);
     drop(qs); drop(ks); drop(vs);
     Tensor::from_vec(out, (1, 1, n_head * head_dim), q.device())
 }

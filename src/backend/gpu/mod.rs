@@ -56,6 +56,7 @@ pub struct GpuContext {
     bsdpa_pipeline: wgpu::ComputePipeline,
     /// Batched decode: per-stream SDPA (each of M concurrent streams attends
     /// its OWN KV cache at its OWN position) and per-stream argmax.
+    #[allow(dead_code)] // superseded by the paged variant; kept for the non-paged A/B path
     bdsdpa_pipeline: wgpu::ComputePipeline,
     /// Paged variant of bdsdpa: the KV is a shared block pool and each stream's
     /// key positions are gathered through a per-slot block table (PagedAttention).
@@ -269,6 +270,7 @@ impl GpuContext {
         p.set_pipeline(&self.brope_pipeline); p.set_bind_group(0, &bg, &[]);
         p.dispatch_workgroups(total.div_ceil(64), 1, 1);
     }
+    #[allow(dead_code)] // superseded by record_bdsdpa_paged; kept for non-paged debugging
     #[allow(clippy::too_many_arguments)]
     fn record_bsdpa(&self, enc: &mut wgpu::CommandEncoder, q: &wgpu::Buffer, kc: &wgpu::Buffer, vc: &wgpu::Buffer, out: &wgpu::Buffer, n_head: usize, n_kv_head: usize, head_dim: usize, m_rows: usize, pos: usize) {
         use wgpu::util::DeviceExt;
@@ -282,6 +284,7 @@ impl GpuContext {
         p.dispatch_workgroups(((m_rows * n_head) as u32).div_ceil(64), 1, 1);
     }
     /// Batched DECODE SDPA: each of `m` streams attends its own KV cache.
+    #[allow(dead_code)] // superseded by the paged variant; kept for non-paged debugging
     #[allow(clippy::too_many_arguments)]
     fn record_bdsdpa(&self, enc: &mut wgpu::CommandEncoder, q: &wgpu::Buffer, kc: &wgpu::Buffer, vc: &wgpu::Buffer, out: &wgpu::Buffer, posb: &wgpu::Buffer, slots: &wgpu::Buffer, n_head: usize, n_kv_head: usize, head_dim: usize, m: usize, max_seq: usize) {
         use wgpu::util::DeviceExt;
@@ -2308,6 +2311,7 @@ fn bge(binding: u32, buf: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
 
 impl GpuContext {
     /// Record a matvec for either quantization.
+    #[allow(dead_code)] // superseded by record_gemm(m=1)/skinny; kept for kernel A/B
     fn record_mv(&self, enc: &mut wgpu::CommandEncoder, w: &ResidentWeight, x: &wgpu::Buffer, out: &wgpu::Buffer) {
         let bg = self.bg_matvec(w, x, out);
         self.pass_matvec(enc, w, &bg);
@@ -2350,11 +2354,13 @@ impl GpuContext {
             layout: &self.sdpa_pipeline.get_bind_group_layout(0),
             entries: &[bge(0, q), bge(1, kc), bge(2, vc), bge(3, out), bge(4, p)] })
     }
+    #[allow(dead_code)] // superseded by fused kernels; kept for kernel A/B
     fn bg_silu(&self, gate: &wgpu::Buffer, up: &wgpu::Buffer, h: &wgpu::Buffer) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None,
             layout: &self.silu_mul_pipeline.get_bind_group_layout(0),
             entries: &[bge(0, gate), bge(1, up), bge(2, h)] })
     }
+    #[allow(dead_code)] // superseded by acc-folded matvecs; kept for kernel A/B
     fn bg_add(&self, a: &wgpu::Buffer, b: &wgpu::Buffer) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None,
             layout: &self.add_pipeline.get_bind_group_layout(0),
@@ -2412,6 +2418,7 @@ struct PrefillLayerBg {
 /// (only `m_rows` is rewritten per call), and per-layer cached bind groups.
 /// Built lazily on the first `prefill_forward` so decode-only users don't pay
 /// the ~70 MB + bind-group cost.
+#[allow(dead_code)] // several staging buffers superseded by later kernel folds; kept allocated
 struct PrefillCache {
     x_b: wgpu::Buffer, normed_b: wgpu::Buffer, q_b: wgpu::Buffer,
     k_b: wgpu::Buffer, v_b: wgpu::Buffer, attn_b: wgpu::Buffer,
@@ -2428,6 +2435,7 @@ struct PrefillCache {
 /// per layer on the GPU. `forward(token, pos)` runs the entire decode token
 /// in ONE command buffer (1 CPU↔GPU sync) — the design that makes GPU
 /// decode beat the CPU.
+#[allow(dead_code)] // several staging buffers superseded by fused kernels; kept allocated for A/B paths
 pub struct GpuModel {
     ctx: GpuContext,
     layers: Vec<GpuLayer>,
@@ -2437,10 +2445,11 @@ pub struct GpuModel {
     embed: Vec<f32>,            // dequantized token-embedding table [vocab*n_embd]
     cos: Vec<f32>, sin: Vec<f32>,   // [max_seq * head_dim/2]
     // persistent per-token buffers (allocated once, content rewritten per token)
+    #[allow(dead_code)] // several fields superseded by later kernel folds; kept allocated
     x_buf: wgpu::Buffer, cos_buf: wgpu::Buffer, sin_buf: wgpu::Buffer,
-    normed: wgpu::Buffer, q: wgpu::Buffer, k: wgpu::Buffer, v: wgpu::Buffer,
-    attn_out: wgpu::Buffer, o: wgpu::Buffer,
-    gate: wgpu::Buffer, up: wgpu::Buffer, h: wgpu::Buffer, ffn_out: wgpu::Buffer,
+    #[allow(dead_code)] normed: wgpu::Buffer, q: wgpu::Buffer, k: wgpu::Buffer, v: wgpu::Buffer,
+    #[allow(dead_code)] attn_out: wgpu::Buffer, o: wgpu::Buffer,
+    #[allow(dead_code)] gate: wgpu::Buffer, up: wgpu::Buffer, h: wgpu::Buffer, ffn_out: wgpu::Buffer,
     logits: wgpu::Buffer,
     norm_p: wgpu::Buffer, rope_q_p: wgpu::Buffer, rope_k_p: wgpu::Buffer, sdpa_p: wgpu::Buffer,
     final_norm_op: wgpu::BindGroup, lm_op: wgpu::BindGroup,
@@ -4104,6 +4113,7 @@ impl GpuBatchServer {
         loop { // one iteration per loaded model
             let mut cb = ContinuousBatcher::new(&model, m_max, max_seq);
             let mut chans: std::collections::HashMap<u64, tokio::sync::mpsc::UnboundedSender<Option<u32>>> = Default::default();
+            #[allow(unused_assignments)] // the None init is dead: every path to the consumer sets Some
             let mut reload: Option<(String, std::sync::mpsc::Sender<bool>)> = None;
             'serve: loop {
                 // Idle (nothing active, prefilling, or preempted) → block for a message.

@@ -38,7 +38,7 @@ use candle_transformers::quantized_nn::RmsNorm;
 
 use crate::backend::candle::q4k_repack::{
     BlockQ4K, BlockQ4Kx8, BlockQ8K, QK_K,
-    gemm_q4_k_8x8_q8_k, gemv_q4_k_8x8_q8_k, matvec_q4k_8x8_par,
+    gemm_q4_k_8x8_q8_k, matvec_q4k_8x8_par,
     quantize_q8_k, repack_q4_k_to_q4_kx8,
 };
 use crate::backend::candle::q4k_avx512::vec_dot_q4k_q8k;

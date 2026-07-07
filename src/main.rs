@@ -1,13 +1,10 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-mod backend;
-mod config;
-mod control_plane;
-mod engine;
-mod error;
-mod metrics;
-mod server;
+// The binary consumes the LIBRARY crate (one compilation of the module tree,
+// shared with tests/benches) instead of re-declaring `mod ...` — that double
+// compilation also made bin-side dead-code analysis flag every lib-only item.
+use zllm::{backend, config, control_plane, engine, server};
 
 #[derive(Parser)]
 #[command(name = "zllm")]
@@ -401,9 +398,9 @@ async fn main() -> anyhow::Result<()> {
             tokenizer,
             prompt,
             max_tokens,
-            temperature,
-            top_k,
-            top_p,
+            temperature: _,
+            top_k: _,
+            top_p: _,
         } => {
             use backend::candle::backend::CandleCpuBackend;
             use backend::candle::tokenizer::LlamaTokenizer;
@@ -529,7 +526,7 @@ async fn main() -> anyhow::Result<()> {
 
             #[cfg(feature = "profile")]
             {
-                let snap = crate::backend::candle::quantized_llama_fork::TIMING.snapshot();
+                let snap = zllm::backend::candle::quantized_llama_fork::TIMING.snapshot();
                 let nf = snap.n_forwards.max(1) as f64;
                 eprintln!("--- profile (per forward, n={}) ---", snap.n_forwards);
                 eprintln!("  total      {:.3} ms", snap.total_ms as f64 / nf);
