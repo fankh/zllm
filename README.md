@@ -14,6 +14,8 @@ White-box LLM inference engine with zero-copy latent intercept.
   (predictive entropy / top-prob), opt-in via `detect_hallucination` — also
   available for *other* servers (llama.cpp, vLLM, ...) via the spin-off
   [zllm-probe](https://github.com/fankh/zllm-probe) drop-in proxy
+- OpenAI-compatible **logprobs** (`logprobs: true` + `top_logprobs: N` on chat;
+  integer `logprobs` on legacy completions)
 - **Grammar-constrained decoding**: `regex:<pattern>` (anchored byte-DFA token
   masking — output is guaranteed to match) and `ban:<ids>` token banning.
   *JSON-schema/BNF modes not yet implemented (requests are rejected with 400).*

@@ -708,6 +708,13 @@ struct ChatRequest {
     /// response. Forces the candle path (full per-token logits) like inspection.
     #[serde(default)]
     detect_hallucination: Option<bool>,
+    /// OpenAI-compatible logprobs: `logprobs: true` returns each generated
+    /// token's log-probability; `top_logprobs: N` (0..=20) adds the top-N
+    /// alternatives. Forces the candle path like detection.
+    #[serde(default)]
+    logprobs: Option<bool>,
+    #[serde(default)]
+    top_logprobs: Option<u32>,
 }
 
 fn sampler_from_request(
@@ -767,10 +774,16 @@ async fn chat_completions(
         },
         None => None,
     };
-    // Hallucination detection is only wired into the non-streaming path.
+    // Hallucination detection and logprobs are only wired into the
+    // non-streaming path.
     if req.detect_hallucination.unwrap_or(false) && req.stream {
         return (StatusCode::BAD_REQUEST, Json(json!({
             "error": "detect_hallucination is not supported with stream=true yet; use stream=false"
+        }))).into_response();
+    }
+    if req.logprobs.unwrap_or(false) && req.stream {
+        return (StatusCode::BAD_REQUEST, Json(json!({
+            "error": "logprobs is not supported with stream=true yet; use stream=false"
         }))).into_response();
     }
 
@@ -780,7 +793,7 @@ async fn chat_completions(
     // the candle-only features (grammar / spec-decode / PLD / early-exit) are on,
     // since the CB engine doesn't implement those. Greedy or temp/top-k/top-p.
     #[cfg(feature = "gpu")]
-    if let Some(server) = cb_chat_server(&s, fsm.is_none() && !req.detect_hallucination.unwrap_or(false)) {
+    if let Some(server) = cb_chat_server(&s, fsm.is_none() && !req.detect_hallucination.unwrap_or(false) && !req.logprobs.unwrap_or(false)) {
         let prompt_tokens = tokens.len();
         let temp = sampler_cfg.temperature;
         let params = if temp <= 0.0 {
@@ -810,9 +823,13 @@ async fn chat_completions(
     } else {
         let mut detector = req.detect_hallucination.unwrap_or(false)
             .then(|| crate::engine::hallucination::Detector::new(Default::default()));
+        let mut lp = req.logprobs.unwrap_or(false).then(|| {
+            crate::engine::logprobs::LogprobsCollector::new(req.top_logprobs.unwrap_or(0) as usize)
+        });
         let (text, prompt_tokens, completion_tokens, finish_reason) =
-            generate_blocking(&s, tokens, max_tokens, &sampler_cfg, fsm.as_ref(), &id, detector.as_mut());
+            generate_blocking(&s, tokens, max_tokens, &sampler_cfg, fsm.as_ref(), &id, detector.as_mut(), lp.as_mut());
         let hallu = detector.map(|d| hallucination_json(&d.report()));
+        let logprobs_json = lp.map(|c| chat_logprobs_json(&s, &c));
         let now = unix_secs();
         let mut resp = json!({
             "id": id,
@@ -835,6 +852,9 @@ async fn chat_completions(
         // llm-probe proxy's T2 battery test).
         if let Some(h) = hallu {
             resp["hallucination"] = h;
+        }
+        if let Some(l) = logprobs_json {
+            resp["choices"][0]["logprobs"] = l;
         }
         Json(resp).into_response()
     }
@@ -860,6 +880,11 @@ struct CompletionRequest {
     /// response. Forces the candle path (full per-token logits) like inspection.
     #[serde(default)]
     detect_hallucination: Option<bool>,
+    /// Legacy OpenAI completions logprobs: an INTEGER N returns each token's
+    /// logprob plus the top-N alternatives (`{tokens, token_logprobs,
+    /// top_logprobs}` response shape). Forces the candle path.
+    #[serde(default)]
+    logprobs: Option<u32>,
 }
 
 /// Build a LogitFSM from a request's `grammar` string, supplying the cached
@@ -934,8 +959,11 @@ async fn text_completions(
     };
     let mut detector = req.detect_hallucination.unwrap_or(false)
         .then(|| crate::engine::hallucination::Detector::new(Default::default()));
-    let (text, p, c, finish_reason) = generate_blocking(&s, tokens, req.max_tokens, &sampler_cfg, fsm.as_ref(), &id, detector.as_mut());
+    let mut lp = req.logprobs
+        .map(|n| crate::engine::logprobs::LogprobsCollector::new(n as usize));
+    let (text, p, c, finish_reason) = generate_blocking(&s, tokens, req.max_tokens, &sampler_cfg, fsm.as_ref(), &id, detector.as_mut(), lp.as_mut());
     let hallu = detector.map(|d| hallucination_json(&d.report()));
+    let logprobs_json = lp.map(|col| legacy_logprobs_json(&s, &col));
     let now = unix_secs();
     let mut resp = json!({
         "id": id,
@@ -957,7 +985,46 @@ async fn text_completions(
     if let Some(h) = hallu {
         resp["hallucination"] = h;
     }
+    if let Some(l) = logprobs_json {
+        resp["choices"][0]["logprobs"] = l;
+    }
     Json(resp).into_response()
+}
+
+/// OpenAI CHAT logprobs shape: `{"content": [{token, logprob, bytes,
+/// top_logprobs: [{token, logprob, bytes}]}]}`.
+fn chat_logprobs_json(s: &AppState, c: &crate::engine::logprobs::LogprobsCollector) -> serde_json::Value {
+    let tok = s.tokenizer.read().unwrap();
+    let dec = |id: u32| tok.decode(&[id]).unwrap_or_default();
+    let content: Vec<serde_json::Value> = c.entries.iter().map(|e| {
+        let t = dec(e.token_id);
+        json!({
+            "token": t,
+            "logprob": e.logprob,
+            "bytes": t.as_bytes(),
+            "top_logprobs": e.top.iter().map(|(id, lp)| {
+                let tt = dec(*id);
+                json!({"token": tt, "logprob": lp, "bytes": tt.as_bytes()})
+            }).collect::<Vec<_>>()
+        })
+    }).collect();
+    json!({ "content": content })
+}
+
+/// Legacy COMPLETIONS logprobs shape: `{tokens, token_logprobs,
+/// top_logprobs: [{token: logprob}]}`.
+fn legacy_logprobs_json(s: &AppState, c: &crate::engine::logprobs::LogprobsCollector) -> serde_json::Value {
+    let tok = s.tokenizer.read().unwrap();
+    let dec = |id: u32| tok.decode(&[id]).unwrap_or_default();
+    let tokens: Vec<String> = c.entries.iter().map(|e| dec(e.token_id)).collect();
+    let token_logprobs: Vec<f32> = c.entries.iter().map(|e| e.logprob).collect();
+    let top: Vec<serde_json::Value> = c.entries.iter().map(|e| {
+        let m: serde_json::Map<String, serde_json::Value> = e.top.iter()
+            .map(|(id, lp)| (dec(*id), json!(lp)))
+            .collect();
+        serde_json::Value::Object(m)
+    }).collect();
+    json!({ "tokens": tokens, "token_logprobs": token_logprobs, "top_logprobs": top })
 }
 
 #[derive(Deserialize)]
@@ -1433,15 +1500,18 @@ fn generate_blocking(
     fsm: Option<&LogitFSM>,
     request_id: &str,
     mut detect: Option<&mut crate::engine::hallucination::Detector>,
+    mut lp: Option<&mut crate::engine::logprobs::LogprobsCollector>,
 ) -> (String, usize, usize, &'static str) {
     // Spec-decode fast path: redirect to the dedicated handler if every
     // precondition holds. Keeps the main generate_blocking unchanged.
-    // Hallucination detection forces the candle path (it needs full per-token
-    // logits, one token per forward) — like inspection, it disables the fast lanes.
+    // Hallucination detection and logprobs collection force the candle path
+    // (they need full per-token logits, one token per forward) — like
+    // inspection, they disable the fast lanes.
     let inspect_on = s.inspection_enabled.load(Ordering::Relaxed);
     let spec_on = s.spec_decode_enabled.load(Ordering::Relaxed)
         && !inspect_on
         && detect.is_none()
+        && lp.is_none()
         && sampler_cfg.temperature == 0.0
         && fsm.is_none();
     if spec_on {
@@ -1462,6 +1532,7 @@ fn generate_blocking(
     {
         let gpu_eligible = !inspect_on
             && detect.is_none()
+            && lp.is_none()
             && !s.pld_enabled.load(Ordering::Relaxed)
             && !s.early_exit_enabled.load(Ordering::Relaxed)
             && fsm.is_none()
@@ -1483,6 +1554,7 @@ fn generate_blocking(
         let plen = prompt_tokens.len();
         let vk_eligible = !inspect_on
             && detect.is_none()
+            && lp.is_none()
             && !s.pld_enabled.load(Ordering::Relaxed)
             && !s.early_exit_enabled.load(Ordering::Relaxed)
             && fsm.is_none()
@@ -1625,6 +1697,9 @@ fn generate_blocking(
         if let Some(d) = detect.as_deref_mut() {
             d.observe(&logits, next);
         }
+        if let Some(c) = lp.as_deref_mut() {
+            c.observe(&logits, next);
+        }
         if inspect_on {
             let tok_text = s.tokenizer.read().unwrap().decode(&[next]).unwrap_or_default();
             observer.record_token(generated_ids.len(), next, tok_text, &logits, 5);
@@ -1646,6 +1721,7 @@ fn generate_blocking(
         let pld_on = s.pld_enabled.load(Ordering::Relaxed)
             && !inspect_on
             && detect.is_none()
+            && lp.is_none()
             && fsm.is_none()
             && sampler_cfg.temperature == 0.0;
         if pld_on && generated_ids.len() < max_tokens {
