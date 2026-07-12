@@ -84,9 +84,17 @@ struct PersistedState {
     status: Option<StatusEntry>,
 }
 
+/// Text → embedding function used to vectorize goal/task/status text
+/// before it lands in the `MemoryStore`. Returns `None` when no encoder
+/// is currently able to run (no model loaded, all backend slots busy).
+pub type GoalEncoder = Arc<dyn Fn(&str) -> Option<Vec<f32>> + Send + Sync>;
+
 pub struct GoalManager {
     store: Arc<RwLock<MemoryStore>>,
     d_model: usize,
+    /// Encodes entry text into a real embedding so goals/tasks/status
+    /// participate in `query_by_similarity` like every other memory.
+    encoder: Option<GoalEncoder>,
     /// If set, the manager writes its state to this path after every
     /// mutation and rebuilds it from this path on startup. Atomic-write
     /// (write to .tmp + rename) so a crash mid-save can't corrupt the
@@ -99,6 +107,7 @@ impl GoalManager {
         Self {
             store,
             d_model: D_MODEL_PLACEHOLDER,
+            encoder: None,
             save_path: None,
         }
     }
@@ -106,6 +115,26 @@ impl GoalManager {
     pub fn with_save_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.save_path = Some(path.into());
         self
+    }
+
+    pub fn with_encoder(mut self, encoder: GoalEncoder) -> Self {
+        self.encoder = Some(encoder);
+        self
+    }
+
+    /// Embed `text` via the configured encoder. Falls back to a zero
+    /// vector when no encoder is set or it can't run right now — cosine
+    /// similarity against a zero vector scores 0, so an un-embedded entry
+    /// never spuriously matches; it just stays retrievable by key,
+    /// category, and tags.
+    fn encode(&self, text: &str) -> Vec<f32> {
+        if let Some(encoder) = &self.encoder {
+            match encoder(text) {
+                Some(v) if !v.is_empty() => return v,
+                _ => tracing::debug!("goal encoder unavailable — storing zero vector"),
+            }
+        }
+        vec![0.0f32; self.d_model]
     }
 
     /// Restore goal/task/status entries from disk. Idempotent — safe to
@@ -201,7 +230,7 @@ impl GoalManager {
         };
         let _ = store.store_with_options(
             format!("goal:{}", g.goal_id),
-            vec![0.0f32; self.d_model],
+            self.encode(&g.text),
             metadata,
             pinned_no_ttl(),
         );
@@ -227,7 +256,7 @@ impl GoalManager {
         };
         let _ = store.store_with_options(
             format!("task:{}", t.task_id),
-            vec![0.0f32; self.d_model],
+            self.encode(&t.text),
             metadata,
             opts,
         );
@@ -245,7 +274,7 @@ impl GoalManager {
         };
         let _ = store.store_with_options(
             key,
-            vec![0.0f32; self.d_model],
+            self.encode(&s.text),
             metadata,
             StoreOptions { pinned: false, ttl_seconds: Some(STATUS_TTL_SECONDS) },
         );
@@ -289,7 +318,7 @@ impl GoalManager {
         };
         let _ = store.store_with_options(
             format!("goal:{goal_id}"),
-            vec![0.0f32; self.d_model],
+            self.encode(text),
             metadata,
             pinned_no_ttl(),
         );
@@ -386,7 +415,7 @@ impl GoalManager {
         // Active tasks are pinned; they unpin only when marked Done.
         let _ = store.store_with_options(
             format!("task:{task_id}"),
-            vec![0.0f32; self.d_model],
+            self.encode(text),
             metadata,
             pinned_no_ttl(),
         );
@@ -468,7 +497,7 @@ impl GoalManager {
         // and tasks survive.
         let _ = store.store_with_options(
             key,
-            vec![0.0f32; self.d_model],
+            self.encode(text),
             metadata,
             StoreOptions { pinned: false, ttl_seconds: Some(STATUS_TTL_SECONDS) },
         );

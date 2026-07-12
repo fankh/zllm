@@ -210,9 +210,55 @@ async fn main() -> anyhow::Result<()> {
                 }));
             }
 
+            let pool = Arc::new(pool_slots);
+            let tokenizer = Arc::new(RwLock::new(tokenizer));
+
             let memory_store = Arc::new(RwLock::new(
                 engine::memory_store::MemoryStore::new(1024, 256),
             ));
+
+            // Goal/task/status encoder: tokenize the text and mean-pool the
+            // model's token embeddings (embedding lookup only — no
+            // transformer layers), L2-normalized so cosine similarity in the
+            // MemoryStore is well-behaved. try_lock across the pool so goal
+            // CRUD never waits behind an in-flight generation; if every slot
+            // is busy or no model is loaded, the GoalManager stores a zero
+            // vector (retrievable by key/category/tags, scores 0 on cosine).
+            let goal_encoder: control_plane::goal_manager::GoalEncoder = {
+                let pool = pool.clone();
+                let tokenizer = tokenizer.clone();
+                Arc::new(move |text: &str| {
+                    let ids = tokenizer.read().ok()?.encode(text).ok()?;
+                    if ids.is_empty() {
+                        return None;
+                    }
+                    let flat = pool.iter().find_map(|slot| {
+                        let slot = slot.try_lock().ok()?;
+                        slot.backend.embed_tokens(&ids).ok()
+                    })?;
+                    let d = flat.len() / ids.len();
+                    if d == 0 {
+                        return None;
+                    }
+                    let mut mean = vec![0f32; d];
+                    for chunk in flat.chunks_exact(d) {
+                        for (m, v) in mean.iter_mut().zip(chunk) {
+                            *m += v;
+                        }
+                    }
+                    let inv_n = 1.0 / ids.len() as f32;
+                    for m in &mut mean {
+                        *m *= inv_n;
+                    }
+                    let norm = mean.iter().map(|v| v * v).sum::<f32>().sqrt();
+                    if norm > 0.0 {
+                        for m in &mut mean {
+                            *m /= norm;
+                        }
+                    }
+                    Some(mean)
+                })
+            };
 
             // GoalManager persistence: save next to the config file by
             // default so the snapshot travels with the install.
@@ -222,9 +268,12 @@ async fn main() -> anyhow::Result<()> {
                 .join("goals.json");
             let goal_manager = Arc::new(
                 control_plane::goal_manager::GoalManager::new(memory_store.clone())
-                    .with_save_path(goals_path),
+                    .with_save_path(goals_path)
+                    .with_encoder(goal_encoder),
             );
             // Restore prior state if a snapshot exists. No-op on first run.
+            // Runs through the encoder, so restored entries get real
+            // embeddings too (the pool is idle at startup).
             goal_manager.load_from_disk();
 
             // Resolve current_model id from the loaded path's stem (e.g.
@@ -348,8 +397,8 @@ async fn main() -> anyhow::Result<()> {
             };
 
             let state = AppState {
-                pool: Arc::new(pool_slots),
-                tokenizer: Arc::new(RwLock::new(tokenizer)),
+                pool,
+                tokenizer,
                 goals: goal_manager,
                 memory: memory_store,
                 engine: Arc::new(cfg.engine.clone()),
