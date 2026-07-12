@@ -6,7 +6,7 @@ use zllm::backend::traits::{Backend, QuantConfig};
 use zllm::engine::hooks::registry::HookRegistry;
 use zllm::engine::hooks::steering::SteeringHook;
 use zllm::engine::hooks::early_exit::EarlyExitHook;
-use zllm::engine::hooks::traits::{Hook, HookAction, HookContext};
+use zllm::engine::hooks::traits::{HookAction, HookContext};
 use zllm::engine::memory_store::{MemoryStore, MemoryMetadata, MemoryCategory};
 use zllm::engine::reasoning_budget::ReasoningBudget;
 
@@ -180,15 +180,26 @@ fn test_hooks_on_real_backend() {
     context.tokens_generated = 10;
     context.current_confidence.set(0.5);
 
-    // Test steering hook (layer 8)
+    // Test steering hook (layer 8). Steering edits the live residual
+    // stream via the write-back channel (`residual_delta`), not by
+    // mutating the pooled observe-path copy passed to `fire`.
     let mut hidden = vec![1.0f32; 2048];
-    let original_sum: f32 = hidden.iter().sum();
     let action = registry.fire(8, 0, &mut hidden, &context);
-    let modified_sum: f32 = hidden.iter().sum();
-    assert!(modified_sum != original_sum, "Steering should modify hidden state");
-    println!("Steering: sum changed from {original_sum:.2} to {modified_sum:.2}");
+    let delta = registry
+        .residual_delta(8, &hidden, &context)
+        .expect("steering should produce a residual delta at its target layer");
+    assert_eq!(delta.len(), 2048);
+    assert!(
+        delta.iter().all(|&d| (d - 0.005).abs() < 1e-6),
+        "delta should be alpha * vector = 0.5 * 0.01"
+    );
+    assert!(
+        registry.residual_delta(9, &hidden, &context).is_none(),
+        "no steering delta off the target layer"
+    );
+    println!("Steering delta at layer 8: {} dims of {:.3}", delta.len(), delta[0]);
     // Registry returns last non-Continue action, or Continue if all hooks pass
-    // Steering at layer 8 modifies state; early_exit at layer 12 doesn't fire here
+    // Steering at layer 8 is write-back only; early_exit at layer 12 doesn't fire here
     assert!(!matches!(action, HookAction::EarlyExit { .. }), "Should not early exit at layer 8");
 
     // Test early exit hook (layer 12, confidence below threshold)
@@ -412,4 +423,74 @@ fn test_throughput_benchmark() {
     // Debug mode is ~100x slower; only assert speed in release
     #[cfg(not(debug_assertions))]
     assert!(tok_per_sec > 1.0, "Should be faster than 1 tok/s, got {:.1}", tok_per_sec);
+}
+
+// --- Test 10: Manual layer drive matches the fused forward pass ---
+//
+// The Backend trait's step-by-step surface (embed_tokens → forward_layer
+// per block → compute_logits) must reproduce what the fused
+// forward_logits pass computes: same embeddings, same causal mask, same
+// blocks, same final norm + LM head. Guards the per-layer path the
+// InferenceRunner drives.
+
+#[test]
+fn test_manual_layer_drive_matches_fused_forward() {
+    if !model_available() {
+        println!("SKIP: model not found");
+        return;
+    }
+
+    let mut backend = CandleCpuBackend::new();
+    backend.load_model(
+        Path::new(MODEL_PATH),
+        &QuantConfig { method: "gguf".into(), bits: 4 },
+    ).unwrap();
+
+    let tokenizer = LlamaTokenizer::from_file(TOKENIZER_PATH).unwrap();
+    let tokens = tokenizer.encode("The capital of France is").unwrap();
+    let seq_len = tokens.len();
+
+    // Reference: fused single-shot forward.
+    let fused = backend.forward_logits(&tokens).unwrap();
+    backend.reset_position();
+
+    // Manual drive over the trait surface.
+    let n_layers = Backend::n_layers(&backend);
+    assert!(n_layers > 0, "n_layers should be reported after load");
+    let mut hidden = backend.embed_tokens(&tokens).unwrap();
+    assert_eq!(hidden.len() % seq_len, 0, "embedding width must divide evenly");
+    for layer_idx in 0..n_layers {
+        hidden = backend.forward_layer(layer_idx, &hidden, seq_len).unwrap();
+    }
+    let manual = backend.compute_logits(&hidden).unwrap();
+
+    assert_eq!(fused.len(), manual.len(), "vocab widths must match");
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i)
+            .unwrap()
+    };
+    let (fused_top, manual_top) = (argmax(&fused), argmax(&manual));
+    let max_abs_diff = fused
+        .iter()
+        .zip(&manual)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    println!(
+        "fused top: {} '{}', manual top: {} '{}', max |Δlogit| = {max_abs_diff}",
+        fused_top,
+        tokenizer.decode(&[fused_top as u32]).unwrap_or_default(),
+        manual_top,
+        tokenizer.decode(&[manual_top as u32]).unwrap_or_default(),
+    );
+    assert_eq!(fused_top, manual_top, "top-1 token must agree");
+    assert!(
+        max_abs_diff < 1e-3,
+        "logits should match the fused pass, max |Δ| = {max_abs_diff}"
+    );
+
+    // Out-of-range layer must be a hard error, not a silent identity.
+    assert!(backend.forward_layer(n_layers, &hidden, seq_len).is_err());
 }
