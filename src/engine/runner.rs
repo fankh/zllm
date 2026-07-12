@@ -1,4 +1,5 @@
 use crate::backend::traits::Backend;
+use crate::error::Result;
 use crate::engine::hooks::registry::HookRegistry;
 use crate::engine::hooks::traits::{HookAction, HookContext};
 use crate::engine::memory_store::{InspectionTrace, LayerSnapshot, MemoryStore};
@@ -95,13 +96,13 @@ impl InferenceRunner {
     }
 
     pub fn generate(
-        &self,
+        &mut self,
         prompt_tokens: &[u32],
         max_tokens: usize,
         config: &SamplerConfig,
         budget: &ReasoningBudget,
         request_id: &str,
-    ) -> GenerationResult {
+    ) -> Result<GenerationResult> {
         let seq_len = prompt_tokens.len();
         let mut state = ReasoningState::new(seq_len);
         let memory_per_loop = ReasoningBudget::estimate_memory_per_loop(
@@ -120,10 +121,18 @@ impl InferenceRunner {
         // counters stay at zero in this code path; if you need accurate hook
         // counters they should move into HookContext (atomic counters).
 
-        // Zone 1: Encode (always runs once)
-        let mut hidden = vec![0.1f32; seq_len * self.d_model];
-        for layer_idx in 0..8 {
-            hidden = self.backend.forward_layer(layer_idx, &hidden, seq_len).unwrap();
+        // Zone boundaries clamp to the loaded model's real depth: the
+        // canonical 8 / 8+N / 32 split assumes a 32-layer model, but the
+        // backend may hold e.g. a 16-layer 1B.
+        let n_layers = self.backend.n_layers();
+        let encode_end = 8.min(n_layers);
+        let reason_end = (encode_end + self.reasoning_layers).min(n_layers);
+
+        // Zone 1: Encode (always runs once). Seed the residual stream with
+        // the model's real token embeddings via Backend::embed_tokens.
+        let mut hidden = self.backend.embed_tokens(prompt_tokens)?;
+        for layer_idx in 0..encode_end {
+            hidden = self.backend.forward_layer(layer_idx, &hidden, seq_len)?;
 
             if self.enable_inspection {
                 layer_snapshots.push(LayerSnapshot::from_hidden_state(layer_idx, 0, &hidden));
@@ -166,8 +175,8 @@ impl InferenceRunner {
                 break;
             }
 
-            for layer_idx in 8..8 + self.reasoning_layers {
-                hidden = self.backend.forward_layer(layer_idx, &hidden, seq_len).unwrap();
+            for layer_idx in encode_end..reason_end {
+                hidden = self.backend.forward_layer(layer_idx, &hidden, seq_len)?;
 
                 // Update HookContext confidence from the live hidden state
                 // so hooks like EarlyExitHook see a real signal. Source:
@@ -209,8 +218,8 @@ impl InferenceRunner {
         // single chokepoint that honors HookContext.stores_remaining.
 
         // Zone 3: Output layers (always runs once)
-        for layer_idx in 8 + self.reasoning_layers..32 {
-            hidden = self.backend.forward_layer(layer_idx, &hidden, seq_len).unwrap();
+        for layer_idx in reason_end..n_layers {
+            hidden = self.backend.forward_layer(layer_idx, &hidden, seq_len)?;
 
             if self.enable_inspection {
                 layer_snapshots.push(LayerSnapshot::from_hidden_state(layer_idx, 0, &hidden));
@@ -220,7 +229,7 @@ impl InferenceRunner {
         // Decode: generate output tokens
         let mut output_tokens = Vec::new();
         for _ in 0..max_tokens {
-            let logits = self.backend.compute_logits(&hidden).unwrap();
+            let logits = self.backend.compute_logits(&hidden)?;
             let token_id = sample(&logits, config);
             output_tokens.push(token_id);
             if token_id == 2 {
@@ -247,7 +256,7 @@ impl InferenceRunner {
             None
         };
 
-        GenerationResult {
+        Ok(GenerationResult {
             tokens: output_tokens,
             reasoning_loops_used: state.loops_used,
             reasoning_memory_mb: state.memory_used_mb,
@@ -256,6 +265,6 @@ impl InferenceRunner {
             inspection_trace,
             memories_injected,
             memories_captured,
-        }
+        })
     }
 }

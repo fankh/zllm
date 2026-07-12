@@ -5,7 +5,7 @@ pub struct LayerStepper;
 
 impl LayerStepper {
     pub fn step_layer(
-        backend: &dyn Backend,
+        backend: &mut dyn Backend,
         layer_idx: usize,
         hidden_state: &Tensor,
         seq_len: usize,

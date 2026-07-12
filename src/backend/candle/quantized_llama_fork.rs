@@ -978,6 +978,57 @@ impl ModelWeights {
         out
     }
 
+    /// Token-embedding lookup only: `(1, seq_len)` token ids →
+    /// `(1, seq_len, n_embd)` hidden states. Entry point for
+    /// `Backend::embed_tokens` — seeds a manually-driven residual stream
+    /// (the inference runner) with the model's real embeddings.
+    pub fn embed_tokens(&self, x: &Tensor) -> Result<Tensor> {
+        self.tok_embeddings.forward(x)
+    }
+
+    /// Run a single transformer block as a standalone pass over `x`
+    /// (shape `(1, seq_len, n_embd)`): causal mask from position 0, and
+    /// the layer-local KV cache cleared both before and after the pass.
+    /// Callers (the runner's zone loop) re-enter middle layers many times
+    /// per request, and the same backend instance may also serve the
+    /// normal `forward*` decode path — without the double reset, K/V from
+    /// these standalone passes would leak into that cache.
+    pub fn forward_one_layer(&mut self, layer_idx: usize, x: &Tensor) -> Result<Tensor> {
+        let (_b_sz, seq_len, _n_embd) = x.dims3()?;
+        let mask = if seq_len == 1 {
+            None
+        } else {
+            Some(self.mask(seq_len, 0, x.device())?)
+        };
+        let n_layers = self.layers.len();
+        let layer = self.layers.get_mut(layer_idx).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "forward_one_layer: layer {layer_idx} out of range (model has {n_layers})"
+            ))
+        })?;
+        layer.kv_cache.reset();
+        let residual = x;
+        let x = layer.attention_norm.forward(x)?;
+        let attn = layer.forward_attn(&x, mask.as_ref(), 0)?;
+        let x = (attn + residual)?;
+        let residual = &x;
+        let x = layer.ffn_norm.forward(&x)?;
+        let x = layer.mlp_or_moe.forward(&x)?;
+        let out = (x + residual)?;
+        layer.kv_cache.reset();
+        Ok(out)
+    }
+
+    /// Project a hidden state `(1, seq_len, n_embd)` through the final
+    /// RMS norm + LM head, returning next-token logits `(1, vocab)` for
+    /// the last position. Companion to `forward_one_layer` for callers
+    /// that drive layers manually instead of via `forward*`.
+    pub fn logits_from_hidden(&self, hidden: &Tensor) -> Result<Tensor> {
+        let (_b_sz, seq_len, _n_embd) = hidden.dims3()?;
+        let x = self.norm.forward(hidden)?;
+        let x = x.i((.., seq_len - 1, ..))?;
+        self.output.forward(&x)
+    }
 }
 
 #[cfg(feature = "profile")]

@@ -362,15 +362,57 @@ impl Backend for CandleCpuBackend {
         Ok(())
     }
 
+    fn embed_tokens(&self, tokens: &[u32]) -> Result<Tensor> {
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| ZllmError::Model("model not loaded".into()))?;
+        if tokens.is_empty() {
+            return Err(ZllmError::Backend("embed_tokens: empty token slice".into()));
+        }
+        let input = CandleTensor::new(tokens, &self.device)
+            .map_err(|e| ZllmError::Backend(format!("tensor creation: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| ZllmError::Backend(format!("unsqueeze: {e}")))?;
+        let emb = model
+            .embed_tokens(&input)
+            .map_err(|e| ZllmError::Backend(format!("embedding lookup: {e}")))?;
+        emb.flatten_all()
+            .map_err(|e| ZllmError::Backend(format!("flatten: {e}")))?
+            .to_vec1()
+            .map_err(|e| ZllmError::Backend(format!("to_vec1: {e}")))
+    }
+
+    fn n_layers(&self) -> usize {
+        self.n_layers
+    }
+
     fn forward_layer(
-        &self,
-        _layer_idx: usize,
+        &mut self,
+        layer_idx: usize,
         hidden_state: &Tensor,
-        _seq_len: usize,
+        seq_len: usize,
     ) -> Result<Tensor> {
-        // Per-layer forward not directly supported by quantized model
-        // Return input unchanged (hooks still work on the hidden state)
-        Ok(hidden_state.clone())
+        let hidden_size = self.hidden_size;
+        if seq_len == 0 || hidden_state.len() != seq_len * hidden_size {
+            return Err(ZllmError::Backend(format!(
+                "forward_layer: hidden len {} != seq_len {seq_len} * hidden {hidden_size}",
+                hidden_state.len()
+            )));
+        }
+        let x = CandleTensor::from_slice(hidden_state, (1, seq_len, hidden_size), &self.device)
+            .map_err(|e| ZllmError::Backend(format!("tensor creation: {e}")))?;
+        let model = self
+            .model
+            .as_mut()
+            .ok_or_else(|| ZllmError::Model("model not loaded".into()))?;
+        let out = model
+            .forward_one_layer(layer_idx, &x)
+            .map_err(|e| ZllmError::Backend(format!("layer forward: {e}")))?;
+        out.flatten_all()
+            .map_err(|e| ZllmError::Backend(format!("flatten: {e}")))?
+            .to_vec1()
+            .map_err(|e| ZllmError::Backend(format!("to_vec1: {e}")))
     }
 
     fn read_hidden_state(&self, layer_idx: usize) -> Result<Tensor> {
@@ -395,10 +437,32 @@ impl Backend for CandleCpuBackend {
         }
     }
 
-    fn compute_logits(&self, _hidden_state: &Tensor) -> Result<Tensor> {
-        // This is handled by generate_token() for the candle backend
-        // Return zeros as placeholder — real logits come from forward pass
-        Ok(vec![0.0f32; self.vocab_size])
+    fn compute_logits(&self, hidden_state: &Tensor) -> Result<Tensor> {
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| ZllmError::Model("model not loaded".into()))?;
+        if self.hidden_size == 0
+            || hidden_state.is_empty()
+            || hidden_state.len() % self.hidden_size != 0
+        {
+            return Err(ZllmError::Backend(format!(
+                "compute_logits: hidden len {} is not a multiple of hidden size {}",
+                hidden_state.len(),
+                self.hidden_size
+            )));
+        }
+        let seq_len = hidden_state.len() / self.hidden_size;
+        let x = CandleTensor::from_slice(hidden_state, (1, seq_len, self.hidden_size), &self.device)
+            .map_err(|e| ZllmError::Backend(format!("tensor creation: {e}")))?;
+        let logits = model
+            .logits_from_hidden(&x)
+            .map_err(|e| ZllmError::Backend(format!("lm head: {e}")))?;
+        logits
+            .squeeze(0)
+            .map_err(|e| ZllmError::Backend(format!("squeeze: {e}")))?
+            .to_vec1()
+            .map_err(|e| ZllmError::Backend(format!("to_vec1: {e}")))
     }
 
     fn alloc_kv_block(&mut self, _n_tokens: usize) -> Result<BlockId> {

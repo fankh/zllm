@@ -5,7 +5,7 @@ use std::path::Path;
 
 pub struct DummyBackend {
     vocab_size: usize,
-    #[allow(dead_code)] d_model: usize, // part of the Backend construction contract
+    d_model: usize,
     n_layers: usize,
     next_block_id: BlockId,
     hidden_states: Vec<Tensor>,
@@ -33,8 +33,28 @@ impl Backend for DummyBackend {
         Ok(())
     }
 
+    fn embed_tokens(&self, tokens: &[u32]) -> Result<Tensor> {
+        // Deterministic pseudo-embedding: unique per (token, dim, position),
+        // bounded, and reproducible across runs — good enough for the
+        // engine tests this backend exists for.
+        let mut out = Vec::with_capacity(tokens.len() * self.d_model);
+        for (pos, &tok) in tokens.iter().enumerate() {
+            for dim in 0..self.d_model {
+                let phase = tok as f32 * 0.618_034
+                    + dim as f32 * 0.070_71
+                    + pos as f32 * 0.001;
+                out.push(phase.sin() * 0.02);
+            }
+        }
+        Ok(out)
+    }
+
+    fn n_layers(&self) -> usize {
+        self.n_layers
+    }
+
     fn forward_layer(
-        &self,
+        &mut self,
         _layer_idx: usize,
         hidden_state: &Tensor,
         _seq_len: usize,

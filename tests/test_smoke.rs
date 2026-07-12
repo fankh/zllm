@@ -158,13 +158,13 @@ fn test_token_importance_high_ratio() {
 #[test]
 fn test_runner_with_budget() {
     let backend = DummyBackend::new(32000, 4096, 32);
-    let runner = InferenceRunner::new(Box::new(backend), 4096, 8);
+    let mut runner = InferenceRunner::new(Box::new(backend), 4096, 8);
 
     let prompt = vec![1u32; 10];
     let config = SamplerConfig::default();
     let budget = ReasoningBudget::from_tier("free");
 
-    let result = runner.generate(&prompt, 5, &config, &budget, "req-1");
+    let result = runner.generate(&prompt, 5, &config, &budget, "req-1").expect("generate");
     assert!(result.tokens.len() <= 5);
     assert!(result.reasoning_loops_used <= 2);
     assert!(!result.early_exit);
@@ -177,13 +177,13 @@ fn test_runner_with_budget() {
 #[test]
 fn test_runner_premium_budget() {
     let backend = DummyBackend::new(32000, 4096, 32);
-    let runner = InferenceRunner::new(Box::new(backend), 4096, 8);
+    let mut runner = InferenceRunner::new(Box::new(backend), 4096, 8);
 
     let prompt = vec![1u32; 10];
     let config = SamplerConfig::default();
     let budget = ReasoningBudget::from_tier("premium");
 
-    let result = runner.generate(&prompt, 5, &config, &budget, "req-2");
+    let result = runner.generate(&prompt, 5, &config, &budget, "req-2").expect("generate");
     assert!(result.tokens.len() <= 5);
     assert!(result.reasoning_loops_used <= 16);
     assert!(result.avg_token_importance >= 0.0);
@@ -259,14 +259,16 @@ fn test_memory_store_eviction() {
 fn test_memory_injection_across_requests() {
     let memory = Arc::new(RwLock::new(MemoryStore::new(100, 50)));
     let backend = DummyBackend::new(32000, 4096, 32);
-    let runner = InferenceRunner::new(Box::new(backend), 4096, 8)
+    let mut runner = InferenceRunner::new(Box::new(backend), 4096, 8)
         .with_memory(memory.clone());
 
     let config = SamplerConfig::default();
     let budget = ReasoningBudget::from_tier("standard");
 
     // Request 1: generates and captures reasoning state via MemoryInjectHook
-    let _result1 = runner.generate(&vec![1u32; 10], 3, &config, &budget, "req-1");
+    let _result1 = runner
+        .generate(&vec![1u32; 10], 3, &config, &budget, "req-1")
+        .expect("generate");
 
     // Verify some memory was stored (via the hook's capture path).
     let store = memory.read().unwrap();
@@ -276,19 +278,23 @@ fn test_memory_injection_across_requests() {
 
     // Request 2: should be able to inject from request 1 (we don't assert
     // result counters because GenerationResult no longer tracks them).
-    let _result2 = runner.generate(&vec![2u32; 10], 3, &config, &budget, "req-2");
+    let _result2 = runner
+        .generate(&vec![2u32; 10], 3, &config, &budget, "req-2")
+        .expect("generate");
 }
 
 #[test]
 fn test_inspection_trace() {
     let backend = DummyBackend::new(32000, 4096, 32);
-    let runner = InferenceRunner::new(Box::new(backend), 4096, 8)
+    let mut runner = InferenceRunner::new(Box::new(backend), 4096, 8)
         .with_inspection(true);
 
     let config = SamplerConfig::default();
     let budget = ReasoningBudget::from_tier("free");
 
-    let result = runner.generate(&vec![1u32; 10], 3, &config, &budget, "req-trace");
+    let result = runner
+        .generate(&vec![1u32; 10], 3, &config, &budget, "req-trace")
+        .expect("generate");
     assert!(result.inspection_trace.is_some());
 
     let trace = result.inspection_trace.unwrap();
@@ -306,14 +312,16 @@ fn test_inspection_trace() {
 fn test_inspection_trace_stored_in_memory() {
     let memory = Arc::new(RwLock::new(MemoryStore::new(100, 50)));
     let backend = DummyBackend::new(32000, 4096, 32);
-    let runner = InferenceRunner::new(Box::new(backend), 4096, 8)
+    let mut runner = InferenceRunner::new(Box::new(backend), 4096, 8)
         .with_memory(memory.clone())
         .with_inspection(true);
 
     let config = SamplerConfig::default();
     let budget = ReasoningBudget::from_tier("free");
 
-    runner.generate(&vec![1u32; 10], 3, &config, &budget, "req-t1");
+    runner
+        .generate(&vec![1u32; 10], 3, &config, &budget, "req-t1")
+        .expect("generate");
 
     let store = memory.read().unwrap();
     assert_eq!(store.trace_count(), 1);

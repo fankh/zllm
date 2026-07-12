@@ -24,8 +24,21 @@ pub trait Backend: Send + Sync {
     fn load_model(&mut self, path: &Path, config: &QuantConfig) -> Result<()>;
     fn unload_model(&mut self) -> Result<()>;
 
+    /// Look up token embeddings for `tokens`, returning a flat
+    /// `seq_len * d_model` tensor — the real layer-0 input for a
+    /// manually-driven forward pass.
+    fn embed_tokens(&self, tokens: &[u32]) -> Result<Tensor>;
+
+    /// Number of transformer blocks the loaded model actually has.
+    /// Callers driving layers manually (the runner's zone loop) must
+    /// clamp their layer ranges to this.
+    fn n_layers(&self) -> usize;
+
+    /// Run one transformer block over `hidden_state` (flat
+    /// `seq_len * d_model`). Takes `&mut self` because a real layer
+    /// forward touches backend state (KV cache, mask cache).
     fn forward_layer(
-        &self,
+        &mut self,
         layer_idx: usize,
         hidden_state: &Tensor,
         seq_len: usize,

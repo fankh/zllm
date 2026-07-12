@@ -11,7 +11,7 @@ use std::sync::{Arc, RwLock};
 /// callback into the runner's pull-shaped HookRegistry. Lets the chat
 /// path get per-layer hook firings, confidence updates, memory captures,
 /// and inspection traces — the same features `InferenceRunner::generate`
-/// provides for the (still-stubbed) `forward_layer` path.
+/// provides for the per-layer `forward_layer` path.
 ///
 /// Read-only in v0.8: hook mutations to `&mut Tensor` are computed but
 /// discarded — the backend tensor is borrowed immutably and there is no
