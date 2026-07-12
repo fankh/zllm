@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.9.1 — 2026-07-13
+
+Mock-data cleanup: the four "Still mocked" rows from the v0.7 scorecard are
+now real. No placeholder tensors remain on the `Backend` trait surface.
+
+- `Backend::embed_tokens` (new): real token-embedding lookup. The runner's
+  Zone 1 now seeds the residual stream with model embeddings instead of the
+  `vec![0.1f32; …]` fill.
+- `CandleCpuBackend::forward_layer`: real per-layer transformer forward via
+  the fork's new `forward_one_layer` (causal mask from pos 0, layer-local KV
+  reset before/after so standalone passes never pollute the decode cache).
+  Was: identity. Out-of-range layer is now a hard error.
+- `CandleCpuBackend::compute_logits`: real final-norm + LM-head projection via
+  the fork's `logits_from_hidden`. Was: zeros.
+- Parity test (`test_manual_layer_drive_matches_fused_forward`): manual
+  `embed_tokens → forward_layer × n_layers → compute_logits` reproduces the
+  fused `forward_logits` pass **bit-exact** (max |Δlogit| = 0) on
+  Llama-3.2-1B Q4_K_M.
+- `Backend::n_layers` (new): runner zone boundaries clamp to the loaded
+  model's real depth instead of assuming 32 layers.
+- `Backend::forward_layer` takes `&mut self` (real layers touch KV/mask
+  state); `InferenceRunner::generate` returns `Result` and propagates backend
+  errors instead of unwrapping.
+- `GoalManager`: goal/task/status entries are embedded by a real encoder pass
+  (tokenize → mean-pool token embeddings → L2 normalize) instead of storing
+  `vec![0.0; d_model]`. Encoder is injected from `main.rs`, `try_lock`s across
+  the backend pool so goal CRUD never queues behind a generation, and falls
+  back to a zero vector (cosine 0 — honest "no embedding") when no model is
+  loaded. Disk-restored entries are re-encoded on startup.
+- `test_hooks_on_real_backend` modernized: steering asserts the
+  `residual_delta` write-back contract (v0.9 design) instead of the removed
+  mutate-on-`fire` behavior.
+
 ## v0.9.0 — 2026-07-07
 
 Performance: prefill rebuilt around WMMA attention; TTFT transformed; the
@@ -199,10 +232,10 @@ Brief recap; see commit history for full detail.
 | `DifficultyEstimator::estimate → 1` | **Fixed** (inverse-confidence buckets) |
 | `tenant_id`-scoped APIs | **Deleted** (installed-app stance) |
 | Per-layer hooks fire on chat | **Half-fixed** (capture wired; inject still mutation-only via forward; replacement is Phase 3) |
-| `CandleCpuBackend::forward_layer → identity` | Still mocked — needs runner integration |
-| `CandleCpuBackend::compute_logits → zeros` | Still mocked — same |
-| `runner.rs vec![0.1f32; …]` placeholder | Still mocked — needs `Backend::embed_tokens` |
-| `GoalManager` zero-vector storage | Still mocked — needs an encoder pass |
+| `CandleCpuBackend::forward_layer → identity` | **Fixed in v0.9.1** (real block forward, bit-exact vs fused pass) |
+| `CandleCpuBackend::compute_logits → zeros` | **Fixed in v0.9.1** (final norm + LM head) |
+| `runner.rs vec![0.1f32; …]` placeholder | **Fixed in v0.9.1** (`Backend::embed_tokens`) |
+| `GoalManager` zero-vector storage | **Fixed in v0.9.1** (mean-pooled embedding encoder) |
 
 ### Surface today
 

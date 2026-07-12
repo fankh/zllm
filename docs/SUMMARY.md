@@ -96,9 +96,14 @@ as of the 2026-06 feature audit.)*
   disk-persisted, backed by `engine/memory_store.rs`. *(REST, not gRPC; gRPC removed v0.4.)*
 - **Paged-KV continuous batching** is the real serving stack — in the **GPU backend**
   (`backend/gpu`), no tenant isolation (tenancy removed v0.3).
-- **NOT functional:** Adaptive Latent Reasoning (`runner.rs` 3-zone loop is dead code
-  on a no-op `forward_layer`; difficulty/budget estimators are real but feed only the
-  dead loop). Decision pending: implement on the real forward, or cut.
+- **Adaptive Latent Reasoning** (`runner.rs` 3-zone loop) now runs on the real
+  per-layer forward: `Backend::embed_tokens` seeds the residual stream,
+  `forward_layer` executes actual transformer blocks (candle fork
+  `forward_one_layer`, validated bit-exact vs the fused pass), and
+  `compute_logits` projects through the real final-norm + LM head. Zone
+  boundaries clamp to the loaded model's depth. Whether the 3-zone loop
+  *earns its keep* vs the plain chat path is still an open product question —
+  but it is no longer dead code on stubs.
 - **REST/OpenAI server** (`src/server/rest.rs`): `/v1/completions`, chat, CB endpoints.
 
 ## Reusable techniques (transfer to other LLM engines / sessions)
