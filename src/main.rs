@@ -437,6 +437,8 @@ async fn main() -> anyhow::Result<()> {
                     Default::default()
                 })),
                 model_ctx: Arc::new(std::sync::atomic::AtomicUsize::new(initial_model_ctx)),
+                active_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                max_concurrent: cfg.server.max_concurrent.max(1),
                 hooks: Arc::new(hook_registry),
                 inspection_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 pld_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -457,7 +459,18 @@ async fn main() -> anyhow::Result<()> {
                 vk: vk_engine,
             };
 
-            let rest_addr = format!("0.0.0.0:{}", cfg.server.rest_port);
+            // Trust model (V1_PLAN M4): zllm has no authentication by
+            // default, so it binds LOOPBACK ONLY unless the operator
+            // explicitly widens it with ZLLM_BIND (e.g. "0.0.0.0").
+            // Setting ZLLM_API_KEY additionally requires
+            // `Authorization: Bearer <key>` on every /v1 route.
+            let bind_host = std::env::var("ZLLM_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+            if bind_host != "127.0.0.1" && bind_host != "localhost" && std::env::var("ZLLM_API_KEY").is_err() {
+                tracing::warn!(
+                    "binding {bind_host} WITHOUT ZLLM_API_KEY — anyone who can reach this port can use the model and the goal/inspect surface"
+                );
+            }
+            let rest_addr = format!("{bind_host}:{}", cfg.server.rest_port);
             let router = server::rest::router(state);
 
             let rest_handle = tokio::spawn(async move {
@@ -478,9 +491,9 @@ async fn main() -> anyhow::Result<()> {
             tokenizer,
             prompt,
             max_tokens,
-            temperature: _,
-            top_k: _,
-            top_p: _,
+            temperature,
+            top_k,
+            top_p,
         } => {
             use backend::candle::backend::CandleCpuBackend;
             use backend::candle::tokenizer::LlamaTokenizer;
@@ -568,6 +581,14 @@ async fn main() -> anyhow::Result<()> {
             use std::io::Write;
             std::io::stdout().flush()?;
 
+            let cli_sampler = zllm::engine::sampler::SamplerConfig {
+                temperature,
+                top_k,
+                top_p,
+                min_p: 0.0,
+            };
+            let mut generated_ids: Vec<u32> = Vec::new();
+            let mut printed = 0usize;
             for _ in 0..max_tokens {
                 let input_tokens = if generated == 0 {
                     &all_tokens[..]
@@ -575,23 +596,27 @@ async fn main() -> anyhow::Result<()> {
                     &all_tokens[all_tokens.len() - 1..]
                 };
 
-                let token_id = candle_backend.generate_token(input_tokens)?;
-
-                // Apply sampling (temperature + top_k + top_p would be applied to logits)
-                // For now, generate_token returns greedy argmax
-                // TODO: expose logits and use our sampler
+                let logits = candle_backend.forward_logits(input_tokens)?;
+                let token_id = zllm::engine::sampler::sample(&logits, &cli_sampler);
 
                 if stops.contains(&token_id) {
                     break;
                 }
 
                 all_tokens.push(token_id);
+                generated_ids.push(token_id);
                 generated += 1;
 
-                // Decode and print token
-                if let Ok(text) = tok.decode(&[token_id]) {
-                    print!("{text}");
-                    std::io::stdout().flush()?;
+                // SPM-safe printing: decode the whole generated tail and
+                // emit only the new suffix. Per-token decodes drop
+                // SentencePiece space markers (Mistral printed
+                // "Paris,butthe…" before this).
+                if let Ok(text) = tok.decode(&generated_ids) {
+                    if let Some(delta) = text.get(printed..) {
+                        print!("{delta}");
+                        std::io::stdout().flush()?;
+                        printed = text.len();
+                    }
                 }
             }
 

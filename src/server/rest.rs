@@ -28,6 +28,60 @@ use crate::engine::sampler::SamplerConfig;
 
 const CHAT_UI_HTML: &str = include_str!("chat_ui.html");
 
+/// Optional bearer-token auth: when ZLLM_API_KEY is set, every route
+/// except /health requires `Authorization: Bearer <key>`. Read once —
+/// the key is process-lifetime configuration, not hot-reloadable.
+async fn require_api_key(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    static KEY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let key = KEY.get_or_init(|| std::env::var("ZLLM_API_KEY").ok().filter(|k| !k.is_empty()));
+    if let Some(key) = key {
+        if req.uri().path() != "/health" {
+            let ok = req
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .map(|k| k == key)
+                .unwrap_or(false);
+            if !ok {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"error": "missing or invalid API key"})),
+                )
+                    .into_response();
+            }
+        }
+    }
+    next.run(req).await
+}
+
+/// RAII in-flight counter: decrements on drop so streams and early
+/// returns can't leak a slot in the saturation accounting.
+struct ActiveGuard(Arc<AtomicUsize>);
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// 503 when the server is already running `max_concurrent` generations
+/// — bounded queueing beats every caller blocking on slot mutexes.
+fn admit(s: &AppState) -> Result<ActiveGuard, axum::response::Response> {
+    let now = s.active_requests.fetch_add(1, Ordering::Relaxed) + 1;
+    let guard = ActiveGuard(s.active_requests.clone());
+    if now > s.max_concurrent {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": format!("server saturated ({now} in flight, limit {})", s.max_concurrent)})),
+        )
+            .into_response());
+    }
+    Ok(guard)
+}
+
 /// One slot in the backend pool: a fully-loaded backend plus the
 /// tokens currently materialized in its KV cache. The pool size is
 /// controlled by `cfg.engine.backend_pool_size` (default 2). Each
@@ -85,6 +139,10 @@ pub struct AppState {
     /// whose prompt exceeds it get an OpenAI-style 400 instead of a
     /// forward-pass failure.
     pub model_ctx: Arc<AtomicUsize>,
+    /// In-flight generation count vs `server.max_concurrent`: excess
+    /// requests get 503 instead of queueing unboundedly on slot locks.
+    pub active_requests: Arc<AtomicUsize>,
+    pub max_concurrent: usize,
     /// Hook registry consulted on every chat prefill via `RunnerObserver`.
     /// Built once at startup with the default `MemoryInjectHook` plus
     /// anything callers add before serving — see `main.rs`.
@@ -204,6 +262,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/debug/layer_agreement", post(layer_agreement))
         .route("/v1/debug/matmul_bench", get(matmul_bench))
         .route("/v1/inspect/{request_id}", get(get_trace))
+        .layer(axum::middleware::from_fn(require_api_key))
         .with_state(state)
 }
 
@@ -848,6 +907,16 @@ fn build_decode_ctrl(
     )
 }
 
+/// Per-request wall-clock budget (ZLLM_REQ_TIMEOUT_SECS, default 600).
+fn request_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        std::env::var("ZLLM_REQ_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600),
+    )
+}
+
 /// The stop-TOKEN set for the loaded model: ids the GGUF declares
 /// (ground truth) unioned with the vocab probe (covers GGUFs that
 /// predate the declared fields).
@@ -913,9 +982,19 @@ async fn chat_completions(
             "code": "context_length_exceeded"
         }))).into_response();
     }
+    let active = match admit(&s) {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
     let id = format!("chatcmpl-{}", Uuid::new_v4());
     let model_id = s.current_model.read().unwrap().clone();
-    let max_tokens = req.max_tokens;
+    // Clamp generation to the remaining window so the KV cache can never
+    // be asked to grow past what it preallocated.
+    let max_tokens = if ctx > 0 {
+        req.max_tokens.min(ctx.saturating_sub(tokens.len()).max(1))
+    } else {
+        req.max_tokens
+    };
     // Recognized-but-unsupported OpenAI params fail loudly (V1_PLAN M1:
     // accepting a parameter and ignoring it is a silent lie).
     if req.tools.is_some() || req.tool_choice.is_some() {
@@ -1023,9 +1102,10 @@ async fn chat_completions(
     }
 
     if req.stream {
-        let stream = chat_stream(s.clone(), tokens, max_tokens, sampler_cfg, fsm, id.clone(), model_id, ctrl);
+        let stream = chat_stream(s.clone(), tokens, max_tokens, sampler_cfg, fsm, id.clone(), model_id, ctrl, active);
         Sse::new(stream).into_response()
     } else {
+        let _active = active;
         let mut detector = req.detect_hallucination.unwrap_or(false)
             .then(|| crate::engine::hallucination::Detector::new(Default::default()));
         let mut lp = req.logprobs.unwrap_or(false).then(|| {
@@ -1178,6 +1258,15 @@ async fn text_completions(
             "code": "context_length_exceeded"
         }))).into_response();
     }
+    let _active = match admit(&s) {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
+    let max_tokens = if ctx > 0 {
+        req.max_tokens.min(ctx.saturating_sub(tokens.len()).max(1))
+    } else {
+        req.max_tokens
+    };
     let id = format!("cmpl-{}", Uuid::new_v4());
     if req.n.unwrap_or(1) > 1 || req.best_of.unwrap_or(1) > 1 {
         return (StatusCode::BAD_REQUEST, Json(json!({
@@ -1209,7 +1298,7 @@ async fn text_completions(
         .then(|| crate::engine::hallucination::Detector::new(Default::default()));
     let mut lp = req.logprobs
         .map(|n| crate::engine::logprobs::LogprobsCollector::new(n as usize));
-    let (text, p, c, finish_reason) = generate_blocking(&s, tokens, req.max_tokens, &sampler_cfg, fsm.as_ref(), &id, detector.as_mut(), lp.as_mut(), &mut ctrl);
+    let (text, p, c, finish_reason) = generate_blocking(&s, tokens, max_tokens, &sampler_cfg, fsm.as_ref(), &id, detector.as_mut(), lp.as_mut(), &mut ctrl);
     let hallu = detector.map(|d| hallucination_json(&d.report()));
     let logprobs_json = lp.map(|col| legacy_logprobs_json(&s, &col));
     let now = unix_secs();
@@ -2152,8 +2241,16 @@ fn generate_blocking(
         && fsm.is_none();
     let ee_min_layer = s.early_exit_min_layer.load(Ordering::Relaxed);
     let ee_threshold = f32::from_bits(s.early_exit_threshold_bits.load(Ordering::Relaxed));
+    // Wall-clock cap: a wedged or absurdly slow generation frees its slot
+    // instead of holding it forever (ZLLM_REQ_TIMEOUT_SECS, default 600).
+    let req_deadline = std::time::Instant::now() + request_timeout();
 
     for _ in 0..max_tokens {
+        if std::time::Instant::now() >= req_deadline {
+            tracing::warn!("request wall-clock timeout — returning partial output");
+            finish_reason = "length";
+            break;
+        }
         let is_prefill = generated_ids.is_empty();
         let input = if is_prefill {
             &all_tokens[prefill_start..]
@@ -2366,6 +2463,7 @@ fn generate_blocking(
 /// Streaming generation via SSE. Spawns a blocking task that runs the
 /// generation loop and pushes per-token chunks into a futures::channel,
 /// which axum's Sse type consumes.
+#[allow(clippy::too_many_arguments)]
 fn chat_stream(
     s: AppState,
     prompt_tokens: Vec<u32>,
@@ -2375,6 +2473,7 @@ fn chat_stream(
     id: String,
     model_id: String,
     mut ctrl: DecodeControl,
+    active: ActiveGuard,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     use futures::channel::mpsc;
     use futures::StreamExt;
@@ -2397,6 +2496,9 @@ fn chat_stream(
     let _ = tx.unbounded_send(Ok(Event::default().data(role_chunk.to_string())));
 
     tokio::task::spawn_blocking(move || {
+        // Held for the stream's lifetime; drops (and frees the admission
+        // slot) when generation ends OR the client disconnects.
+        let _active = active;
         let stops = stop_set(&s);
 
         // iGPU fast-lane (streaming): same eligibility as generate_blocking's
@@ -2559,8 +2661,14 @@ fn chat_stream(
                 .with_inspection(inspect_on),
         );
         let mut finish_reason: &'static str = "stop";
+        let req_deadline = std::time::Instant::now() + request_timeout();
         loop {
             if generated >= max_tokens {
+                break;
+            }
+            if std::time::Instant::now() >= req_deadline {
+                tracing::warn!("request wall-clock timeout — ending stream");
+                finish_reason = "length";
                 break;
             }
             let is_prefill = generated == 0;
