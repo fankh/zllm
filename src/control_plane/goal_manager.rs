@@ -137,6 +137,32 @@ impl GoalManager {
         vec![0.0f32; self.d_model]
     }
 
+    /// Re-embed every Goal/Task/Status entry with the current encoder.
+    /// Call after a model swap: vectors captured under the previous model
+    /// live in that model's embedding space (and width), so against
+    /// new-model queries they silently score 0 and goal-similarity
+    /// retrieval goes dark. Text/tags/pinning are preserved; only the
+    /// vectors are rebuilt (store_with_options replaces in place).
+    pub fn reencode_all(&self) {
+        let state = self.snapshot_for_save();
+        for g in &state.goals {
+            self.restore_goal(g);
+        }
+        for t in &state.tasks {
+            self.restore_task(t);
+        }
+        if let Some(st) = &state.status {
+            self.restore_status(st);
+        }
+        if !state.goals.is_empty() || !state.tasks.is_empty() {
+            tracing::info!(
+                "re-encoded {} goal(s), {} task(s) for the current model",
+                state.goals.len(),
+                state.tasks.len()
+            );
+        }
+    }
+
     /// Restore goal/task/status entries from disk. Idempotent — safe to
     /// call on a manager that has never been saved (no-op if file missing).
     /// Logs and continues on parse errors (returns the same instance) so

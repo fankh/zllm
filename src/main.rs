@@ -476,7 +476,7 @@ async fn main() -> anyhow::Result<()> {
             if std::env::var("ZLLM_VK").is_ok() {
                 let prompt_tokens = tok.encode(&prompt)?;
                 tracing::info!("Prompt: {} tokens", prompt_tokens.len());
-                let eos_id = tok.eos_token_id().unwrap_or(128001);
+                let stops = tok.stop_token_ids();
                 let t_load = std::time::Instant::now();
                 match backend::vulkan::VkContext::new()
                     .and_then(|ctx| backend::vulkan::VkModel::load(model.to_str().unwrap_or(""), ctx))
@@ -505,7 +505,7 @@ async fn main() -> anyhow::Result<()> {
                         let mut pos = prompt_tokens.len();
                         let start = std::time::Instant::now(); // time decode (steady-state)
                         let mut generated = 0usize;
-                        while generated < max_tokens && next != eos_id && next != 128009 {
+                        while generated < max_tokens && !stops.contains(&next) {
                             if let Ok(text) = tok.decode(&[next]) { print!("{text}"); std::io::stdout().flush()?; }
                             generated += 1;
                             next = vmodel.forward_argmax(next, pos); pos += 1;
@@ -531,7 +531,7 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Prompt: {} tokens", prompt_tokens.len());
 
             // Generate tokens
-            let eos_id = tok.eos_token_id().unwrap_or(128001);
+            let stops = tok.stop_token_ids();
             let mut all_tokens = prompt_tokens.clone();
             let start = std::time::Instant::now();
             let mut generated = 0usize;
@@ -553,7 +553,7 @@ async fn main() -> anyhow::Result<()> {
                 // For now, generate_token returns greedy argmax
                 // TODO: expose logits and use our sampler
 
-                if token_id == eos_id || token_id == 128009 {
+                if stops.contains(&token_id) {
                     break;
                 }
 

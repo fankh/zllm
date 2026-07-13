@@ -494,3 +494,103 @@ fn test_manual_layer_drive_matches_fused_forward() {
     // Out-of-range layer must be a hard error, not a silent identity.
     assert!(backend.forward_layer(n_layers, &hidden, seq_len).is_err());
 }
+
+// --- Test 11: Runner decode is real autoregression ---
+//
+// With reasoning_layers = 0 the 3-zone program reduces to a plain
+// full-depth forward, so the runner's greedy decode must reproduce the
+// fused KV-path greedy continuation token-for-token. The old decode
+// loop sampled every token from one frozen logit vector (and stopped on
+// the Llama-2 id 2) — this test pins the fix.
+
+#[test]
+fn test_runner_decode_matches_greedy_continuation() {
+    if !model_available() {
+        println!("SKIP: model not found");
+        return;
+    }
+    let tokenizer = LlamaTokenizer::from_file(TOKENIZER_PATH).unwrap();
+    let prompt = tokenizer.encode("The capital of France is").unwrap();
+    let n_new = 4usize;
+
+    // Reference: greedy continuation via stateless full re-forwards on the
+    // fused path — the same prefill kernels the runner's per-layer surface
+    // uses, so equality is exact. (The KV-cache decode path uses a different
+    // CPU SDPA kernel whose accumulation order can flip near-tied logits —
+    // e.g. " The capital" vs " The Eiffel" here — so it is not a bit-exact
+    // oracle for this comparison.)
+    let mut backend = CandleCpuBackend::new();
+    backend.load_model(
+        Path::new(MODEL_PATH),
+        &QuantConfig { method: "gguf".into(), bits: 4 },
+    ).unwrap();
+    let stops = tokenizer.stop_token_ids();
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i as u32)
+            .unwrap()
+    };
+    let mut all = prompt.clone();
+    let mut reference = Vec::new();
+    for _ in 0..n_new {
+        backend.reset_position();
+        let logits = backend.forward_logits(&all).unwrap();
+        let t = argmax(&logits);
+        reference.push(t);
+        if stops.contains(&t) {
+            break;
+        }
+        all.push(t);
+    }
+
+    // Runner path: zones over the trait surface, then autoregressive decode.
+    let mut runner_backend = CandleCpuBackend::new();
+    runner_backend.load_model(
+        Path::new(MODEL_PATH),
+        &QuantConfig { method: "gguf".into(), bits: 4 },
+    ).unwrap();
+    let d_model = 2048; // Llama 3.2 1B
+    let mut runner = zllm::engine::runner::InferenceRunner::new(
+        Box::new(runner_backend), d_model, 0,
+    )
+    .with_eos_tokens(tokenizer.stop_token_ids());
+    let config = zllm::engine::sampler::SamplerConfig {
+        temperature: 0.0, top_k: 0, top_p: 1.0,
+    };
+    let budget = ReasoningBudget::from_tier("free");
+    let result = runner
+        .generate(&prompt, n_new, &config, &budget, "req-ar")
+        .expect("runner generate");
+
+    println!(
+        "reference: {:?} '{}'\nrunner:    {:?} '{}'",
+        reference,
+        tokenizer.decode(&reference).unwrap_or_default(),
+        result.tokens,
+        tokenizer.decode(&result.tokens).unwrap_or_default(),
+    );
+    assert_eq!(
+        result.tokens, reference,
+        "runner decode must match the fused greedy continuation"
+    );
+}
+
+// --- Test 12: Stop-token set derived from the tokenizer ---
+
+#[test]
+fn test_stop_token_ids_from_vocab() {
+    if !model_available() {
+        println!("SKIP: tokenizer not found");
+        return;
+    }
+    let tok = LlamaTokenizer::from_file(TOKENIZER_PATH).unwrap();
+    let stops = tok.stop_token_ids();
+    // Llama-3 vocab: both <|end_of_text|> and <|eot_id|> must come out of
+    // the vocab probe — 128009 used to be hardcoded at every call site.
+    assert!(stops.contains(&128001), "missing <|end_of_text|>: {stops:?}");
+    assert!(stops.contains(&128009), "missing <|eot_id|>: {stops:?}");
+    assert!(!stops.contains(&2), "Llama-2 </s> id must not appear for a Llama-3 vocab");
+    println!("stop set: {stops:?}");
+}

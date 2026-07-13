@@ -52,6 +52,40 @@ impl LlamaTokenizer {
             .or_else(|| self.inner.token_to_id("<|eot_id|>"))
     }
 
+    /// Vocab lookup for a literal token string. Used for chat-template
+    /// family detection and stop-set construction.
+    pub fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.inner.token_to_id(token)
+    }
+
+    /// Every token id that should terminate generation for this model:
+    /// the EOS token plus whichever end-of-turn specials exist in this
+    /// vocab (Llama-3 `<|eot_id|>`/`<|eom_id|>`, ChatML `<|im_end|>`,
+    /// Phi `<|end|>`, GPT-style `<|endoftext|>`). Derived from the loaded
+    /// tokenizer rather than hardcoded ids, so the stop set is correct
+    /// across model families — Llama-3's 128009 was previously baked in
+    /// and wrong for everything else.
+    pub fn stop_token_ids(&self) -> Vec<u32> {
+        let mut ids = Vec::new();
+        if let Some(eos) = self.eos_token_id() {
+            ids.push(eos);
+        }
+        for tok in ["<|eot_id|>", "<|eom_id|>", "<|im_end|>", "<|end|>", "<|endoftext|>"] {
+            if let Some(id) = self.inner.token_to_id(tok) {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        // Last-resort fallback so an exotic tokenizer with none of the
+        // known stop tokens still terminates (128001 = Llama-3
+        // <|end_of_text|>, the previous hardcoded default).
+        if ids.is_empty() {
+            ids.push(128001);
+        }
+        ids
+    }
+
     /// id → decoded surface bytes for every vocab entry, for grammar-constrained
     /// decoding (the FSM walks these bytes through its DFA). `None` for special
     /// tokens (decode to "" with skip-special) and tokens that aren't valid UTF-8

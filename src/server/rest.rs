@@ -661,9 +661,9 @@ async fn select_model(
 
     // Selectively clear Context captures — they have an n_embd from
     // the previous model and would dilute injections done on the new
-    // one. Goal / Task / Status entries are model-agnostic text-only
-    // records (their vectors are zero-padded placeholders, not real
-    // hidden states) so they survive the swap.
+    // one. Goal / Task / Status entries survive the swap (their text is
+    // model-agnostic) but their vectors are real embeddings in the OLD
+    // model's space and width, so they must be re-encoded below.
     if let Ok(mut store) = s.memory.write() {
         let to_remove: Vec<String> = store
             .query_by_category(&MemoryCategory::Context)
@@ -674,6 +674,10 @@ async fn select_model(
             store.remove(&key);
         }
     }
+    // Re-embed goals/tasks/status against the swapped-in model. The
+    // encoder reads the tokenizer + pool we just updated; slot locks are
+    // released at this point, so the try_lock inside the encoder succeeds.
+    s.goals.reencode_all();
 
     tracing::info!("model swapped to {} ({})", req.id, gguf_path.display());
     Json(json!({"success": true, "current": req.id})).into_response()
@@ -746,7 +750,8 @@ async fn chat_completions(
 ) -> impl IntoResponse {
     // Build the rendered prompt with goal-prefix injected as the system
     // message.
-    let prompt = render_chat_prompt(&s.goals, &req.messages);
+    let family = ChatFamily::detect(&s.tokenizer.read().unwrap());
+    let prompt = render_chat_prompt(&s.goals, &req.messages, family);
     let tokens = match s.tokenizer.read().unwrap().encode(&prompt) {
         Ok(t) => t,
         Err(e) => {
@@ -802,8 +807,18 @@ async fn chat_completions(
             crate::backend::gpu::SamplingParams { temp, top_k: sampler_cfg.top_k as u32, top_p: sampler_cfg.top_p }
         };
         let seed = req.seed.unwrap_or(0);
-        let eos = s.tokenizer.read().unwrap().eos_token_id().unwrap_or(128001);
-        let stop_eot = 128009u32;
+        let (eos, stop_eot) = {
+            let tok = s.tokenizer.read().unwrap();
+            let eos = tok.eos_token_id().unwrap_or(128001);
+            // End-of-turn stop derived from the vocab (Llama-3 <|eot_id|>,
+            // ChatML <|im_end|>) instead of a hardcoded Llama-3 id; falls
+            // back to EOS for vocabs with no separate turn token.
+            let eot = tok
+                .token_to_id("<|eot_id|>")
+                .or_else(|| tok.token_to_id("<|im_end|>"))
+                .unwrap_or(eos);
+            (eos, eot)
+        };
         match server.submit(tokens, max_tokens, stop_eot, params, seed) {
             Ok(rx) => {
                 return if req.stream {
@@ -1071,8 +1086,17 @@ async fn cb_completions(
             Ok(t) => t,
             Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("tokenize: {e}")}))).into_response(),
         };
-        let eos = s.tokenizer.read().unwrap().eos_token_id().unwrap_or(128001);
-        let stop_eot = 128009u32; // Llama 3.2 <|eot_id|> — the chat-turn stop token
+        let (eos, stop_eot) = {
+            let tok = s.tokenizer.read().unwrap();
+            let eos = tok.eos_token_id().unwrap_or(128001);
+            // Chat-turn stop token from the vocab (<|eot_id|> / <|im_end|>),
+            // not the hardcoded Llama-3 128009; falls back to EOS.
+            let eot = tok
+                .token_to_id("<|eot_id|>")
+                .or_else(|| tok.token_to_id("<|im_end|>"))
+                .unwrap_or(eos);
+            (eos, eot)
+        };
         let params = crate::backend::gpu::SamplingParams {
             temp: req.temperature.unwrap_or(0.0),
             top_k: req.top_k.unwrap_or(0),
@@ -1262,10 +1286,38 @@ fn capture_prefill_to_memory(
     }
 }
 
-/// Llama 3 instruct chat template with the goal prefix folded into the
-/// effective system message. Hand-built — getting the special tokens right
-/// matters for output quality, but tokenizer.encode handles them.
-fn render_chat_prompt(goals: &GoalManager, messages: &[ChatMessage]) -> String {
+/// Chat-template family, detected from the loaded tokenizer's vocab
+/// instead of assuming Llama 3. The arch gate limits swaps to llama-arch
+/// GGUFs, but that family spans three prompt formats in the wild:
+/// Llama-3 header style, ChatML (many llama-arch finetunes: Hermes,
+/// TinyLlama-Chat, …), and Llama-2 `[INST]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatFamily {
+    Llama3,
+    ChatMl,
+    Llama2,
+}
+
+impl ChatFamily {
+    fn detect(tok: &LlamaTokenizer) -> Self {
+        if tok.token_to_id("<|start_header_id|>").is_some() {
+            ChatFamily::Llama3
+        } else if tok.token_to_id("<|im_start|>").is_some() {
+            ChatFamily::ChatMl
+        } else if tok.token_to_id("</s>").is_some() {
+            ChatFamily::Llama2
+        } else {
+            // Unknown vocab — Llama 3 headers were the previous
+            // unconditional behavior, keep them as the default.
+            ChatFamily::Llama3
+        }
+    }
+}
+
+/// Instruct chat template with the goal prefix folded into the effective
+/// system message. Hand-built per family — getting the special tokens
+/// right matters for output quality, but tokenizer.encode handles them.
+fn render_chat_prompt(goals: &GoalManager, messages: &[ChatMessage], family: ChatFamily) -> String {
     let prefix = goals.build_prompt_prefix();
     let mut sys = prefix.trim_end().to_string();
     let mut other_messages: Vec<&ChatMessage> = Vec::new();
@@ -1280,20 +1332,71 @@ fn render_chat_prompt(goals: &GoalManager, messages: &[ChatMessage]) -> String {
         }
     }
 
-    let mut out = String::from("<|begin_of_text|>");
-    if !sys.is_empty() {
-        out.push_str("<|start_header_id|>system<|end_header_id|>\n\n");
-        out.push_str(&sys);
-        out.push_str("<|eot_id|>");
+    let mut out = String::new();
+    match family {
+        ChatFamily::Llama3 => {
+            out.push_str("<|begin_of_text|>");
+            if !sys.is_empty() {
+                out.push_str("<|start_header_id|>system<|end_header_id|>\n\n");
+                out.push_str(&sys);
+                out.push_str("<|eot_id|>");
+            }
+            for m in other_messages {
+                out.push_str("<|start_header_id|>");
+                out.push_str(&m.role);
+                out.push_str("<|end_header_id|>\n\n");
+                out.push_str(&m.content);
+                out.push_str("<|eot_id|>");
+            }
+            out.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+        }
+        ChatFamily::ChatMl => {
+            if !sys.is_empty() {
+                out.push_str("<|im_start|>system\n");
+                out.push_str(&sys);
+                out.push_str("<|im_end|>\n");
+            }
+            for m in other_messages {
+                out.push_str("<|im_start|>");
+                out.push_str(&m.role);
+                out.push('\n');
+                out.push_str(&m.content);
+                out.push_str("<|im_end|>\n");
+            }
+            out.push_str("<|im_start|>assistant\n");
+        }
+        ChatFamily::Llama2 => {
+            // BOS comes from tokenizer.encode(add_special_tokens=true);
+            // assistant turns close with </s> per the Llama-2 format.
+            let mut first_user = true;
+            for m in other_messages {
+                match m.role.as_str() {
+                    "assistant" => {
+                        out.push(' ');
+                        out.push_str(&m.content);
+                        out.push_str(" </s>");
+                    }
+                    _ => {
+                        out.push_str("[INST] ");
+                        if first_user && !sys.is_empty() {
+                            out.push_str("<<SYS>>\n");
+                            out.push_str(&sys);
+                            out.push_str("\n<</SYS>>\n\n");
+                        }
+                        first_user = false;
+                        out.push_str(&m.content);
+                        out.push_str(" [/INST]");
+                    }
+                }
+            }
+            if first_user && !sys.is_empty() {
+                // System prompt but no user turn — still emit it.
+                out.push_str("[INST] <<SYS>>\n");
+                out.push_str(&sys);
+                out.push_str("\n<</SYS>>\n\n [/INST]");
+            }
+        }
     }
-    for m in other_messages {
-        out.push_str("<|start_header_id|>");
-        out.push_str(&m.role);
-        out.push_str("<|end_header_id|>\n\n");
-        out.push_str(&m.content);
-        out.push_str("<|eot_id|>");
-    }
-    out.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
     out
 }
 
@@ -1319,7 +1422,7 @@ fn generate_spec_decode(
     _sampler_cfg: &SamplerConfig,
 ) -> (String, usize, usize, &'static str) {
     let prompt_len = prompt_tokens.len();
-    let eos = s.tokenizer.read().unwrap().eos_token_id().unwrap_or(128001);
+    let stops = s.tokenizer.read().unwrap().stop_token_ids();
     let mut all_tokens = prompt_tokens;
     let mut generated_ids: Vec<u32> = Vec::new();
     let mut slot = acquire_slot(&s.pool);
@@ -1368,7 +1471,7 @@ fn generate_spec_decode(
         last_draft_logit = iter.next_draft_logit;
         let mut hit_eos = false;
         for t in iter.committed {
-            if t == eos || t == 128009 { hit_eos = true; break; }
+            if stops.contains(&t) { hit_eos = true; break; }
             all_tokens.push(t);
             generated_ids.push(t);
             if generated_ids.len() >= max_tokens { break; }
@@ -1402,7 +1505,7 @@ fn generate_gpu(
     sampler_cfg: &SamplerConfig,
 ) -> (String, usize, usize, &'static str) {
     let prompt_len = prompt_tokens.len();
-    let eos = s.tokenizer.read().unwrap().eos_token_id().unwrap_or(128001);
+    let stops = s.tokenizer.read().unwrap().stop_token_ids();
     // Greedy decode (temperature 0) can use the GPU argmax path, which reads
     // back 4 bytes instead of the 128k-wide logit vector each token (~40% more
     // decode tok/s). Sampling needs the full logits on the CPU.
@@ -1418,7 +1521,7 @@ fn generate_gpu(
     let t_decode = std::time::Instant::now();
     let mut next = sample(&first_logits, sampler_cfg);
     loop {
-        if next == eos || next == 128009 {
+        if stops.contains(&next) {
             finish_reason = "stop";
             break;
         }
@@ -1457,7 +1560,7 @@ fn generate_vk(
     sampler_cfg: &SamplerConfig,
 ) -> (String, usize, usize, &'static str) {
     let prompt_len = prompt_tokens.len();
-    let eos = s.tokenizer.read().unwrap().eos_token_id().unwrap_or(128001);
+    let stops = s.tokenizer.read().unwrap().stop_token_ids();
     let greedy = sampler_cfg.temperature == 0.0;
     let t_prefill = std::time::Instant::now();
     // Prefill with cross-request prefix reuse: K/V for the longest common prefix
@@ -1471,7 +1574,7 @@ fn generate_vk(
     let mut pos = prompt_len;
     let t_decode = std::time::Instant::now();
     loop {
-        if next == eos || next == 128009 { finish_reason = "stop"; break; }
+        if stops.contains(&next) { finish_reason = "stop"; break; }
         generated.push(next);
         if generated.len() >= max_tokens { break; }
         next = if greedy { model.forward_argmax(next, pos) } else { sample(&model.forward(next, pos), sampler_cfg) };
@@ -1570,7 +1673,7 @@ fn generate_blocking(
         }
     }
     let prompt_len = prompt_tokens.len();
-    let eos = s.tokenizer.read().unwrap().eos_token_id().unwrap_or(128001);
+    let stops = s.tokenizer.read().unwrap().stop_token_ids();
     let mut all_tokens = prompt_tokens;
     let mut generated_ids: Vec<u32> = Vec::new();
     // Acquire any free backend slot — falls back to round-robin block
@@ -1704,7 +1807,7 @@ fn generate_blocking(
             let tok_text = s.tokenizer.read().unwrap().decode(&[next]).unwrap_or_default();
             observer.record_token(generated_ids.len(), next, tok_text, &logits, 5);
         }
-        if next == eos || next == 128009 {
+        if stops.contains(&next) {
             break;
         }
         all_tokens.push(next);
@@ -1756,7 +1859,7 @@ fn generate_blocking(
 
                 let mut early_eos = false;
                 for d in &draft[..verify.accepted] {
-                    if *d == eos || *d == 128009 { early_eos = true; break; }
+                    if stops.contains(d) { early_eos = true; break; }
                     all_tokens.push(*d);
                     generated_ids.push(*d);
                     if generated_ids.len() >= max_tokens { break; }
@@ -1772,8 +1875,7 @@ fn generate_blocking(
                 }
                 // Also emit the bonus/corrected token (always present).
                 if !early_eos
-                    && verify.bonus != eos
-                    && verify.bonus != 128009
+                    && !stops.contains(&verify.bonus)
                     && generated_ids.len() < max_tokens
                 {
                     all_tokens.push(verify.bonus);
@@ -1837,7 +1939,7 @@ fn chat_stream(
     let _ = tx.unbounded_send(Ok(Event::default().data(role_chunk.to_string())));
 
     tokio::task::spawn_blocking(move || {
-        let eos = s.tokenizer.read().unwrap().eos_token_id().unwrap_or(128001);
+        let stops = s.tokenizer.read().unwrap().stop_token_ids();
 
         // iGPU fast-lane (streaming): same eligibility as generate_blocking's
         // GPU path. Streams tokens from the resident GPU engine over SSE, then
@@ -1865,7 +1967,7 @@ fn chat_stream(
                         let mut next = sample(&first_logits, &sampler_cfg);
                         let t_decode = std::time::Instant::now();
                         loop {
-                            if next == eos || next == 128009 {
+                            if stops.contains(&next) {
                                 finish_reason = "stop";
                                 break;
                             }
@@ -1935,7 +2037,7 @@ fn chat_stream(
                         let mut pos = prompt_len;
                         let mut generated = 0usize;
                         loop {
-                            if next == eos || next == 128009 { finish_reason = "stop"; break; }
+                            if stops.contains(&next) { finish_reason = "stop"; break; }
                             let text = s.tokenizer.read().unwrap().decode(&[next]).unwrap_or_default();
                             let chunk = json!({
                                 "id": id, "object": "chat.completion.chunk",
@@ -2039,7 +2141,7 @@ fn chat_stream(
                 let tok_text = s.tokenizer.read().unwrap().decode(&[next]).unwrap_or_default();
                 observer.record_token(generated, next, tok_text, &logits, 5);
             }
-            if next == eos || next == 128009 {
+            if stops.contains(&next) {
                 break;
             }
             all_tokens.push(next);
@@ -2085,7 +2187,7 @@ fn chat_stream(
                     crate::metrics::pld_tokens_rejected().inc_by((draft_len - verify.accepted) as u64);
                     let mut early_eos = false;
                     for d in &draft[..verify.accepted] {
-                        if *d == eos || *d == 128009 { early_eos = true; break; }
+                        if stops.contains(d) { early_eos = true; break; }
                         all_tokens.push(*d); generated += 1;
                         if !send_tok(*d, &mut tx) { early_eos = true; break; }
                         if generated >= max_tokens { break; }
@@ -2097,8 +2199,7 @@ fn chat_stream(
                         prompt_cache.clear();
                     }
                     if !early_eos
-                        && verify.bonus != eos
-                        && verify.bonus != 128009
+                        && !stops.contains(&verify.bonus)
                         && generated < max_tokens
                     {
                         all_tokens.push(verify.bonus); generated += 1;
@@ -2521,7 +2622,7 @@ async fn layer_agreement(
         }
         generated.push(final_token);
         last_token = final_token;
-        if final_token == s.tokenizer.read().unwrap().eos_token_id().unwrap_or(128001) { break; }
+        if s.tokenizer.read().unwrap().stop_token_ids().contains(&final_token) { break; }
     }
     let n = generated.len() as f32;
     let pct: Vec<f64> = agreement.iter().map(|&c| 100.0 * c as f64 / n.max(1.0) as f64).collect();
