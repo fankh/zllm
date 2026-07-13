@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod gguf_vocab;
 pub mod q4k_avx512;
 pub mod q4k_repack;
 pub mod quantized_llama_fork;

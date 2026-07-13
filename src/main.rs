@@ -106,7 +106,9 @@ async fn main() -> anyhow::Result<()> {
             let cfg = config::ZllmConfig::load(&config)?;
             tracing::info!("Starting ZLLM server (REST: {})", cfg.server.rest_port);
 
-            // Tokenizer: explicit path wins; otherwise look next to the model.
+            // Tokenizer: explicit path wins; then sibling tokenizer.json;
+            // then the vocab EMBEDDED in the GGUF (single-file loading,
+            // BPE vocabs — oracle-tested identical to tokenizer.json).
             let tokenizer = if !cfg.model.tokenizer_path.is_empty() {
                 LlamaTokenizer::from_file(&cfg.model.tokenizer_path)?
             } else {
@@ -117,9 +119,12 @@ async fn main() -> anyhow::Result<()> {
                     .join("tokenizer.json");
                 if next_to.exists() {
                     LlamaTokenizer::from_file(next_to.to_str().unwrap())?
+                } else if model_path.exists() {
+                    tracing::info!("no sibling tokenizer.json — using the GGUF-embedded vocab");
+                    LlamaTokenizer::from_gguf_file(&model_path)?
                 } else {
                     return Err(anyhow::anyhow!(
-                        "tokenizer.json not found at model.tokenizer_path or next to model.path ({})",
+                        "no tokenizer: model.tokenizer_path unset, no tokenizer.json at {}, and no GGUF to read an embedded vocab from",
                         next_to.display()
                     ));
                 }
@@ -413,6 +418,13 @@ async fn main() -> anyhow::Result<()> {
                 current_model: Arc::new(RwLock::new(current_model)),
                 arch_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
                 token_table: Arc::new(RwLock::new(None)),
+                // Embedded chat template + declared stop ids from the GGUF
+                // itself — refreshed on swap (rest.rs).
+                chat_meta: Arc::new(RwLock::new(if model_exists {
+                    server::chat_template::read_gguf_chat_meta(&model_path)
+                } else {
+                    Default::default()
+                })),
                 hooks: Arc::new(hook_registry),
                 inspection_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 pld_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -469,12 +481,8 @@ async fn main() -> anyhow::Result<()> {
                 if tok_path.exists() {
                     LlamaTokenizer::from_file(tok_path.to_str().unwrap())?
                 } else {
-                    // No silent HF fallback: the old one downloaded a gated
-                    // meta-llama repo and 401'd without a token anyway.
-                    return Err(anyhow::anyhow!(
-                        "tokenizer.json not found next to {} — pass --tokenizer <path>",
-                        model.display()
-                    ));
+                    tracing::info!("no sibling tokenizer.json — using the GGUF-embedded vocab");
+                    LlamaTokenizer::from_gguf_file(&model)?
                 }
             } else {
                 LlamaTokenizer::from_file(&tokenizer)?

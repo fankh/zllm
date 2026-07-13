@@ -126,3 +126,10 @@ naga = { version = "22.1", features = ["wgsl-in", "spv-out"] }
 # server). Already in the dependency tree via hf-hub.
 ureq = { version = "2", features = ["json"] }
 
+[dependencies.minijinja]
+# Renders GGUF-embedded chat templates (tokenizer.chat_template) — the
+# same approach as llama.cpp's minja. Heuristic ChatFamily templates
+# remain the fallback for template-less GGUFs.
+version = "2"
+features = ["builtins", "loader"]
+

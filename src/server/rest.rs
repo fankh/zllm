@@ -74,6 +74,12 @@ pub struct AppState {
     /// (`regex:` mode). One decode per vocab entry (~100ms for 128k) on first
     /// grammar request; invalidated on model swap (tokenizer changes).
     pub token_table: Arc<RwLock<Option<Arc<crate::engine::logit_fsm::TokenByteTable>>>>,
+    /// Chat-relevant GGUF metadata (embedded chat template + DECLARED
+    /// stop ids + BOS), read at load and refreshed on model swap. The
+    /// template renders via minijinja; the ChatFamily vocab heuristics
+    /// are the fallback for template-less GGUFs. Declared stop ids are
+    /// unioned with the vocab probe in `stop_set`.
+    pub chat_meta: Arc<RwLock<crate::server::chat_template::GgufChatMeta>>,
     /// Hook registry consulted on every chat prefill via `RunnerObserver`.
     /// Built once at startup with the default `MemoryInjectHook` plus
     /// anything callers add before serving — see `main.rs`.
@@ -550,15 +556,6 @@ async fn select_model(
             .into_response();
     };
     let tok_path = gguf_path.with_file_name("tokenizer.json");
-    if !tok_path.exists() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": format!("tokenizer.json not found next to {}", gguf_path.display())
-            })),
-        )
-            .into_response();
-    }
 
     // Architecture pre-check. We refuse non-Llama BEFORE unloading the
     // current model so a failed swap doesn't leave the backend empty.
@@ -577,15 +574,35 @@ async fn select_model(
     }
 
     // Load the new tokenizer first so a tokenizer error doesn't leave us
-    // with an unloaded backend.
-    let new_tok = match LlamaTokenizer::from_file(tok_path.to_str().unwrap_or("")) {
-        Ok(t) => t,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("tokenizer load failed: {e}")})),
-            )
-                .into_response();
+    // with an unloaded backend. Sibling tokenizer.json preferred; the
+    // GGUF-embedded vocab (BPE) makes bare .gguf files swappable.
+    let new_tok = if tok_path.exists() {
+        match LlamaTokenizer::from_file(tok_path.to_str().unwrap_or("")) {
+            Ok(t) => t,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("tokenizer load failed: {e}")})),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        match LlamaTokenizer::from_gguf_file(&gguf_path) {
+            Ok(t) => {
+                tracing::info!("no sibling tokenizer.json — using the GGUF-embedded vocab");
+                t
+            }
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!(
+                        "no tokenizer.json next to {} and the embedded vocab is unusable: {e}",
+                        gguf_path.display()
+                    )})),
+                )
+                    .into_response();
+            }
         }
     };
 
@@ -658,6 +675,9 @@ async fn select_model(
     *s.current_model.write().expect("current_model poisoned") = req.id.clone();
     // Grammar byte table is tokenizer-specific — rebuild lazily on next use.
     *s.token_table.write().expect("token_table poisoned") = None;
+    // Chat template + declared stop ids follow the new GGUF.
+    *s.chat_meta.write().expect("chat_meta poisoned") =
+        crate::server::chat_template::read_gguf_chat_meta(&gguf_path);
 
     // Selectively clear Context captures — they have an n_embd from
     // the previous model and would dilute injections done on the new
@@ -815,6 +835,19 @@ fn build_decode_ctrl(
     )
 }
 
+/// The stop-TOKEN set for the loaded model: ids the GGUF declares
+/// (ground truth) unioned with the vocab probe (covers GGUFs that
+/// predate the declared fields).
+fn stop_set(s: &AppState) -> Vec<u32> {
+    let mut ids = s.chat_meta.read().unwrap().stop_ids.clone();
+    for id in s.tokenizer.read().unwrap().stop_token_ids() {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
 /// Decode the generated tail into text for stop-string matching. Always
 /// a window re-decode — per-token decodes drop SentencePiece space
 /// markers and would miss stops spanning token boundaries.
@@ -843,8 +876,7 @@ async fn chat_completions(
 ) -> impl IntoResponse {
     // Build the rendered prompt with goal-prefix injected as the system
     // message.
-    let family = ChatFamily::detect(&s.tokenizer.read().unwrap());
-    let prompt = render_chat_prompt(&s.goals, &req.messages, family);
+    let prompt = render_chat_prompt(&s, &req.messages);
     let tokens = match s.tokenizer.read().unwrap().encode(&prompt) {
         Ok(t) => t,
         Err(e) => {
@@ -1595,11 +1627,12 @@ impl ChatFamily {
     }
 }
 
-/// Instruct chat template with the goal prefix folded into the effective
-/// system message. Hand-built per family — getting the special tokens
-/// right matters for output quality, but tokenizer.encode handles them.
-fn render_chat_prompt(goals: &GoalManager, messages: &[ChatMessage], family: ChatFamily) -> String {
-    let prefix = goals.build_prompt_prefix();
+/// Render the chat prompt with the goal prefix folded into the effective
+/// system message. The GGUF-embedded chat template (minijinja) is
+/// authoritative when present; the hand-built family templates below are
+/// the fallback for template-less GGUFs and render failures.
+fn render_chat_prompt(s: &AppState, messages: &[ChatMessage]) -> String {
+    let prefix = s.goals.build_prompt_prefix();
     let mut sys = prefix.trim_end().to_string();
     let mut other_messages: Vec<&ChatMessage> = Vec::new();
     for m in messages {
@@ -1613,6 +1646,31 @@ fn render_chat_prompt(goals: &GoalManager, messages: &[ChatMessage], family: Cha
         }
     }
 
+    // GGUF-embedded template first.
+    let meta = s.chat_meta.read().unwrap().clone();
+    if let Some(tpl) = &meta.template {
+        let tok = s.tokenizer.read().unwrap();
+        let bos = meta.bos_id.and_then(|id| tok.id_to_token(id)).unwrap_or_default();
+        let eos = meta
+            .stop_ids
+            .first()
+            .and_then(|&id| tok.id_to_token(id))
+            .unwrap_or_default();
+        drop(tok);
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        if !sys.is_empty() {
+            pairs.push(("system".to_string(), sys.clone()));
+        }
+        for m in &other_messages {
+            pairs.push((m.role.clone(), m.content.clone()));
+        }
+        match crate::server::chat_template::render(tpl, &pairs, &bos, &eos) {
+            Ok(p) => return p,
+            Err(e) => tracing::warn!("{e}; falling back to family heuristics"),
+        }
+    }
+
+    let family = ChatFamily::detect(&s.tokenizer.read().unwrap());
     let mut out = String::new();
     match family {
         ChatFamily::Llama3 => {
@@ -1734,7 +1792,7 @@ fn generate_spec_decode(
     ctrl: &mut DecodeControl,
 ) -> (String, usize, usize, &'static str) {
     let prompt_len = prompt_tokens.len();
-    let stops = s.tokenizer.read().unwrap().stop_token_ids();
+    let stops = stop_set(s);
     let mut all_tokens = prompt_tokens;
     let mut generated_ids: Vec<u32> = Vec::new();
     let mut slot = acquire_slot(&s.pool);
@@ -1825,7 +1883,7 @@ fn generate_gpu(
     ctrl: &mut DecodeControl,
 ) -> (String, usize, usize, &'static str) {
     let prompt_len = prompt_tokens.len();
-    let stops = s.tokenizer.read().unwrap().stop_token_ids();
+    let stops = stop_set(s);
     // Greedy decode (temperature 0) can use the GPU argmax path, which reads
     // back 4 bytes instead of the 128k-wide logit vector each token (~40% more
     // decode tok/s). Sampling — or any logit adjustment (penalties /
@@ -1894,7 +1952,7 @@ fn generate_vk(
     ctrl: &mut DecodeControl,
 ) -> (String, usize, usize, &'static str) {
     let prompt_len = prompt_tokens.len();
-    let stops = s.tokenizer.read().unwrap().stop_token_ids();
+    let stops = stop_set(s);
     // GPU argmax readback only when nothing adjusts the distribution.
     let greedy = sampler_cfg.temperature == 0.0 && !ctrl.modifies_logits();
     ctrl.observe_prompt_tail(prompt_tokens, 64);
@@ -2020,7 +2078,7 @@ fn generate_blocking(
         }
     }
     let prompt_len = prompt_tokens.len();
-    let stops = s.tokenizer.read().unwrap().stop_token_ids();
+    let stops = stop_set(s);
     ctrl.observe_prompt_tail(&prompt_tokens, 64);
     let mut all_tokens = prompt_tokens;
     let mut generated_ids: Vec<u32> = Vec::new();
@@ -2304,7 +2362,7 @@ fn chat_stream(
     let _ = tx.unbounded_send(Ok(Event::default().data(role_chunk.to_string())));
 
     tokio::task::spawn_blocking(move || {
-        let stops = s.tokenizer.read().unwrap().stop_token_ids();
+        let stops = stop_set(&s);
 
         // iGPU fast-lane (streaming): same eligibility as generate_blocking's
         // GPU path. Streams tokens from the resident GPU engine over SSE, then
@@ -3024,7 +3082,7 @@ async fn layer_agreement(
         }
         generated.push(final_token);
         last_token = final_token;
-        if s.tokenizer.read().unwrap().stop_token_ids().contains(&final_token) { break; }
+        if stop_set(&s).contains(&final_token) { break; }
     }
     let n = generated.len() as f32;
     let pct: Vec<f64> = agreement.iter().map(|&c| 100.0 * c as f64 / n.max(1.0) as f64).collect();

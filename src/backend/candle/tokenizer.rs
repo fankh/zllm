@@ -11,6 +11,24 @@ impl LlamaTokenizer {
         Ok(Self { inner })
     }
 
+    /// Build from the vocab EMBEDDED in a GGUF (single-file loading).
+    /// BPE ("gpt2") vocabs only — see `gguf_vocab` for scope and the
+    /// oracle test enforcing parity with sibling tokenizer.json files.
+    pub fn from_gguf_content(content: &candle_core::quantized::gguf_file::Content) -> Result<Self> {
+        let inner = crate::backend::candle::gguf_vocab::tokenizer_from_gguf(content)
+            .map_err(ZllmError::Model)?;
+        Ok(Self { inner })
+    }
+
+    /// Convenience: open a GGUF file and build from its embedded vocab.
+    pub fn from_gguf_file(path: &std::path::Path) -> Result<Self> {
+        let mut f = std::fs::File::open(path)
+            .map_err(|e| ZllmError::Model(format!("cannot open {}: {e}", path.display())))?;
+        let content = candle_core::quantized::gguf_file::Content::read(&mut f)
+            .map_err(|e| ZllmError::Model(format!("invalid GGUF: {e}")))?;
+        Self::from_gguf_content(&content)
+    }
+
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let encoding = self
             .inner
@@ -42,6 +60,13 @@ impl LlamaTokenizer {
     /// family detection and stop-set construction.
     pub fn token_to_id(&self, token: &str) -> Option<u32> {
         self.inner.token_to_id(token)
+    }
+
+    /// Reverse lookup: token id → its literal surface string (specials
+    /// included — unlike `decode`, which strips them). Used to feed
+    /// `bos_token`/`eos_token` into GGUF chat templates.
+    pub fn id_to_token(&self, id: u32) -> Option<String> {
+        self.inner.id_to_token(id)
     }
 
     /// Every token id that should terminate generation for this model:

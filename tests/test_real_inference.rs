@@ -579,6 +579,67 @@ fn test_runner_decode_matches_greedy_continuation() {
     );
 }
 
+// --- Test 13: GGUF-embedded tokenizer parity with tokenizer.json ---
+//
+// Single-file loading is only safe if the GGUF-built tokenizer is
+// token-for-token identical to the model's tokenizer.json. This oracle
+// runs both constructions over adversarial samples (whitespace runs,
+// digits, contractions, unicode, specials, code) and demands equality.
+
+fn run_vocab_oracle(gguf_path: &Path, tokenizer_json: &str) {
+    let json_tok = LlamaTokenizer::from_file(tokenizer_json).unwrap();
+    let gguf_tok = LlamaTokenizer::from_gguf_file(gguf_path).unwrap();
+    let samples = [
+        "The capital of France is Paris.",
+        "Hello, world! 123 4567 89 1234567890",
+        "  leading spaces\nand\r\nnewlines\t tabs   trailing  ",
+        "don't stop— can't won't I'M SHOUTING'll",
+        "émojis 🦀🔥 and CJK 中文测试 and кириллица",
+        "<|begin_of_text|>special <|eot_id|> tokens inline",
+        "fn main() { println!(\"hi\"); } // code &&= 0xFF",
+        "",
+    ];
+    for s in samples {
+        let a = json_tok.encode(s).unwrap();
+        let b = gguf_tok.encode(s).unwrap();
+        assert_eq!(a, b, "encode mismatch for {s:?}");
+        assert_eq!(
+            json_tok.decode(&a).unwrap(),
+            gguf_tok.decode(&b).unwrap(),
+            "decode mismatch for {s:?}"
+        );
+    }
+    assert_eq!(json_tok.stop_token_ids(), gguf_tok.stop_token_ids());
+    println!(
+        "GGUF-embedded tokenizer for {} is token-identical to {tokenizer_json}",
+        gguf_path.display()
+    );
+}
+
+#[test]
+fn test_gguf_vocab_matches_tokenizer_json() {
+    if !model_available() {
+        println!("SKIP: model not found");
+        return;
+    }
+    run_vocab_oracle(Path::new(MODEL_PATH), TOKENIZER_PATH);
+}
+
+/// Second-family oracle (qwen2 pre + no-BOS path). Opt-in via env vars
+/// since the files live outside the repo junction:
+/// `ZLLM_TEST_QWEN_GGUF` + `ZLLM_TEST_QWEN_TOKENIZER`.
+#[test]
+fn test_gguf_vocab_oracle_qwen() {
+    let (Ok(gguf), Ok(tok)) = (
+        std::env::var("ZLLM_TEST_QWEN_GGUF"),
+        std::env::var("ZLLM_TEST_QWEN_TOKENIZER"),
+    ) else {
+        println!("SKIP: set ZLLM_TEST_QWEN_GGUF / ZLLM_TEST_QWEN_TOKENIZER");
+        return;
+    };
+    run_vocab_oracle(Path::new(&gguf), &tok);
+}
+
 // --- Test 12: Stop-token set derived from the tokenizer ---
 
 #[test]
