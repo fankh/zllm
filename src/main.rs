@@ -165,6 +165,9 @@ async fn main() -> anyhow::Result<()> {
             let mut pool_slots: Vec<Mutex<BackendSlot>> = Vec::with_capacity(pool_size);
             for i in 0..pool_size {
                 let mut be = CandleCpuBackend::new();
+                // Effective window = min(model context_length, this cap);
+                // bounds the per-slot KV preallocation.
+                be.set_max_seq_cap(cfg.model.max_seq_len);
                 if model_exists {
                     tracing::info!("loading main model into pool slot {}/{}", i + 1, pool_size);
                     be.load_model(&model_path)?;
@@ -189,6 +192,7 @@ async fn main() -> anyhow::Result<()> {
                     let p = draft_model_path.as_ref().unwrap();
                     tracing::info!("loading draft model into pool slot {}/{}", i + 1, pool_size);
                     let mut db = CandleCpuBackend::new();
+                    db.set_max_seq_cap(cfg.model.max_seq_len);
                     db.load_model(p)?;
                     let warm_t = std::time::Instant::now();
                     if let Err(e) = db.forward_logits(&[1u32, 2, 3]) {
@@ -408,6 +412,13 @@ async fn main() -> anyhow::Result<()> {
                 Arc::new(Mutex::new(loaded))
             };
 
+            // Effective context window of the loaded model (0 = none) —
+            // read before `pool` moves into the state.
+            let initial_model_ctx = pool
+                .first()
+                .and_then(|s| s.lock().ok())
+                .map(|s| s.backend.max_seq())
+                .unwrap_or(0);
             let state = AppState {
                 pool,
                 tokenizer,
@@ -425,6 +436,7 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     Default::default()
                 })),
+                model_ctx: Arc::new(std::sync::atomic::AtomicUsize::new(initial_model_ctx)),
                 hooks: Arc::new(hook_registry),
                 inspection_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 pld_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),

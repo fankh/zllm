@@ -80,6 +80,11 @@ pub struct AppState {
     /// are the fallback for template-less GGUFs. Declared stop ids are
     /// unioned with the vocab probe in `stop_set`.
     pub chat_meta: Arc<RwLock<crate::server::chat_template::GgufChatMeta>>,
+    /// Effective context window of the loaded model (min of its declared
+    /// context_length and the configured cap); 0 = no model. Requests
+    /// whose prompt exceeds it get an OpenAI-style 400 instead of a
+    /// forward-pass failure.
+    pub model_ctx: Arc<AtomicUsize>,
     /// Hook registry consulted on every chat prefill via `RunnerObserver`.
     /// Built once at startup with the default `MemoryInjectHook` plus
     /// anything callers add before serving — see `main.rs`.
@@ -628,6 +633,14 @@ async fn select_model(
         g.prompt_cache.clear();
     }
     drop(guards);
+    // Refresh the effective context window for the new model.
+    let new_ctx = s
+        .pool
+        .first()
+        .and_then(|m| m.lock().ok())
+        .map(|g| g.backend.max_seq())
+        .unwrap_or(0);
+    s.model_ctx.store(new_ctx, Ordering::Relaxed);
 
     // Reload the GPU engine for the new model (else the fast-lane would keep
     // serving the OLD weights). Same gate as startup; on any failure (e.g. a
@@ -888,6 +901,18 @@ async fn chat_completions(
         }
     };
 
+    // Context-window guard: an over-long prompt gets an OpenAI-style 400
+    // instead of a mid-forward failure.
+    let ctx = s.model_ctx.load(Ordering::Relaxed);
+    if ctx > 0 && tokens.len() >= ctx {
+        return (StatusCode::BAD_REQUEST, Json(json!({
+            "error": format!(
+                "this model's maximum context length is {ctx} tokens; the rendered prompt has {}",
+                tokens.len()
+            ),
+            "code": "context_length_exceeded"
+        }))).into_response();
+    }
     let id = format!("chatcmpl-{}", Uuid::new_v4());
     let model_id = s.current_model.read().unwrap().clone();
     let max_tokens = req.max_tokens;
@@ -1143,6 +1168,16 @@ async fn text_completions(
                 .into_response();
         }
     };
+    let ctx = s.model_ctx.load(Ordering::Relaxed);
+    if ctx > 0 && tokens.len() >= ctx {
+        return (StatusCode::BAD_REQUEST, Json(json!({
+            "error": format!(
+                "this model's maximum context length is {ctx} tokens; the prompt has {}",
+                tokens.len()
+            ),
+            "code": "context_length_exceeded"
+        }))).into_response();
+    }
     let id = format!("cmpl-{}", Uuid::new_v4());
     if req.n.unwrap_or(1) > 1 || req.best_of.unwrap_or(1) > 1 {
         return (StatusCode::BAD_REQUEST, Json(json!({

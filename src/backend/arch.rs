@@ -85,6 +85,14 @@ pub struct HParams {
     pub rms_eps: Option<f32>,
     /// Defaults to 10000.0 when absent, matching every prior loader.
     pub rope_freq_base: f32,
+    /// Trained context window (`{p}.context_length`). Loaders size RoPE
+    /// tables and the KV cache from min(this, configured cap) — the old
+    /// hardcoded 4096 silently truncated 128K-capable models.
+    pub context_length: Option<usize>,
+    /// `{p}.rope.scaling.type`: "linear" | "yarn" | "none".
+    pub rope_scaling_type: Option<String>,
+    /// `{p}.rope.scaling.factor` — position/frequency stretch.
+    pub rope_scaling_factor: Option<f32>,
     /// 0 = dense. MoE (`> 1`) is rejected by the candle fork at load.
     pub n_expert: usize,
     pub vocab_size: Option<usize>,
@@ -117,6 +125,11 @@ impl HParams {
             head_dim: opt_u(format!("{p}.attention.key_length")),
             rms_eps: opt_f(format!("{p}.attention.layer_norm_rms_epsilon")),
             rope_freq_base: opt_f(format!("{p}.rope.freq_base")).unwrap_or(10000.0),
+            context_length: opt_u(format!("{p}.context_length")),
+            rope_scaling_type: md
+                .get(&format!("{p}.rope.scaling.type"))
+                .and_then(|v| v.to_string().ok().map(|s| s.to_string())),
+            rope_scaling_factor: opt_f(format!("{p}.rope.scaling.factor")),
             n_expert: opt_u(format!("{p}.expert_count")).unwrap_or(0),
             vocab_size: opt_u(format!("{p}.vocab_size")),
         })

@@ -43,7 +43,21 @@ use crate::backend::candle::q4k_repack::{
 };
 use crate::backend::candle::q4k_avx512::vec_dot_q4k_q8k;
 
-pub const MAX_SEQ_LEN: usize = 4096;
+/// Cap applied to a model's declared context when the loader gets no
+/// explicit cap: bounds the per-slot KV preallocation (candle's KvCache
+/// preallocates max_seq up front) so a 128K-declared model doesn't
+/// silently claim ~8 GB per slot. Effective window =
+/// min(GGUF context_length, cap); override per-load via
+/// `CandleCpuBackend::set_max_seq_cap` (server wires `model.max_seq_len`
+/// from the config) or the `ZLLM_MAX_SEQ` env var.
+pub const DEFAULT_MAX_SEQ_CAP: usize = 32768;
+
+fn max_seq_cap_from_env(fallback: usize) -> usize {
+    std::env::var("ZLLM_MAX_SEQ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(fallback)
+}
 
 /// Repacked Q4_K_M weights laid out as `(n_rows/8) * (n_cols/QK_K)` blocks
 /// of `BlockQ4Kx8`. Row-group-major: all super-blocks of row-group `g`
@@ -533,23 +547,48 @@ pub struct ModelWeights {
     /// kv_len = index_pos + seq_len, so the mask is rectangular when prefix
     /// KV cache entries exist (index_pos > 0).
     masks: HashMap<(usize, usize), Tensor>,
+    /// Effective context window this instance was built for: RoPE tables
+    /// and every layer's KV cache are sized to it.
+    max_seq: usize,
     span: tracing::Span,
     span_output: tracing::Span,
 }
 
+/// RoPE cos/sin tables for positions `0..max_seq`.
+///
+/// `freq_factors`: optional per-dimension divisors from the GGUF's
+/// `rope_freqs.weight` tensor — Llama-3.1/3.2's "llama3" long-context
+/// scaling. Without them those models degrade past their original 8K
+/// window. `pos_scale`: linear position scaling (`rope.scaling.type =
+/// "linear"`, positions divided by the factor).
 fn precomput_freqs_cis(
     head_dim: usize,
     freq_base: f32,
     device: &Device,
+    max_seq: usize,
+    freq_factors: Option<&[f32]>,
+    pos_scale: f32,
 ) -> Result<(Tensor, Tensor)> {
-    let theta: Vec<_> = (0..head_dim)
+    let mut theta: Vec<f32> = (0..head_dim)
         .step_by(2)
         .map(|i| 1f32 / freq_base.powf(i as f32 / head_dim as f32))
         .collect();
+    if let Some(ff) = freq_factors {
+        for (t, f) in theta.iter_mut().zip(ff.iter()) {
+            if *f != 0.0 {
+                *t /= f;
+            }
+        }
+    }
+    if pos_scale != 1.0 {
+        for t in theta.iter_mut() {
+            *t *= pos_scale;
+        }
+    }
     let theta = Tensor::new(theta.as_slice(), device)?;
-    let idx_theta = Tensor::arange(0, MAX_SEQ_LEN as u32, device)?
+    let idx_theta = Tensor::arange(0, max_seq as u32, device)?
         .to_dtype(DType::F32)?
-        .reshape((MAX_SEQ_LEN, 1))?
+        .reshape((max_seq, 1))?
         .matmul(&theta.reshape((1, theta.elem_count()))?)?;
     let cos = idx_theta.cos()?;
     let sin = idx_theta.sin()?;
@@ -563,7 +602,13 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        Self::from_gguf_requant(ct, reader, device, &|_| None)
+        Self::from_gguf_requant(ct, reader, device, &|_| None, DEFAULT_MAX_SEQ_CAP)
+    }
+
+    /// Effective context window (min of the model's declared
+    /// context_length and the loader cap).
+    pub fn max_seq(&self) -> usize {
+        self.max_seq
     }
 
     /// Like `from_gguf`, but each tensor is round-tripped through the sub-Q4
@@ -577,6 +622,7 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
         requant: &dyn Fn(&str) -> Option<GgmlDType>,
+        max_seq_cap: usize,
     ) -> Result<Self> {
         // Architecture + hyperparameters via the shared registry
         // (backend::arch) — the single owner of GGUF key names. The spec's
@@ -613,7 +659,49 @@ impl ModelWeights {
             ))
         })? as f64;
         let rope_freq_base = hp.rope_freq_base;
-        let (cos, sin) = precomput_freqs_cis(rope_dim, rope_freq_base, device)?;
+
+        // Effective context window: the model's trained context, bounded
+        // by the caller cap (KV preallocates max_seq per layer) and the
+        // ZLLM_MAX_SEQ env override. Was a hardcoded 4096 before v0.12.
+        let cap = max_seq_cap_from_env(max_seq_cap).max(512);
+        let model_ctx = hp.context_length.unwrap_or(4096);
+        let max_seq = model_ctx.min(cap);
+        // Linear position scaling ("linear"); "yarn" is approximated as
+        // linear with a LOUD warning until a validation model lands —
+        // silently ignoring it would be worse (positions past the
+        // original window would alias).
+        let pos_scale = match hp.rope_scaling_type.as_deref() {
+            Some("linear") => 1.0 / hp.rope_scaling_factor.unwrap_or(1.0).max(1e-6),
+            Some("yarn") => {
+                tracing::warn!(
+                    "rope.scaling.type=yarn approximated as linear (factor {}) — long-context quality may differ",
+                    hp.rope_scaling_factor.unwrap_or(1.0)
+                );
+                1.0 / hp.rope_scaling_factor.unwrap_or(1.0).max(1e-6)
+            }
+            _ => 1.0,
+        };
+        // Llama-3.1/3.2 "llama3" long-context scaling ships as a
+        // rope_freqs.weight tensor (head_dim/2 per-dimension divisors).
+        let freq_factors: Option<Vec<f32>> = match ct.tensor(reader, "rope_freqs.weight", device) {
+            Ok(qt) => Some(
+                qt.dequantize(device)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+            ),
+            Err(_) => None,
+        };
+        if freq_factors.is_some() {
+            tracing::info!("RoPE: applying rope_freqs.weight (llama3 long-context scaling), window {max_seq}");
+        }
+        let (cos, sin) = precomput_freqs_cis(
+            rope_dim,
+            rope_freq_base,
+            device,
+            max_seq,
+            freq_factors.as_deref(),
+            pos_scale,
+        )?;
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
 
         // Load a tensor, optionally re-quantizing it to a sub-Q4 dtype (for the
@@ -684,7 +772,7 @@ impl ModelWeights {
                 cos: cos.clone(),
                 sin: sin.clone(),
                 neg_inf: neg_inf.clone(),
-                kv_cache: candle_nn::kv_cache::KvCache::new(2, MAX_SEQ_LEN),
+                kv_cache: candle_nn::kv_cache::KvCache::new(2, max_seq),
                 span_attn,
                 span_rot,
                 span_mlp,
@@ -698,6 +786,7 @@ impl ModelWeights {
             norm,
             output: QMatMul::from_qtensor(output)?,
             masks: HashMap::new(),
+            max_seq,
             span,
             span_output,
         })

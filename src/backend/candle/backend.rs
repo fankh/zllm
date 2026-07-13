@@ -11,6 +11,10 @@ pub struct CandleCpuBackend {
     n_layers: usize,
     hidden_size: usize,
     index_pos: usize,
+    /// Context-window cap handed to the loader — effective window =
+    /// min(model context_length, this). Server wires `model.max_seq_len`
+    /// from the config; `ZLLM_MAX_SEQ` overrides at load time.
+    max_seq_cap: usize,
 }
 
 /// Pick the best Candle device available at runtime given the compiled
@@ -54,6 +58,7 @@ impl CandleCpuBackend {
             n_layers: 0,
             hidden_size: 0,
             index_pos: 0,
+            max_seq_cap: crate::backend::candle::quantized_llama_fork::DEFAULT_MAX_SEQ_CAP,
         }
     }
 
@@ -67,6 +72,7 @@ impl CandleCpuBackend {
             n_layers: 0,
             hidden_size: 0,
             index_pos: 0,
+            max_seq_cap: crate::backend::candle::quantized_llama_fork::DEFAULT_MAX_SEQ_CAP,
         }
     }
 
@@ -119,6 +125,17 @@ impl CandleCpuBackend {
         self.hidden_size
     }
 
+    /// Cap the context window for subsequent loads (effective window =
+    /// min(model context_length, cap)). Call before `load_model`.
+    pub fn set_max_seq_cap(&mut self, cap: usize) {
+        self.max_seq_cap = cap.max(512);
+    }
+
+    /// Effective context window of the LOADED model (0 = none loaded).
+    pub fn max_seq(&self) -> usize {
+        self.model.as_ref().map(|m| m.max_seq()).unwrap_or(0)
+    }
+
     /// Load a GGUF model, re-quantizing each tensor to the sub-Q4 dtype returned
     /// by `requant(name)` (dequantize → re-quantize). For the quantization
     /// sensitivity harness — runs the degraded model on candle's path with no
@@ -135,7 +152,7 @@ impl CandleCpuBackend {
         let spec = crate::backend::arch::detect(&content.metadata).map_err(ZllmError::Model)?;
         let hp = crate::backend::arch::HParams::read(&content.metadata, spec)
             .map_err(ZllmError::Model)?;
-        let model = ModelWeights::from_gguf_requant(content, &mut file, &self.device, requant)
+        let model = ModelWeights::from_gguf_requant(content, &mut file, &self.device, requant, self.max_seq_cap)
             .map_err(|e| ZllmError::Model(format!("failed to load model weights: {e}")))?;
         self.model = Some(model);
         self.n_layers = hp.n_layers;
@@ -168,25 +185,44 @@ impl CandleCpuBackend {
     pub fn forward_logits_with_observer<F: FnMut(usize, &CandleTensor) -> Option<CandleTensor>>(
         &mut self,
         prompt_tokens: &[u32],
-        on_layer: F,
+        mut on_layer: F,
     ) -> Result<Vec<f32>> {
         let model = self
             .model
             .as_mut()
             .ok_or_else(|| ZllmError::Model("model not loaded".into()))?;
+        if prompt_tokens.is_empty() {
+            return Err(ZllmError::Backend("forward_logits: empty input".into()));
+        }
 
-        let input = CandleTensor::new(prompt_tokens, &self.device)
-            .map_err(|e| ZllmError::Backend(format!("tensor creation: {e}")))?
-            .unsqueeze(0)
-            .map_err(|e| ZllmError::Backend(format!("unsqueeze: {e}")))?;
+        // CHUNKED prefill: a single-shot forward materializes the full
+        // (n_head, seq, kv) attention matrix — at 16K tokens that is tens
+        // of GB and effectively hangs the box (found by the M3 long-
+        // context exit test). Feeding the prompt in chunks against the
+        // growing KV bounds the transient to (n_head, chunk, kv); the
+        // fork's rectangular masks (built for prefix caching) make each
+        // chunk mathematically identical to the single shot. The observer
+        // fires per chunk; write-back hooks compose across chunks.
+        let chunk = std::env::var("ZLLM_PREFILL_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(512usize)
+            .max(16);
+        let mut last_logits: Option<CandleTensor> = None;
+        for piece in prompt_tokens.chunks(chunk) {
+            let input = CandleTensor::new(piece, &self.device)
+                .map_err(|e| ZllmError::Backend(format!("tensor creation: {e}")))?
+                .unsqueeze(0)
+                .map_err(|e| ZllmError::Backend(format!("unsqueeze: {e}")))?;
+            let logits = model
+                .forward_with_callback(&input, self.index_pos, &mut on_layer)
+                .map_err(|e| ZllmError::Backend(format!("forward pass: {e}")))?;
+            self.index_pos += piece.len();
+            last_logits = Some(logits);
+        }
 
-        let logits = model
-            .forward_with_callback(&input, self.index_pos, on_layer)
-            .map_err(|e| ZllmError::Backend(format!("forward pass: {e}")))?;
-
-        self.index_pos += prompt_tokens.len();
-
-        let logits_vec: Vec<f32> = logits
+        let logits_vec: Vec<f32> = last_logits
+            .expect("non-empty input yields logits")
             .squeeze(0)
             .map_err(|e| ZllmError::Backend(format!("squeeze: {e}")))?
             .to_vec1()
@@ -324,8 +360,9 @@ impl Backend for CandleCpuBackend {
             hp.vocab_size
         );
 
-        let model = ModelWeights::from_gguf(content, &mut file, &self.device)
-            .map_err(|e| ZllmError::Model(format!("failed to load model weights: {e}")))?;
+        let model =
+            ModelWeights::from_gguf_requant(content, &mut file, &self.device, &|_| None, self.max_seq_cap)
+                .map_err(|e| ZllmError::Model(format!("failed to load model weights: {e}")))?;
 
         self.model = Some(model);
         self.n_layers = hp.n_layers;
