@@ -1,0 +1,42 @@
+# CI gate for every push/PR: the deterministic test set + full compile
+# surface. Model-gated suites (test_real_inference, quant_sensitivity)
+# skip themselves without a GGUF and stay local; GPU bench harnesses are
+# compile-checked only. fmt/clippy are deliberately NOT gates yet — the
+# tree predates rustfmt and carries ~90 advisory lints; see V1_PLAN M4.
+name: ci
+
+on:
+  push:
+    branches: [main, gpu-inference-engine]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # .cargo/config.toml sets target-cpu=native for local perf; CI runners
+  # vary, and tests must not depend on host ISA.
+  RUSTFLAGS: ""
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Unit + smoke tests (default features)
+        run: cargo test --lib --test test_smoke
+      - name: Compile surface (default features, all targets)
+        run: cargo check --all-targets
+
+  feature-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile surface (gpu + vulkan features)
+        run: cargo check --all-targets --features gpu,vulkan
