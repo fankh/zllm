@@ -14,6 +14,11 @@ pub struct InferenceRunner {
     d_model: usize,
     reasoning_layers: usize,
     enable_inspection: bool,
+    /// Token ids that terminate generation. Empty by default — callers
+    /// supply the model's real stop set via `with_eos_tokens` (e.g.
+    /// `LlamaTokenizer::stop_token_ids()`); there is no baked-in id
+    /// because EOS is a property of the tokenizer, not the engine.
+    eos_tokens: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,7 +60,13 @@ impl InferenceRunner {
             d_model,
             reasoning_layers,
             enable_inspection: false,
+            eos_tokens: Vec::new(),
         }
+    }
+
+    pub fn with_eos_tokens(mut self, eos_tokens: Vec<u32>) -> Self {
+        self.eos_tokens = eos_tokens;
+        self
     }
 
     pub fn with_memory(mut self, memory: Arc<RwLock<MemoryStore>>) -> Self {
@@ -226,15 +237,30 @@ impl InferenceRunner {
             }
         }
 
-        // Decode: generate output tokens
+        // Decode: real autoregressive loop. The 3-zone reasoning program
+        // above runs once over the prompt and yields the first token's
+        // logits; each subsequent token re-forwards the full extended
+        // sequence through every layer (the per-layer surface keeps no KV
+        // between calls, so each step is a standalone causal pass) and
+        // samples from a distribution conditioned on everything generated
+        // so far. Reasoning zones are a prefill-time mechanism and are not
+        // re-entered during decode.
+        let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();
         let mut output_tokens = Vec::new();
+        let mut logits = self.backend.compute_logits(&hidden)?;
         for _ in 0..max_tokens {
-            let logits = self.backend.compute_logits(&hidden)?;
             let token_id = sample(&logits, config);
             output_tokens.push(token_id);
-            if token_id == 2 {
+            if self.eos_tokens.contains(&token_id) || output_tokens.len() == max_tokens {
                 break;
             }
+            all_tokens.push(token_id);
+            let dec_len = all_tokens.len();
+            let mut dec_hidden = self.backend.embed_tokens(&all_tokens)?;
+            for layer_idx in 0..n_layers {
+                dec_hidden = self.backend.forward_layer(layer_idx, &dec_hidden, dec_len)?;
+            }
+            logits = self.backend.compute_logits(&dec_hidden)?;
         }
 
         // Record inspection trace
