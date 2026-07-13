@@ -173,7 +173,39 @@ fn hardening_suite() {
     let r = chat_raw(body, Some(KEY)).expect("clamped absurd max_tokens must succeed");
     println!("absurd max_tokens: OK ({:?})", r["choices"][0]["finish_reason"]);
 
-    // 6. Concurrency: 4 parallel chats on a 1-slot pool — all succeed
+    // 6. SSE disconnect frees the slot: open a long stream, read the
+    //    first bytes, drop the connection mid-generation. The next send
+    //    into the closed channel breaks the loop, so a follow-up blocking
+    //    chat on this 1-slot pool must succeed promptly — if the slot
+    //    were still held, ~2000 debug-speed tokens would take many
+    //    minutes.
+    {
+        use std::io::Read;
+        let resp = ureq::post(&format!("{}/v1/chat/completions", base()))
+            .set("Authorization", &format!("Bearer {KEY}"))
+            .timeout(std::time::Duration::from_secs(60))
+            .send_json(serde_json::json!({
+                "messages": [{"role": "user", "content": "Count slowly from one to five hundred as words, no digits."}],
+                "max_tokens": 2000, "temperature": 0.0, "stream": true,
+            }))
+            .expect("stream should open");
+        let mut reader = resp.into_reader();
+        let mut buf = [0u8; 512];
+        let n = reader.read(&mut buf).expect("first stream bytes");
+        assert!(n > 0, "stream produced no bytes");
+        drop(reader); // client disconnect
+        let t0 = std::time::Instant::now();
+        chat_raw(simple("Quick check after disconnect.", 8), Some(KEY))
+            .expect("chat after disconnected stream must succeed");
+        let dt = t0.elapsed();
+        assert!(
+            dt < std::time::Duration::from_secs(120),
+            "slot not freed promptly after disconnect: {dt:?}"
+        );
+        println!("sse disconnect: slot freed, follow-up in {dt:?} OK");
+    }
+
+    // 7. Concurrency: 4 parallel chats on a 1-slot pool — all succeed
     //    (serialized), none 503 under the limit of 8.
     let handles: Vec<_> = (0..4)
         .map(|i| {
