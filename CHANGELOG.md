@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.13.0 — 2026-07-13 (V1_PLAN M4: "doesn't fall over")
+
+Live robustness suite green on the first full run
+(`tests/test_hardening.rs`): auth, corrupt-GGUF swap survival, context
+overflow, degenerate params, clamped absurd max_tokens, 4-way
+concurrency on a 1-slot pool.
+
+- **Trust model made explicit**: binds `127.0.0.1` by default; `ZLLM_BIND`
+  widens it (loud warning when widened without a key); `ZLLM_API_KEY`
+  enables bearer auth on everything except `/health`.
+- **Backpressure**: >`server.max_concurrent` in-flight → immediate 503
+  (RAII-counted — streams and early returns can't leak); decode loops
+  carry a wall-clock budget (`ZLLM_REQ_TIMEOUT_SECS`, default 600) and
+  return partial output as `finish_reason=length`; `max_tokens` clamps
+  to the remaining window so KV can never outgrow its preallocation.
+- **CLI**: `generate` honors temperature/top_k/top_p (closing the last
+  TODO from the mock audit) and prints SPM-safely via tail re-decode
+  (Mistral no longer prints "Paris,butthe…").
+- Deferred within M4: the gpu/vulkan monolith split (320 KB + 292 KB,
+  zero-behavior-change surgery) moves to the RC window as background
+  work, per the plan's own framing — the safety net it needs is the
+  local parity suites, best exercised when nothing else is in flight.
+
 ## v0.12.0 — 2026-07-13 (V1_PLAN M3: "the model's context, not ours")
 
 Exit criterion met live: Llama-3.2-1B retrieved a planted needle

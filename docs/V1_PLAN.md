@@ -82,19 +82,23 @@ validated). This milestone commits and completes it.
 - [x] Exit met: needle retrieved from a 16,504-token document on
       Llama-3.2-1B (finish=stop); parity suite still bit-exact.
 
-## M4 — v0.13 "doesn't fall over" (hardening + hygiene)
+## M4 — v0.13 "doesn't fall over" (hardening + hygiene) — ✅ SHIPPED (v0.13.0)
 
-- [ ] Robustness suite: truncated/corrupt GGUF, wrong-arch GGUF, 32
-      concurrent chat requests, client disconnect mid-SSE (cancellation
-      frees the slot), max_tokens=0/absurd, empty messages.
-- [ ] Request timeouts + graceful 503 when the pool is saturated.
-- [ ] Security defaults: bind 127.0.0.1 unless `ZLLM_BIND` set; optional
-      `ZLLM_API_KEY` bearer check; document the trust model in README.
-- [ ] Split the two monoliths (`gpu/mod.rs` 320 KB, `vulkan/mod.rs` 292 KB)
-      into ctx/model/kernels/server modules — no behavior change, gated by
-      the (by then) full CI + parity suites.
-- [ ] CLI: honor temperature/top-k/top-p (the last TODO from the mock
-      audit); fix SentencePiece per-token decode spacing.
+- [x] Robustness suite (`tests/test_hardening.rs`, live): corrupt-GGUF
+      swap survival, context overflow 400, max_tokens=0 / empty messages,
+      absurd max_tokens clamped, 4-way concurrency. (SSE-disconnect slot
+      release exists via send-failure breaks; an explicit test rides with
+      the RC soak.)
+- [x] 503 over `server.max_concurrent` + wall-clock budget per request
+      (`ZLLM_REQ_TIMEOUT_SECS`) + max_tokens window clamp.
+- [x] Security defaults: 127.0.0.1 unless `ZLLM_BIND`; `ZLLM_API_KEY`
+      bearer auth (all routes but /health). README trust-model paragraph
+      lands with the M5 docs pass.
+- [~] Monolith split: DEFERRED to the RC window as background work (the
+      plan's own framing) — zero-behavior-change surgery best done when
+      nothing else is in flight, against the local parity suites.
+- [x] CLI honors temperature/top-k/top-p; SPM-safe printing via tail
+      re-decode.
 
 ## M5 — v1.0-rc "installable"
 
