@@ -559,7 +559,7 @@ fn test_runner_decode_matches_greedy_continuation() {
     )
     .with_eos_tokens(tokenizer.stop_token_ids());
     let config = zllm::engine::sampler::SamplerConfig {
-        temperature: 0.0, top_k: 0, top_p: 1.0,
+        temperature: 0.0, top_k: 0, top_p: 1.0, min_p: 0.0,
     };
     let budget = ReasoningBudget::from_tier("free");
     let result = runner
