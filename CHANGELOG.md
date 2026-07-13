@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.9.2 — 2026-07-13
+
+Follow-up audit of the serving stack for residual mock/temp semantics; the
+three findings that affect correctness are fixed.
+
+- **Goal vectors re-encoded on model swap** (regression guard for v0.9.1):
+  goal/task/status embeddings live in the loaded model's space and width, so
+  the swap handler now calls `GoalManager::reencode_all()` after the pool +
+  tokenizer are updated. Previously they were kept verbatim on the (now
+  false) premise that they were zero-padded placeholders — a 1B→3B swap
+  would silently zero every goal-similarity score.
+- **Runner decode is real autoregression**: each generated token is fed back
+  and the extended sequence re-forwarded through all layers before the next
+  sample; previously every token was drawn from one frozen logit vector.
+  EOS comes from `with_eos_tokens` (tokenizer-derived) instead of the
+  hardcoded Llama-2 id 2. Pinned by
+  `test_runner_decode_matches_greedy_continuation`: with reasoning_layers=0
+  the runner's greedy output is token-identical to the fused path's
+  stateless greedy continuation.
+- **Stop tokens + chat template derived from the tokenizer, not hardcoded
+  Llama-3 ids**: new `LlamaTokenizer::stop_token_ids()` (EOS + whichever of
+  `<|eot_id|>`/`<|eom_id|>`/`<|im_end|>`/`<|end|>`/`<|endoftext|>` exist in
+  the vocab) replaces the `128009`/`unwrap_or(128001)` pattern at ~20 call
+  sites across rest.rs and the CLI; the CB server's two-scalar stop API now
+  receives vocab-derived ids. `render_chat_prompt` detects the template
+  family from the vocab (Llama-3 headers / ChatML / Llama-2 `[INST]`)
+  instead of always emitting Llama-3 headers — llama-arch ChatML finetunes
+  (Hermes, TinyLlama-Chat) now get the right prompt format and actually
+  stop at `<|im_end|>`.
+
 ## v0.9.1 — 2026-07-13
 
 Mock-data cleanup: the four "Still mocked" rows from the v0.7 scorecard are
