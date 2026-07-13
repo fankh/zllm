@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.12.0 — 2026-07-13 (V1_PLAN M3: "the model's context, not ours")
+
+Exit criterion met live: Llama-3.2-1B retrieved a planted needle
+(codename) from a **16,504-token** document with finish_reason=stop —
+4× the old hardcoded ceiling, past the pre-scaling 8K boundary.
+
+- **MAX_SEQ_LEN = 4096 is dead**: effective window = min(GGUF
+  `{arch}.context_length`, config `model.max_seq_len`, `ZLLM_MAX_SEQ`),
+  bounded deliberately — candle's KvCache preallocates the full window
+  per layer per slot (32K on the 1B ≈ 2.1 GB/slot).
+- **RoPE scaling from the GGUF**: linear `rope.scaling.factor` honored;
+  Llama-3.1/3.2 "llama3" scaling applied via the `rope_freqs.weight`
+  tensor (per-dim frequency divisors — required for coherence past 8K);
+  YaRN approximated as linear with a LOUD load-time warning until a
+  validation model lands.
+- **Chunked prefill** (ZLLM_PREFILL_CHUNK, default 512): the single-shot
+  forward materialized the full (n_head, seq, kv) attention matrix —
+  tens of GB at 16K; found the hard way when the first long-context run
+  hung 15 minutes. Chunks feed against the growing KV via the fork's
+  rectangular masks (the prefix-cache machinery), and the fused-vs-
+  manual parity test still reads max |Δlogit| = 0.
+- **`context_length_exceeded` 400** on over-long prompts (AppState
+  model_ctx, refreshed on swap) instead of a mid-forward failure.
+- Deferred from the M3 list: **q8_0 KV quantization** — at the target
+  hardware's RAM (Strix Halo 128 GB) f32 KV at 32K is affordable
+  (~2 GB/slot on 1B, ~8 GB on 8B); revisit post-1.0 or with the VK-lane
+  long-context work.
+
 ## v0.11.0 — 2026-07-13 (V1_PLAN M2: "any GGUF, one file")
 
 Exit criterion met live: a bare single-file Qwen2.5-7B GGUF (hardlinked

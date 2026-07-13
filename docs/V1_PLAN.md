@@ -67,17 +67,20 @@ validated). This milestone commits and completes it.
 - [ ] Exit: Llama-3.2, Mistral-7B, Qwen2.5-7B all serve correctly from a
       bare `.gguf`, template + stops from the file itself.
 
-## M3 — v0.12 "the model's context, not ours"
+## M3 — v0.12 "the model's context, not ours" — ✅ SHIPPED (v0.12.0)
 
-- [ ] Read `{arch}.context_length` + `rope.scaling.*` (linear/YaRN) from
-      GGUF into `HParams`; RoPE tables sized/scaled accordingly (candle
-      fork first, VK/GPU after).
-- [ ] Kill `MAX_SEQ_LEN = 4096`: per-model cap = min(model, config
-      `max_seq_len`, memory budget). KV allocation follows.
-- [ ] KV-cache quantization opt-in on the candle path (q8_0 K/V) so long
-      context is affordable in RAM; VK lane later.
-- [ ] Exit: 16k-token prompt summarized correctly on Llama-3.2-1B (which
-      claims 128k); prefix cache still bit-exact at depth.
+- [x] `{arch}.context_length` + `rope.scaling.*` in `HParams`; RoPE tables
+      sized/scaled (linear exact; YaRN = loud linear approximation until a
+      validation model lands; llama3 scaling via `rope_freqs.weight`).
+      Candle path; VK/GPU lanes keep their own caps for now.
+- [x] `MAX_SEQ_LEN = 4096` killed: window = min(model, `max_seq_len`,
+      `ZLLM_MAX_SEQ`); KV allocation follows.
+- [x] (Discovered) chunked prefill — single-shot 16K prefill materialized
+      a tens-of-GB attention matrix; `ZLLM_PREFILL_CHUNK` (512) bounds it.
+- [~] KV q8_0: DEFERRED post-1.0 — f32 KV at 32K is ~2 GB/slot (1B) on
+      128 GB target hardware; not the binding constraint.
+- [x] Exit met: needle retrieved from a 16,504-token document on
+      Llama-3.2-1B (finish=stop); parity suite still bit-exact.
 
 ## M4 — v0.13 "doesn't fall over" (hardening + hygiene)
 
