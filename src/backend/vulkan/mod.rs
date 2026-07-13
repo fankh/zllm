@@ -2937,9 +2937,9 @@ mod tests {
         eprintln!("VkModel gen: {vk_gen:?}");
 
         use crate::backend::candle::backend::CandleCpuBackend;
-        use crate::backend::traits::{Backend, QuantConfig};
+        use crate::backend::traits::Backend;
         let mut cb = CandleCpuBackend::new();
-        cb.load_model(std::path::Path::new(path), &QuantConfig { method: "gguf".into(), bits: 4 }).expect("candle load");
+        cb.load_model(std::path::Path::new(path)).expect("candle load");
         let mut clog = cb.forward_logits(&prompt).unwrap();
         let mut cnext = argmax(&clog);
         let mut cand_gen = vec![cnext];
@@ -3139,9 +3139,9 @@ mod tests {
         let ctx = match VkContext::new() { Ok(c) => c, Err(e) => { eprintln!("no Vulkan ({e}); skipping"); return; } };
         let vk = VkModel::load(path, ctx).expect("vk load");
         use crate::backend::candle::backend::CandleCpuBackend;
-        use crate::backend::traits::{Backend, QuantConfig};
+        use crate::backend::traits::Backend;
         let mut cb = CandleCpuBackend::new();
-        cb.load_model(std::path::Path::new(path), &QuantConfig { method: "gguf".into(), bits: 4 }).expect("candle load");
+        cb.load_model(std::path::Path::new(path)).expect("candle load");
         let am = |v: &[f32]| -> u32 { let mut bi = 0u32; let mut bv = f32::MIN; for (i, &x) in v.iter().enumerate() { if x > bv { bv = x; bi = i as u32; } } bi };
 
         // Prime both engines (short prompt; we only measure decode rate).
@@ -3219,9 +3219,9 @@ mod tests {
         eprintln!("VkModel gen: {vk_gen:?}");
 
         use crate::backend::candle::backend::CandleCpuBackend;
-        use crate::backend::traits::{Backend, QuantConfig};
+        use crate::backend::traits::Backend;
         let mut cb = CandleCpuBackend::new();
-        cb.load_model(std::path::Path::new(path), &QuantConfig { method: "gguf".into(), bits: 4 }).expect("candle load");
+        cb.load_model(std::path::Path::new(path)).expect("candle load");
         let clog = cb.forward_logits(&prompt).unwrap();
         // cosine of prefill logits vs candle last-token logits
         let (mut a, mut b, mut ab) = (0f64, 0f64, 0f64);

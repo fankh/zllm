@@ -93,7 +93,7 @@ pub struct GoalManager {
     store: Arc<RwLock<MemoryStore>>,
     d_model: usize,
     /// Encodes entry text into a real embedding so goals/tasks/status
-    /// participate in `query_by_similarity` like every other memory.
+    /// participate in similarity-scored retrieval like every other memory.
     encoder: Option<GoalEncoder>,
     /// If set, the manager writes its state to this path after every
     /// mutation and rebuilds it from this path on startup. Atomic-write

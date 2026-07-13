@@ -10,3 +10,4 @@ models/
 
 # runtime state written by the server (GoalManager persistence)
 configs/goals.json
+configs/goals.json.bak

@@ -11,8 +11,6 @@ pub struct CandleCpuBackend {
     n_layers: usize,
     hidden_size: usize,
     vocab_size: usize,
-    hidden_states: Vec<Vec<f32>>,
-    next_block_id: BlockId,
     index_pos: usize,
 }
 
@@ -57,8 +55,6 @@ impl CandleCpuBackend {
             n_layers: 0,
             hidden_size: 0,
             vocab_size: 0,
-            hidden_states: Vec::new(),
-            next_block_id: 0,
             index_pos: 0,
         }
     }
@@ -73,8 +69,6 @@ impl CandleCpuBackend {
             n_layers: 0,
             hidden_size: 0,
             vocab_size: 0,
-            hidden_states: Vec::new(),
-            next_block_id: 0,
             index_pos: 0,
         }
     }
@@ -122,6 +116,12 @@ impl CandleCpuBackend {
         self.n_layers
     }
 
+    /// Hidden width (n_embd) of the loaded model. Returns 0 if no model
+    /// is loaded yet. Used to size goal/task embedding fallbacks.
+    pub fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+
     /// Load a GGUF model, re-quantizing each tensor to the sub-Q4 dtype returned
     /// by `requant(name)` (dequantize → re-quantize). For the quantization
     /// sensitivity harness — runs the degraded model on candle's path with no
@@ -144,7 +144,6 @@ impl CandleCpuBackend {
         self.n_layers = n_layers;
         self.hidden_size = hidden_size;
         self.vocab_size = vocab_size;
-        self.hidden_states = vec![vec![0.0; hidden_size]; n_layers];
         self.index_pos = 0;
         Ok(())
     }
@@ -288,13 +287,11 @@ impl CandleCpuBackend {
         Ok(rows)
     }
 
-    pub fn generate_token(&mut self, prompt_tokens: &[u32]) -> Result<(u32, Vec<Vec<f32>>)> {
+    /// Greedy single-step: forward + argmax. Callers wanting per-layer
+    /// hidden states use `forward_logits_with_observer` instead.
+    pub fn generate_token(&mut self, prompt_tokens: &[u32]) -> Result<u32> {
         let logits_vec = self.forward_logits(prompt_tokens)?;
-        let token_id = argmax_token(&logits_vec);
-        // Hidden states not extractable from quantized forward without
-        // modification — second return is reserved for a future forked
-        // forward pass.
-        Ok((token_id, vec![]))
+        Ok(argmax_token(&logits_vec))
     }
 }
 
@@ -308,7 +305,7 @@ fn argmax_token(logits: &[f32]) -> u32 {
 }
 
 impl Backend for CandleCpuBackend {
-    fn load_model(&mut self, path: &Path, _config: &QuantConfig) -> Result<()> {
+    fn load_model(&mut self, path: &Path) -> Result<()> {
         tracing::info!("Loading GGUF model from {:?}", path);
 
         let mut file = std::fs::File::open(path)
@@ -347,7 +344,6 @@ impl Backend for CandleCpuBackend {
         self.n_layers = n_layers;
         self.hidden_size = hidden_size;
         self.vocab_size = vocab_size;
-        self.hidden_states = vec![vec![0.0; hidden_size]; n_layers];
         self.index_pos = 0;
 
         tracing::info!("Model loaded successfully");
@@ -356,7 +352,6 @@ impl Backend for CandleCpuBackend {
 
     fn unload_model(&mut self) -> Result<()> {
         self.model = None;
-        self.hidden_states.clear();
         self.index_pos = 0;
         tracing::info!("Model unloaded");
         Ok(())
@@ -415,28 +410,6 @@ impl Backend for CandleCpuBackend {
             .map_err(|e| ZllmError::Backend(format!("to_vec1: {e}")))
     }
 
-    fn read_hidden_state(&self, layer_idx: usize) -> Result<Tensor> {
-        if layer_idx < self.hidden_states.len() {
-            Ok(self.hidden_states[layer_idx].clone())
-        } else {
-            Err(ZllmError::Backend(format!(
-                "layer {layer_idx} out of range (max {})",
-                self.hidden_states.len()
-            )))
-        }
-    }
-
-    fn write_hidden_state(&mut self, layer_idx: usize, state: &Tensor) -> Result<()> {
-        if layer_idx < self.hidden_states.len() {
-            self.hidden_states[layer_idx] = state.clone();
-            Ok(())
-        } else {
-            Err(ZllmError::Backend(format!(
-                "layer {layer_idx} out of range"
-            )))
-        }
-    }
-
     fn compute_logits(&self, hidden_state: &Tensor) -> Result<Tensor> {
         let model = self
             .model
@@ -465,15 +438,6 @@ impl Backend for CandleCpuBackend {
             .map_err(|e| ZllmError::Backend(format!("to_vec1: {e}")))
     }
 
-    fn alloc_kv_block(&mut self, _n_tokens: usize) -> Result<BlockId> {
-        self.next_block_id += 1;
-        Ok(self.next_block_id)
-    }
-
-    fn free_kv_block(&mut self, _id: BlockId) -> Result<()> {
-        Ok(())
-    }
-
     fn device_info(&self) -> DeviceInfo {
         let (name, backend) = if self.device.is_cuda() {
             ("CUDA (candle)".to_string(), "candle-cuda".to_string())
@@ -482,13 +446,6 @@ impl Backend for CandleCpuBackend {
         } else {
             ("CPU (candle)".to_string(), "candle-cpu".to_string())
         };
-        DeviceInfo {
-            name,
-            backend,
-            memory_total_mb: 0, // TODO: detect via candle once exposed
-            memory_used_mb: 0,
-            supports_fp8: false,
-            supports_fp4: false,
-        }
+        DeviceInfo { name, backend }
     }
 }

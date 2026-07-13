@@ -2,11 +2,10 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use zllm::backend::candle::backend::CandleCpuBackend;
 use zllm::backend::candle::tokenizer::LlamaTokenizer;
-use zllm::backend::traits::{Backend, QuantConfig};
+use zllm::backend::traits::{Backend, Tensor};
 use zllm::engine::hooks::registry::HookRegistry;
 use zllm::engine::hooks::steering::SteeringHook;
-use zllm::engine::hooks::early_exit::EarlyExitHook;
-use zllm::engine::hooks::traits::{HookAction, HookContext};
+use zllm::engine::hooks::traits::{Hook, HookAction, HookContext};
 use zllm::engine::memory_store::{MemoryStore, MemoryMetadata, MemoryCategory};
 use zllm::engine::reasoning_budget::ReasoningBudget;
 
@@ -27,10 +26,7 @@ fn test_real_model_load() {
     }
 
     let mut backend = CandleCpuBackend::new();
-    let result = backend.load_model(
-        Path::new(MODEL_PATH),
-        &QuantConfig { method: "gguf".into(), bits: 4 },
-    );
+    let result = backend.load_model(Path::new(MODEL_PATH));
     assert!(result.is_ok(), "Model should load: {:?}", result.err());
 
     let info = backend.device_info();
@@ -73,16 +69,13 @@ fn test_real_generate_tokens() {
     }
 
     let mut backend = CandleCpuBackend::new();
-    backend.load_model(
-        Path::new(MODEL_PATH),
-        &QuantConfig { method: "gguf".into(), bits: 4 },
-    ).unwrap();
+    backend.load_model(Path::new(MODEL_PATH)).unwrap();
 
     let tokenizer = LlamaTokenizer::from_file(TOKENIZER_PATH).unwrap();
     let prompt_tokens = tokenizer.encode("The capital of France is").unwrap();
 
     let start = std::time::Instant::now();
-    let (token_id, _hidden) = backend.generate_token(&prompt_tokens).unwrap();
+    let token_id = backend.generate_token(&prompt_tokens).unwrap();
     let elapsed = start.elapsed();
 
     let token_text = tokenizer.decode(&[token_id]).unwrap();
@@ -102,15 +95,12 @@ fn test_real_multi_token_generation() {
     }
 
     let mut backend = CandleCpuBackend::new();
-    backend.load_model(
-        Path::new(MODEL_PATH),
-        &QuantConfig { method: "gguf".into(), bits: 4 },
-    ).unwrap();
+    backend.load_model(Path::new(MODEL_PATH)).unwrap();
 
     let tokenizer = LlamaTokenizer::from_file(TOKENIZER_PATH).unwrap();
     let prompt = "1+1=";
     let prompt_tokens = tokenizer.encode(prompt).unwrap();
-    let eos_id = tokenizer.eos_token_id().unwrap_or(128001);
+    let stops = tokenizer.stop_token_ids();
 
     let mut all_tokens = prompt_tokens.clone();
     let mut generated = 0;
@@ -124,8 +114,8 @@ fn test_real_multi_token_generation() {
             &all_tokens[all_tokens.len() - 1..]
         };
 
-        let (token_id, _) = backend.generate_token(input).unwrap();
-        if token_id == eos_id || token_id == 128009 {
+        let token_id = backend.generate_token(input).unwrap();
+        if stops.contains(&token_id) {
             break;
         }
         all_tokens.push(token_id);
@@ -149,6 +139,42 @@ fn test_real_multi_token_generation() {
 
 // --- Test 5: Hook system with real backend ---
 
+/// Local confidence-gated exit hook. The shipped `EarlyExitHook` was
+/// removed (production early exit runs a `ConfidenceHead` closure over
+/// `forward_logits_early_exit`); this stand-in keeps the registry's
+/// `HookAction::EarlyExit` mechanics covered.
+struct ConfidenceGate {
+    threshold: f32,
+    layer: usize,
+}
+
+impl Hook for ConfidenceGate {
+    fn on_layer(
+        &self,
+        _layer_idx: usize,
+        _loop_idx: usize,
+        _hidden_state: &mut Tensor,
+        context: &HookContext,
+    ) -> HookAction {
+        let c = context.current_confidence.get();
+        if c > self.threshold {
+            HookAction::EarlyExit {
+                reason: format!("confidence {:.3} > threshold {:.3}", c, self.threshold),
+            }
+        } else {
+            HookAction::Continue
+        }
+    }
+
+    fn target_layers(&self) -> Vec<usize> {
+        vec![self.layer]
+    }
+
+    fn name(&self) -> &str {
+        "test-confidence-gate"
+    }
+}
+
 #[test]
 fn test_hooks_on_real_backend() {
     if !model_available() {
@@ -167,12 +193,8 @@ fn test_hooks_on_real_backend() {
     registry.register(Box::new(steering));
     assert_eq!(registry.count(), 1);
 
-    // Add early exit hook
-    let early_exit = EarlyExitHook {
-        threshold: 0.95,
-        layer: 12,
-    };
-    registry.register(Box::new(early_exit));
+    // Add the confidence-gated exit hook
+    registry.register(Box::new(ConfidenceGate { threshold: 0.95, layer: 12 }));
     assert_eq!(registry.count(), 2);
 
     // Fire hooks with a dummy hidden state
@@ -265,14 +287,9 @@ fn test_memory_store_with_real_tokens() {
     assert_eq!(critical.len(), 1);
     assert_eq!(critical[0].key, "finding-sqli-1");
 
-    // Similarity query
+    // Build injection vector from all live memories (similarity-scored
+    // internally — the standalone query_by_similarity API was removed).
     let query = vec![0.5f32; 2048]; // similar to sqli finding
-    let similar = store.query_by_similarity(&query, 2);
-    assert_eq!(similar.len(), 2);
-    assert_eq!(similar[0].0.key, "finding-sqli-1"); // most similar
-    println!("Most similar memory: {} (score: {:.3})", similar[0].0.key, similar[0].1);
-
-    // Build injection vector from all live memories
     let injection = store.build_injection_vector(&query, 5, 0.3);
     assert!(injection.is_some(), "Should build injection from 2 memories");
     let inj = injection.unwrap();
@@ -315,10 +332,7 @@ fn test_full_pipeline_with_memory() {
     }
 
     let mut backend = CandleCpuBackend::new();
-    backend.load_model(
-        Path::new(MODEL_PATH),
-        &QuantConfig { method: "gguf".into(), bits: 4 },
-    ).unwrap();
+    backend.load_model(Path::new(MODEL_PATH)).unwrap();
 
     let tokenizer = LlamaTokenizer::from_file(TOKENIZER_PATH).unwrap();
     let memory = Arc::new(RwLock::new(MemoryStore::new(100, 50)));
@@ -327,7 +341,7 @@ fn test_full_pipeline_with_memory() {
     let prompt1 = "What is a buffer overflow?";
     let tokens1 = tokenizer.encode(prompt1).unwrap();
 
-    let (first_token, _) = backend.generate_token(&tokens1).unwrap();
+    let first_token = backend.generate_token(&tokens1).unwrap();
     let first_word = tokenizer.decode(&[first_token]).unwrap();
     println!("Request 1 prompt: '{prompt1}'");
     println!("Request 1 first token: '{first_word}'");
@@ -353,7 +367,7 @@ fn test_full_pipeline_with_memory() {
     let prompt2 = "How to prevent buffer overflow?";
     let tokens2 = tokenizer.encode(prompt2).unwrap();
 
-    let (second_token, _) = backend.generate_token(&tokens2).unwrap();
+    let second_token = backend.generate_token(&tokens2).unwrap();
     let second_word = tokenizer.decode(&[second_token]).unwrap();
     println!("Request 2 prompt: '{prompt2}'");
     println!("Request 2 first token: '{second_word}'");
@@ -386,17 +400,14 @@ fn test_throughput_benchmark() {
     }
 
     let mut backend = CandleCpuBackend::new();
-    backend.load_model(
-        Path::new(MODEL_PATH),
-        &QuantConfig { method: "gguf".into(), bits: 4 },
-    ).unwrap();
+    backend.load_model(Path::new(MODEL_PATH)).unwrap();
 
     let tokenizer = LlamaTokenizer::from_file(TOKENIZER_PATH).unwrap();
     let prompt_tokens = tokenizer.encode("Hello").unwrap();
 
     // Prefill timing
     let prefill_start = std::time::Instant::now();
-    let (_, _) = backend.generate_token(&prompt_tokens).unwrap();
+    let _ = backend.generate_token(&prompt_tokens).unwrap();
     let prefill_time = prefill_start.elapsed();
 
     // Decode timing (single tokens)
@@ -404,7 +415,7 @@ fn test_throughput_benchmark() {
     let mut last_token = prompt_tokens[prompt_tokens.len() - 1];
     for _ in 0..3 {  // 3 tokens for benchmark (debug mode is slow)
         let start = std::time::Instant::now();
-        let (token_id, _) = backend.generate_token(&[last_token]).unwrap();
+        let token_id = backend.generate_token(&[last_token]).unwrap();
         times.push(start.elapsed());
         last_token = token_id;
     }
@@ -441,10 +452,7 @@ fn test_manual_layer_drive_matches_fused_forward() {
     }
 
     let mut backend = CandleCpuBackend::new();
-    backend.load_model(
-        Path::new(MODEL_PATH),
-        &QuantConfig { method: "gguf".into(), bits: 4 },
-    ).unwrap();
+    backend.load_model(Path::new(MODEL_PATH)).unwrap();
 
     let tokenizer = LlamaTokenizer::from_file(TOKENIZER_PATH).unwrap();
     let tokens = tokenizer.encode("The capital of France is").unwrap();
@@ -520,10 +528,7 @@ fn test_runner_decode_matches_greedy_continuation() {
     // e.g. " The capital" vs " The Eiffel" here — so it is not a bit-exact
     // oracle for this comparison.)
     let mut backend = CandleCpuBackend::new();
-    backend.load_model(
-        Path::new(MODEL_PATH),
-        &QuantConfig { method: "gguf".into(), bits: 4 },
-    ).unwrap();
+    backend.load_model(Path::new(MODEL_PATH)).unwrap();
     let stops = tokenizer.stop_token_ids();
     let argmax = |v: &[f32]| {
         v.iter()
@@ -547,10 +552,7 @@ fn test_runner_decode_matches_greedy_continuation() {
 
     // Runner path: zones over the trait surface, then autoregressive decode.
     let mut runner_backend = CandleCpuBackend::new();
-    runner_backend.load_model(
-        Path::new(MODEL_PATH),
-        &QuantConfig { method: "gguf".into(), bits: 4 },
-    ).unwrap();
+    runner_backend.load_model(Path::new(MODEL_PATH)).unwrap();
     let d_model = 2048; // Llama 3.2 1B
     let mut runner = zllm::engine::runner::InferenceRunner::new(
         Box::new(runner_backend), d_model, 0,

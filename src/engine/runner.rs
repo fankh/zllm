@@ -190,7 +190,7 @@ impl InferenceRunner {
                 hidden = self.backend.forward_layer(layer_idx, &hidden, seq_len)?;
 
                 // Update HookContext confidence from the live hidden state
-                // so hooks like EarlyExitHook see a real signal. Source:
+                // so confidence-gated hooks see a real signal. Source:
                 // engine::confidence::ConfidenceHead::estimate (IPR-based).
                 hook_context
                     .current_confidence

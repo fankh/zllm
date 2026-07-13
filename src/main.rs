@@ -99,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Serve { config } => {
             use backend::candle::backend::CandleCpuBackend;
             use backend::candle::tokenizer::LlamaTokenizer;
-            use backend::traits::{Backend, QuantConfig};
+            use backend::traits::Backend;
             use server::rest::{AppState, BackendSlot};
             use std::sync::{Arc, Mutex, RwLock};
 
@@ -162,10 +162,7 @@ async fn main() -> anyhow::Result<()> {
                 let mut be = CandleCpuBackend::new();
                 if model_exists {
                     tracing::info!("loading main model into pool slot {}/{}", i + 1, pool_size);
-                    be.load_model(&model_path, &QuantConfig {
-                        method: "gguf".into(),
-                        bits: 4,
-                    })?;
+                    be.load_model(&model_path)?;
                     // Pre-warm: do one cheap forward so subsequent cold
                     // requests don't pay the page-fault + JIT + scratch-
                     // allocation cost. The dummy run mmaps weight pages,
@@ -187,7 +184,7 @@ async fn main() -> anyhow::Result<()> {
                     let p = draft_model_path.as_ref().unwrap();
                     tracing::info!("loading draft model into pool slot {}/{}", i + 1, pool_size);
                     let mut db = CandleCpuBackend::new();
-                    db.load_model(p, &QuantConfig { method: "gguf".into(), bits: 4 })?;
+                    db.load_model(p)?;
                     let warm_t = std::time::Instant::now();
                     if let Err(e) = db.forward_logits(&[1u32, 2, 3]) {
                         tracing::warn!("pre-warm draft forward failed in slot {}: {}", i + 1, e);
@@ -266,11 +263,21 @@ async fn main() -> anyhow::Result<()> {
                 .parent()
                 .unwrap_or(std::path::Path::new("."))
                 .join("goals.json");
-            let goal_manager = Arc::new(
-                control_plane::goal_manager::GoalManager::new(memory_store.clone())
-                    .with_save_path(goals_path)
-                    .with_encoder(goal_encoder),
-            );
+            // Zero-vector fallback width = the loaded model's real hidden
+            // size, so fallback and encoded entries agree (0 = no model
+            // loaded yet; keep the constructor default then).
+            let goal_d_model = pool
+                .first()
+                .and_then(|s| s.lock().ok())
+                .map(|s| s.backend.hidden_size())
+                .filter(|&d| d > 0);
+            let mut goal_manager = control_plane::goal_manager::GoalManager::new(memory_store.clone())
+                .with_save_path(goals_path)
+                .with_encoder(goal_encoder);
+            if let Some(d) = goal_d_model {
+                goal_manager = goal_manager.with_d_model(d);
+            }
+            let goal_manager = Arc::new(goal_manager);
             // Restore prior state if a snapshot exists. No-op on first run.
             // Runs through the encoder, so restored entries get real
             // embeddings too (the pool is idle at startup).
@@ -453,7 +460,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             use backend::candle::backend::CandleCpuBackend;
             use backend::candle::tokenizer::LlamaTokenizer;
-            use backend::traits::{Backend, QuantConfig};
+            use backend::traits::Backend;
 
             // Load tokenizer
             let tok = if tokenizer.is_empty() {
@@ -462,8 +469,12 @@ async fn main() -> anyhow::Result<()> {
                 if tok_path.exists() {
                     LlamaTokenizer::from_file(tok_path.to_str().unwrap())?
                 } else {
-                    tracing::info!("Downloading tokenizer from HuggingFace...");
-                    LlamaTokenizer::from_hf("meta-llama/Meta-Llama-3.1-8B-Instruct")?
+                    // No silent HF fallback: the old one downloaded a gated
+                    // meta-llama repo and 401'd without a token anyway.
+                    return Err(anyhow::anyhow!(
+                        "tokenizer.json not found next to {} — pass --tokenizer <path>",
+                        model.display()
+                    ));
                 }
             } else {
                 LlamaTokenizer::from_file(&tokenizer)?
@@ -521,10 +532,7 @@ async fn main() -> anyhow::Result<()> {
 
             // Load model
             let mut candle_backend = CandleCpuBackend::new();
-            candle_backend.load_model(&model, &QuantConfig {
-                method: "gguf".into(),
-                bits: 4,
-            })?;
+            candle_backend.load_model(&model)?;
 
             // Tokenize prompt
             let prompt_tokens = tok.encode(&prompt)?;
@@ -547,7 +555,7 @@ async fn main() -> anyhow::Result<()> {
                     &all_tokens[all_tokens.len() - 1..]
                 };
 
-                let (token_id, _hidden) = candle_backend.generate_token(input_tokens)?;
+                let token_id = candle_backend.generate_token(input_tokens)?;
 
                 // Apply sampling (temperature + top_k + top_p would be applied to logits)
                 // For now, generate_token returns greedy argmax

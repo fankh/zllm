@@ -343,27 +343,6 @@ impl MemoryStore {
             .collect()
     }
 
-    pub fn query_by_similarity(
-        &self,
-        query_vector: &Tensor,
-        top_k: usize,
-    ) -> Vec<(&MemoryEntry, f32)> {
-        let now = self.now();
-        let mut scored: Vec<(&MemoryEntry, f32)> = self
-            .entries
-            .values()
-            .filter(|e| !Self::is_expired(e, now))
-            .map(|entry| {
-                let sim = cosine_similarity(&entry.vector, query_vector);
-                (entry, sim)
-            })
-            .collect();
-
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(top_k);
-        scored
-    }
-
     // --- Inject: Build injection vector from relevant memories ---
 
     pub fn build_injection_vector(
@@ -424,82 +403,6 @@ impl MemoryStore {
         }
     }
 
-    /// Category-aware injection. Walks each (category, alpha, max) entry,
-    /// builds a per-category injection vector via the per-category index
-    /// (no full-table scan), and sums them.
-    pub fn build_injection_vector_by_categories(
-        &self,
-        query_vector: &Tensor,
-        weights: &[(MemoryCategory, f32, usize)],
-    ) -> Option<Tensor> {
-        let now = self.now();
-        let mut result: Option<Vec<f32>> = None;
-
-        for (category, alpha, max_per_category) in weights {
-            let Some(keys) = self.by_category.get(category) else {
-                continue;
-            };
-            let cat_memories: Vec<&MemoryEntry> = keys
-                .iter()
-                .filter_map(|k| self.entries.get(k))
-                .filter(|e| !Self::is_expired(e, now))
-                .collect();
-
-            if cat_memories.is_empty() {
-                continue;
-            }
-
-            let mut scored: Vec<(&MemoryEntry, f32)> = cat_memories
-                .into_iter()
-                .map(|entry| {
-                    let sim = cosine_similarity(&entry.vector, query_vector);
-                    let recency_boost =
-                        1.0 / (1.0 + (now.saturating_sub(entry.created_at)) as f32 / 3600.0);
-                    let final_score =
-                        sim * 0.7 + entry.relevance_score * 0.2 + recency_boost * 0.1;
-                    (entry, final_score)
-                })
-                .collect();
-
-            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            scored.truncate(*max_per_category);
-
-            let d = scored[0].0.vector.len();
-            let mut sum = vec![0.0f32; d];
-            let mut total_weight = 0.0f32;
-
-            for (entry, score) in &scored {
-                if entry.vector.len() == d && vector_norm(&entry.vector) > 1e-6 {
-                    for (r, v) in sum.iter_mut().zip(entry.vector.iter()) {
-                        *r += score * v;
-                    }
-                    total_weight += score;
-                }
-            }
-
-            if total_weight > 0.0 {
-                for r in sum.iter_mut() {
-                    *r = (*r / total_weight) * alpha;
-                }
-                match result.as_mut() {
-                    Some(acc) if acc.len() == sum.len() => {
-                        for (a, s) in acc.iter_mut().zip(sum.iter()) {
-                            *a += *s;
-                        }
-                    }
-                    Some(_) => {
-                        // Mismatched dimensions — skip; shouldn't happen in practice
-                    }
-                    None => {
-                        result = Some(sum);
-                    }
-                }
-            }
-        }
-
-        result
-    }
-
     // --- Inspect: Record and retrieve traces ---
 
     pub fn record_trace(&mut self, trace: InspectionTrace) {
@@ -526,12 +429,6 @@ impl MemoryStore {
 
     pub fn trace_count(&self) -> usize {
         self.traces.len()
-    }
-
-    pub fn decay_relevance(&mut self, factor: f32) {
-        for entry in self.entries.values_mut() {
-            entry.relevance_score *= factor;
-        }
     }
 
     /// Drop one expired entry if any exists. Returns true if one was dropped.
@@ -697,25 +594,6 @@ mod tests {
             .expect("expected injection");
 
         assert_eq!(with_both, expected);
-    }
-
-    #[test]
-    fn category_aware_injection_routes_by_category() {
-        let mut s = MemoryStore::new(16, 4);
-        s.store("g".into(), vec![1.0; 4], meta(MemoryCategory::Goal));
-        s.store("c".into(), vec![0.5; 4], meta(MemoryCategory::Context));
-
-        let q = vec![1.0; 4];
-        let out = s
-            .build_injection_vector_by_categories(
-                &q,
-                &[(MemoryCategory::Goal, 0.5, 1), (MemoryCategory::Context, 0.1, 1)],
-            )
-            .expect("expected vector");
-        assert_eq!(out.len(), 4);
-        for v in out {
-            assert!((v - 0.55).abs() < 1e-4, "expected 0.55, got {v}");
-        }
     }
 
     // --- v0.2 tests ---

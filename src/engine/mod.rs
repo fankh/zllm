@@ -2,7 +2,6 @@ pub mod confidence;
 pub mod difficulty;
 pub mod hallucination;
 pub mod hooks;
-pub mod layer_stepper;
 pub mod logit_fsm;
 pub mod logprobs;
 pub mod memory_store;

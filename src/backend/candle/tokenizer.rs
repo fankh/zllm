@@ -11,20 +11,6 @@ impl LlamaTokenizer {
         Ok(Self { inner })
     }
 
-    pub fn from_hf(model_id: &str) -> Result<Self> {
-        let api = hf_hub::api::sync::Api::new()
-            .map_err(|e| ZllmError::Model(format!("HF API error: {e}")))?;
-        let repo = api.model(model_id.to_string());
-        let tokenizer_path = repo
-            .get("tokenizer.json")
-            .map_err(|e| ZllmError::Model(format!("failed to download tokenizer: {e}")))?;
-        Self::from_file(
-            tokenizer_path
-                .to_str()
-                .ok_or_else(|| ZllmError::Model("invalid path".into()))?,
-        )
-    }
-
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let encoding = self
             .inner

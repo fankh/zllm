@@ -593,13 +593,7 @@ async fn select_model(
         .collect();
     for g in guards.iter_mut() {
         let _ = g.backend.unload_model();
-        if let Err(e) = g.backend.load_model(
-            &gguf_path,
-            &crate::backend::traits::QuantConfig {
-                method: "gguf".into(),
-                bits: 4,
-            },
-        ) {
+        if let Err(e) = g.backend.load_model(&gguf_path) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("model load failed in pool slot: {e}")})),

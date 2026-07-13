@@ -17,10 +17,6 @@ fn test_dummy_backend() {
 
     let logits = backend.compute_logits(&hidden).unwrap();
     assert_eq!(logits.len(), 32000);
-
-    let block_id = backend.alloc_kv_block(16).unwrap();
-    assert!(block_id > 0);
-    backend.free_kv_block(block_id).unwrap();
 }
 
 #[test]
@@ -229,19 +225,6 @@ fn test_memory_store_query_by_category() {
     assert_eq!(findings.len(), 1);
     let contexts = store.query_by_category(&MemoryCategory::Context);
     assert_eq!(contexts.len(), 1);
-}
-
-#[test]
-fn test_memory_store_similarity_query() {
-    let mut store = MemoryStore::new(100, 50);
-
-    store.store("similar".into(), vec![1.0, 0.0, 1.0, 0.0], meta(MemoryCategory::Finding, "Similar"));
-    store.store("different".into(), vec![0.0, 1.0, 0.0, 1.0], meta(MemoryCategory::Context, "Different"));
-
-    let query = vec![1.0, 0.0, 1.0, 0.0];
-    let results = store.query_by_similarity(&query, 2);
-    assert_eq!(results.len(), 2);
-    assert_eq!(results[0].0.key, "similar");
 }
 
 #[test]
