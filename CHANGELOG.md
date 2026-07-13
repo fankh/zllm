@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.11.0 — 2026-07-13 (V1_PLAN M2: "any GGUF, one file")
+
+Exit criterion met live: a bare single-file Qwen2.5-7B GGUF (hardlinked
+into an empty directory, no tokenizer.json) served chat end-to-end —
+embedded BPE vocab, the model's own embedded ChatML template via
+minijinja, and the GGUF-declared `<|im_end|>` stop ("Paris.", 2 tokens,
+finish_reason=stop; multi-turn and stop strings verified).
+
+- **Qwen2 family** (`f6f994d`): ArchSpec block flags — `qkv_bias`
+  (additive Q/K/V biases) and `rope_neox` (non-interleaved rotary). The
+  dense fork detects `general.architecture` and consumes the flags; one
+  forward, parameterized. Local Qwen2.5-7B: coherent greedy at
+  8.8 tok/s CPU on first try.
+- **GGUF-native chat templates**: `tokenizer.chat_template` read at
+  load/swap, rendered with minijinja (raise_exception + strftime_now);
+  ChatFamily heuristics demoted to fallback. Llama-3.2's own template
+  (self-date-stamping) now drives the chat endpoint — conformance suite
+  green through it.
+- **Declared stop ids**: `tokenizer.ggml.{eos,eot,eom}_token_id` unioned
+  with the vocab probe in every decode loop.
+- **Single-file loading** (`gguf_vocab.rs`): HF tokenizer built from the
+  GGUF-embedded byte-level BPE vocab (per-family split regexes:
+  llama-bpe, qwen2; family-default BOS when quants omit add_bos_token).
+  Sibling tokenizer.json preferred; embedded vocab is the fallback at
+  startup, swap, and CLI. **Oracle-enforced fidelity**: token-identical
+  to tokenizer.json over adversarial samples for both llama-bpe (BOS)
+  and qwen2 (no BOS). SPM vocabs (Llama-2, Mistral v0.3) still require
+  tokenizer.json — loud, documented error.
+
 ## v0.10.0 — 2026-07-13 (V1_PLAN M1: "no silent lies")
 
 The OpenAI surface now honors what it accepts and rejects what it can't
