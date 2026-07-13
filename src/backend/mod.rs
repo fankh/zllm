@@ -1,3 +1,4 @@
+pub mod arch;
 pub mod candle;
 pub mod dummy;
 #[cfg(feature = "gpu")]

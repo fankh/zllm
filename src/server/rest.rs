@@ -309,7 +309,9 @@ fn gguf_architecture(
 /// `general.architecture = "llama"`. Other arches (qwen2, mistral,
 /// gemma, phi, …) need their own forks.
 fn arch_is_supported(arch: &str) -> bool {
-    arch.eq_ignore_ascii_case("llama")
+    // Supported ⇔ the arch registry has a spec for it. Widening support
+    // (qwen2, …) happens in backend::arch, not here.
+    crate::backend::arch::spec_for(arch).is_some()
 }
 
 async fn list_models(State(s): State<AppState>) -> Json<Value> {
@@ -1289,6 +1291,9 @@ fn capture_prefill_to_memory(
 enum ChatFamily {
     Llama3,
     ChatMl,
+    /// Mistral v0.3+/Tekken: `[INST]` is a control token in the vocab;
+    /// no `<<SYS>>` — the system prompt folds into the first user turn.
+    Mistral,
     Llama2,
 }
 
@@ -1298,7 +1303,11 @@ impl ChatFamily {
             ChatFamily::Llama3
         } else if tok.token_to_id("<|im_start|>").is_some() {
             ChatFamily::ChatMl
+        } else if tok.token_to_id("[INST]").is_some() {
+            ChatFamily::Mistral
         } else if tok.token_to_id("</s>").is_some() {
+            // Llama-2 and pre-v0.3 Mistral (no [INST] control token) both
+            // land here; the [INST]+<<SYS>> string format is the best fit.
             ChatFamily::Llama2
         } else {
             // Unknown vocab — Llama 3 headers were the previous
@@ -1358,6 +1367,36 @@ fn render_chat_prompt(goals: &GoalManager, messages: &[ChatMessage], family: Cha
                 out.push_str("<|im_end|>\n");
             }
             out.push_str("<|im_start|>assistant\n");
+        }
+        ChatFamily::Mistral => {
+            // <s> comes from tokenizer.encode(add_special_tokens=true).
+            // System prompt: Mistral defines no system slot — prepend it
+            // to the first user message, separated by a blank line.
+            let mut pending_sys = if sys.is_empty() { None } else { Some(sys.clone()) };
+            for m in other_messages {
+                match m.role.as_str() {
+                    "assistant" => {
+                        out.push(' ');
+                        out.push_str(&m.content);
+                        out.push_str("</s>");
+                    }
+                    _ => {
+                        out.push_str("[INST] ");
+                        if let Some(sys) = pending_sys.take() {
+                            out.push_str(&sys);
+                            out.push_str("\n\n");
+                        }
+                        out.push_str(&m.content);
+                        out.push_str(" [/INST]");
+                    }
+                }
+            }
+            if let Some(sys) = pending_sys {
+                // System prompt but no user turn — emit it alone.
+                out.push_str("[INST] ");
+                out.push_str(&sys);
+                out.push_str(" [/INST]");
+            }
         }
         ChatFamily::Llama2 => {
             // BOS comes from tokenizer.encode(add_special_tokens=true);

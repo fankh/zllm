@@ -433,7 +433,7 @@ impl LayerWeights {
         index_pos: usize,
     ) -> Result<Tensor> {
         let _enter = self.span_attn.enter();
-        let (b_sz, seq_len, n_embd) = x.dims3()?;
+        let (b_sz, seq_len, _n_embd) = x.dims3()?;
         let q = self.attention_wq.forward(x)?;
         let k = self.attention_wk.forward(x)?;
         let v = self.attention_wv.forward(x)?;
@@ -477,7 +477,9 @@ impl LayerWeights {
                 &q, &k, &v, None, false,
                 1. / (self.head_dim as f32).sqrt(), 1.,
             )?;
-            y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?
+            // Concat-heads width is n_head * head_dim — equal to n_embd on
+            // classic llama, NOT equal on explicit-key_length models.
+            y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?
         } else {
             // Prefill / non-CPU-non-Metal: original matmul path,
             // returns (1, n_head, seq_len, head_dim).
@@ -494,7 +496,7 @@ impl LayerWeights {
             };
             let att = candle_nn::ops::softmax_last_dim(&att)?;
             let y = att.matmul(&v.contiguous()?)?;
-            y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?
+            y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?
         };
         let y = self.attention_wo.forward(&y)?;
         Ok(y)
@@ -556,35 +558,35 @@ impl ModelWeights {
         device: &Device,
         requant: &dyn Fn(&str) -> Option<GgmlDType>,
     ) -> Result<Self> {
-        let md_get = |s: &str| match ct.metadata.get(s) {
-            None => candle_core::bail!("cannot find {s} in metadata"),
-            Some(v) => Ok(v),
-        };
-
-        // Parameter extraction from metadata.
+        // Hyperparameters via the shared arch registry (backend::arch) —
+        // the single owner of GGUF key names across all loaders.
+        let hp = crate::backend::arch::HParams::read(&ct.metadata, &crate::backend::arch::LLAMA)
+            .map_err(candle_core::Error::Msg)?;
         // MoE (Mixtral-class GGUFs: arch "llama" + expert_count > 1) was
         // inherited from candle but cut in v0.9.3 — zllm's installed-app
         // stance is dense 1B–8B models, and the GPU/VK engines are
         // dense-only. Fail loudly rather than half-support it.
-        let n_expert = md_get("llama.expert_count")
-            .and_then(|v| v.to_u32())
-            .unwrap_or(0) as usize;
-        if n_expert > 1 {
+        if hp.n_expert > 1 {
             candle_core::bail!(
-                "MoE GGUF (expert_count = {n_expert}) is not supported — zllm serves dense llama-arch models only"
+                "MoE GGUF (expert_count = {}) is not supported — zllm serves dense llama-arch models only",
+                hp.n_expert
             );
         }
-        let head_count = md_get("llama.attention.head_count")?.to_u32()? as usize;
-        let head_count_kv = md_get("llama.attention.head_count_kv")?.to_u32()? as usize;
-        let block_count = md_get("llama.block_count")?.to_u32()? as usize;
-        let embedding_length = md_get("llama.embedding_length")?.to_u32()? as usize;
-        let rope_dim = md_get("llama.rope.dimension_count")?.to_u32()? as usize;
+        let head_count = hp.n_head;
+        let head_count_kv = hp.n_head_kv;
+        let block_count = hp.n_layers;
+        let embedding_length = hp.n_embd;
+        // Mistral-Nemo / Mistral-Small-3 carry an explicit key_length that
+        // differs from n_embd / n_head — the accessor prefers it.
+        let head_dim = hp.head_dim();
+        let rope_dim = hp
+            .rope_dim
+            .ok_or_else(|| candle_core::Error::Msg("GGUF metadata missing llama.rope.dimension_count".into()))?;
         // Strangely this value is generally 1e-6 in GGUF file but used to be 1e-5 by default.
-        let rms_norm_eps = md_get("llama.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
-
-        let rope_freq_base = md_get("llama.rope.freq_base")
-            .and_then(|m| m.to_f32())
-            .unwrap_or(10000f32);
+        let rms_norm_eps = hp.rms_eps.ok_or_else(|| {
+            candle_core::Error::Msg("GGUF metadata missing llama.attention.layer_norm_rms_epsilon".into())
+        })? as f64;
+        let rope_freq_base = hp.rope_freq_base;
         let (cos, sin) = precomput_freqs_cis(rope_dim, rope_freq_base, device)?;
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
 
@@ -639,7 +641,7 @@ impl ModelWeights {
                 ffn_norm: RmsNorm::from_qtensor(ffn_norm, rms_norm_eps)?,
                 n_head: head_count,
                 n_kv_head: head_count_kv,
-                head_dim: embedding_length / head_count,
+                head_dim,
                 cos: cos.clone(),
                 sin: sin.clone(),
                 neg_inf: neg_inf.clone(),

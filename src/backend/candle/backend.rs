@@ -10,7 +10,6 @@ pub struct CandleCpuBackend {
     device: Device,
     n_layers: usize,
     hidden_size: usize,
-    vocab_size: usize,
     index_pos: usize,
 }
 
@@ -54,7 +53,6 @@ impl CandleCpuBackend {
             device: select_best_device(),
             n_layers: 0,
             hidden_size: 0,
-            vocab_size: 0,
             index_pos: 0,
         }
     }
@@ -68,7 +66,6 @@ impl CandleCpuBackend {
             device,
             n_layers: 0,
             hidden_size: 0,
-            vocab_size: 0,
             index_pos: 0,
         }
     }
@@ -135,15 +132,13 @@ impl CandleCpuBackend {
             .map_err(|e| ZllmError::Model(format!("cannot open model file: {e}")))?;
         let content = gguf_file::Content::read(&mut file)
             .map_err(|e| ZllmError::Model(format!("invalid GGUF file: {e}")))?;
-        let n_layers = content.metadata.get("llama.block_count").and_then(|v| v.to_u32().ok()).unwrap_or(32) as usize;
-        let hidden_size = content.metadata.get("llama.embedding_length").and_then(|v| v.to_u32().ok()).unwrap_or(4096) as usize;
-        let vocab_size = content.metadata.get("llama.vocab_size").and_then(|v| v.to_u32().ok()).unwrap_or(128256) as usize;
+        let hp = crate::backend::arch::HParams::read(&content.metadata, &crate::backend::arch::LLAMA)
+            .map_err(ZllmError::Model)?;
         let model = ModelWeights::from_gguf_requant(content, &mut file, &self.device, requant)
             .map_err(|e| ZllmError::Model(format!("failed to load model weights: {e}")))?;
         self.model = Some(model);
-        self.n_layers = n_layers;
-        self.hidden_size = hidden_size;
-        self.vocab_size = vocab_size;
+        self.n_layers = hp.n_layers;
+        self.hidden_size = hp.n_embd;
         self.index_pos = 0;
         Ok(())
     }
@@ -314,36 +309,24 @@ impl Backend for CandleCpuBackend {
         let content = gguf_file::Content::read(&mut file)
             .map_err(|e| ZllmError::Model(format!("invalid GGUF file: {e}")))?;
 
-        // Extract model metadata
-        let n_layers = content
-            .metadata
-            .get("llama.block_count")
-            .and_then(|v| v.to_u32().ok())
-            .unwrap_or(32) as usize;
-
-        let hidden_size = content
-            .metadata
-            .get("llama.embedding_length")
-            .and_then(|v| v.to_u32().ok())
-            .unwrap_or(4096) as usize;
-
-        let vocab_size = content
-            .metadata
-            .get("llama.vocab_size")
-            .and_then(|v| v.to_u32().ok())
-            .unwrap_or(128256) as usize;
-
+        // Hyperparameters via the shared arch registry — missing mandatory
+        // keys are a hard load error (this loader previously defaulted to
+        // 32/4096 silently and ran on garbage dimensions).
+        let hp = crate::backend::arch::HParams::read(&content.metadata, &crate::backend::arch::LLAMA)
+            .map_err(ZllmError::Model)?;
         tracing::info!(
-            "Model metadata: layers={n_layers}, hidden={hidden_size}, vocab={vocab_size}"
+            "Model metadata: layers={}, hidden={}, vocab={:?}",
+            hp.n_layers,
+            hp.n_embd,
+            hp.vocab_size
         );
 
         let model = ModelWeights::from_gguf(content, &mut file, &self.device)
             .map_err(|e| ZllmError::Model(format!("failed to load model weights: {e}")))?;
 
         self.model = Some(model);
-        self.n_layers = n_layers;
-        self.hidden_size = hidden_size;
-        self.vocab_size = vocab_size;
+        self.n_layers = hp.n_layers;
+        self.hidden_size = hp.n_embd;
         self.index_pos = 0;
 
         tracing::info!("Model loaded successfully");
