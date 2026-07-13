@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.0.0-rc.1 — 2026-07-13 (V1_PLAN M5: "installable")
+
+Release-candidate artifacts. The remaining gate to 1.0.0 is the RC soak
+week of daily local use (plus the deferred background items below).
+
+- **Dockerfile** (CPU baseline; GPU/Vulkan lanes stay host-builds by
+  design). Container binds 0.0.0.0 internally — isolation comes from
+  port publishing; `ZLLM_API_KEY` for wider exposure.
+- **`scripts/bench.ps1`**: the BENCHMARKS.md decode numbers on one
+  command (CPU or `-Vk`), with the measurement discipline notes
+  (all-Q4 file, thermal ordering) inline.
+- **README**: single-file GGUF quickstart (BPE families need no
+  tokenizer.json), explicit **trust model** section (loopback default,
+  `ZLLM_BIND`, `ZLLM_API_KEY`, bounded backpressure), and the **API
+  stability tiers** — stable OpenAI surface vs experimental white-box
+  surface (`/v1/goal`, `/v1/inspect`, `/v1/cb`, `/v1/debug`, toggles,
+  extensions).
+- Carried into the soak window: gpu/vulkan monolith split (background),
+  explicit SSE-disconnect test, YaRN validation model.
+
 ## v0.13.0 — 2026-07-13 (V1_PLAN M4: "doesn't fall over")
 
 Live robustness suite green on the first full run

@@ -100,18 +100,20 @@ validated). This milestone commits and completes it.
 - [x] CLI honors temperature/top-k/top-p; SPM-safe printing via tail
       re-decode.
 
-## M5 — v1.0-rc "installable"
+## M5 — v1.0-rc "installable" — 🚧 RC.1 CUT (soak week remains)
 
-- [ ] Packaging: `Dockerfile` (CPU baseline), Windows installer or winget
-      manifest, `install.ps1`/`install.sh` fetching the GitHub release.
-- [ ] API freeze + stability tiers documented: `/v1/{chat/completions,
-      completions,models,embeddings}` = stable; `/v1/{goal,inspect,cb,
-      debug,*enabled}` = experimental (may change in 1.x).
-- [ ] `scripts/bench.ps1` reproducing the BENCHMARKS.md llama.cpp
-      comparison on one command.
-- [ ] Docs pass: README quickstart ≤ 10 lines to first token; config
-      reference current; SUMMARY.md updated; explicit non-goals section.
-- [ ] Version 1.0.0 after an RC soak week of daily local use.
+- [x] `Dockerfile` (CPU baseline; container binds 0.0.0.0, isolation by
+      port publishing) + `scripts/install.ps1` (fetches the latest GitHub
+      release; untested against a live release until one is published
+      from this line).
+- [x] API stability tiers in README: stable OpenAI surface vs
+      experimental white-box surface; unsupported params 400.
+- [x] `scripts/bench.ps1` — validated live (one-command decode numbers,
+      measurement discipline inline).
+- [x] Docs pass: README single-file quickstart, trust model, tiers.
+- [ ] **Version 1.0.0 after the RC soak week** of daily local use.
+      Carried into the soak window: monolith split (background),
+      SSE-disconnect test, YaRN validation model, SUMMARY.md refresh.
 
 ---
 

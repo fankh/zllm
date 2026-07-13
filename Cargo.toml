@@ -1,6 +1,6 @@
 [package]
 name = "zllm"
-version = "0.13.0"
+version = "1.0.0-rc.1"
 edition = "2024"
 description = "ZLLM — White-box LLM inference engine with zero-copy latent intercept"
 license = "MIT"

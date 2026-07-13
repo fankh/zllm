@@ -47,13 +47,20 @@ cd zllm-vX.Y.Z-linux-x86_64-cpu
 
 ## Get a model
 
-zllm loads **GGUF** models (same files llama.cpp uses) plus a HuggingFace
-`tokenizer.json` from the same model family:
+zllm loads **GGUF** models (same files llama.cpp uses). Supported
+families today: **Llama** (1/2/3.x, Mistral-arch included) and
+**Qwen2/2.5**, dense variants; unknown architectures are rejected at
+load — see `src/backend/arch.rs` for the registry.
+
+For modern BPE models (Llama 3, Qwen2) **the GGUF alone is enough** —
+the tokenizer and chat template embedded in the file are used, verified
+token-identical to the HF `tokenizer.json`. SentencePiece models
+(Llama 2, Mistral v0.3) still need a sibling `tokenizer.json`, which
+always takes precedence when present.
 
 1. Download a GGUF, e.g. `Llama-3.2-1B-Instruct-Q4_K_M.gguf`
    (all-Q4 quantizations give the best GPU-path numbers — see BENCHMARKS.md).
-2. Put a matching `tokenizer.json` next to it (from the model's HF repo).
-3. Point the config at both:
+2. Point the config at it:
 
 ```toml
 # configs/default.toml
@@ -101,15 +108,42 @@ ZLLM_CB=1 ./target/release/zllm serve --config configs/default.toml
 # Health check (default port 8080; see [server].rest_port in the config)
 curl http://localhost:8080/health
 
-# One-shot CLI generation, no server
+# One-shot CLI generation, no server. The tokenizer is read from the
+# GGUF itself for BPE models; pass --tokenizer only for SPM families.
 ./target/release/zllm generate \
   --model C:/models/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
-  --tokenizer C:/models/llama-3.2-1b/tokenizer.json \
   --prompt "The capital of France is" --max-tokens 32
 
 # CLI help
 ./target/release/zllm --help
 ```
+
+## Trust model
+
+zllm has no multi-user story — it is an installed app. Accordingly:
+
+- The server binds **`127.0.0.1` only** by default. Set `ZLLM_BIND=0.0.0.0`
+  (or an interface address) to expose it — you'll get a loud startup
+  warning if you do that without a key.
+- Set `ZLLM_API_KEY=<secret>` to require `Authorization: Bearer <secret>`
+  on every route except `/health`. This is the only auth mechanism;
+  anyone holding the key controls the model AND the white-box surface
+  (goals, inspection, memory).
+- Backpressure is bounded: more than `[server] max_concurrent` in-flight
+  generations → `503`; each request has a wall-clock budget
+  (`ZLLM_REQ_TIMEOUT_SECS`, default 600) and returns partial output
+  rather than holding a slot forever.
+
+## API stability (toward 1.0)
+
+Two tiers. **Stable** (semver applies from 1.0): `/v1/chat/completions`,
+`/v1/completions`, `/v1/models`, `/v1/embeddings`, `/tokenize`,
+`/detokenize`, `/health`, `/metrics`. Accepted-but-unsupported OpenAI
+parameters return `400` — nothing is silently ignored.
+**Experimental** (may change in any release): `/v1/goal/*`,
+`/v1/inspect*`, `/v1/cb/*`, `/v1/debug/*`, the `*_enabled` toggles, and
+the non-OpenAI extensions (`grammar`, `detect_hallucination`,
+`repeat_penalty`).
 
 ## Configuration reference
 
