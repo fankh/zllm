@@ -70,9 +70,11 @@ validated). This milestone commits and completes it.
 ## M3 — v0.12 "the model's context, not ours" — ✅ SHIPPED (v0.12.0)
 
 - [x] `{arch}.context_length` + `rope.scaling.*` in `HParams`; RoPE tables
-      sized/scaled (linear exact; YaRN = loud linear approximation until a
-      validation model lands; llama3 scaling via `rope_freqs.weight`).
-      Candle path; VK/GPU lanes keep their own caps for now.
+      sized/scaled (linear exact; **YaRN real** since the RC window —
+      NTK-by-parts + mscale, A/B-validated: needle at 6.5K on
+      Yarn-Llama-2-7B (4K native) retrieved WITH keys, degenerate without;
+      llama3 scaling via `rope_freqs.weight`). Candle path; VK/GPU lanes
+      keep their own caps for now.
 - [x] `MAX_SEQ_LEN = 4096` killed: window = min(model, `max_seq_len`,
       `ZLLM_MAX_SEQ`); KV allocation follows.
 - [x] (Discovered) chunked prefill — single-shot 16K prefill materialized
@@ -112,8 +114,11 @@ validated). This milestone commits and completes it.
       measurement discipline inline).
 - [x] Docs pass: README single-file quickstart, trust model, tiers.
 - [ ] **Version 1.0.0 after the RC soak week** of daily local use.
-      Carried into the soak window: monolith split (background),
-      SSE-disconnect test, YaRN validation model, SUMMARY.md refresh.
+      Carried-item status: SSE-disconnect test ✅; YaRN real +
+      A/B-validated ✅; SUMMARY refresh ✅; monolith split → dedicated
+      session (explicit call: 5,600+ lines of surgery deserves full
+      context of its own); publish a GitHub release (user-triggered) so
+      install.ps1 gets tested.
 
 ---
 

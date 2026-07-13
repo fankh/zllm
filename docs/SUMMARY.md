@@ -5,6 +5,20 @@ fast on-ramp for a new session (human or AI): what exists, what's proven, what's
 dead end, and which pieces transfer to other LLM work. For numbers see
 [BENCHMARKS.md](../BENCHMARKS.md); for history see [CHANGELOG.md](../CHANGELOG.md).
 
+## Release status: v1.0.0-rc.1 (2026-07-13)
+
+The [V1_PLAN](V1_PLAN.md) executed M1–M5, each exit criterion verified live:
+honest OpenAI surface (stop strings / penalties / logit_bias / seed on every
+lane; unsupported params 400) with a conformance suite; **multi-arch**
+(llama-family + Qwen2 via the `backend/arch.rs` registry) and **single-file
+GGUF loading** (embedded vocab oracle-proven token-identical, embedded chat
+templates via minijinja, GGUF-declared stops); **model-true context** (16.5K
+needle retrieved on the 1B; chunked prefill; linear/YaRN/llama3 RoPE scaling);
+hardening (loopback default, `ZLLM_API_KEY`, 503 backpressure, wall-clock
+budgets — live robustness suite incl. SSE-disconnect slot release); Docker-
+validated packaging + declared API stability tiers. **Gate to 1.0.0: the RC
+soak week**, plus the gpu/vulkan monolith split as background work.
+
 ## Target & the one constraint that shapes everything
 
 - **Box:** AMD Ryzen AI MAX+ 395 "Strix Halo" — Zen 5, 16C/32T, AVX-512 (VNNI/BF16),
