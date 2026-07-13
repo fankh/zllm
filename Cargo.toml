@@ -1,6 +1,6 @@
 [package]
 name = "zllm"
-version = "0.9.3"
+version = "0.10.0"
 edition = "2024"
 description = "ZLLM — White-box LLM inference engine with zero-copy latent intercept"
 license = "MIT"
@@ -122,4 +122,7 @@ metal = [
 # Offline GLSL/WGSL → SPIR-V generation for new Vulkan kernels (the env has no
 # glslang/glslc/SDK). naga is already in the tree via wgpu; reuse it.
 naga = { version = "22.1", features = ["wgsl-in", "spv-out"] }
+# HTTP client for the OpenAI-conformance integration test (spawns a real
+# server). Already in the dependency tree via hf-hub.
+ureq = { version = "2", features = ["json"] }
 
