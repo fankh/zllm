@@ -554,20 +554,35 @@ pub struct ModelWeights {
     span_output: tracing::Span,
 }
 
+/// RoPE frequency scaling declared by the GGUF.
+#[derive(Debug, Clone, Copy)]
+enum RopeScaling {
+    None,
+    /// Positions divided by the factor (all dims uniformly).
+    Linear(f32),
+    /// YaRN NTK-by-parts: high-frequency dims extrapolate (unscaled),
+    /// low-frequency dims interpolate (/factor), with a ramp between the
+    /// beta_fast/beta_slow rotation counts, and cos/sin magnitude scaled
+    /// by mscale = 1 + 0.1·ln(factor). Mirrors ggml's rope_yarn.
+    Yarn { factor: f32, orig_ctx: usize },
+}
+
+const YARN_BETA_FAST: f32 = 32.0;
+const YARN_BETA_SLOW: f32 = 1.0;
+
 /// RoPE cos/sin tables for positions `0..max_seq`.
 ///
 /// `freq_factors`: optional per-dimension divisors from the GGUF's
 /// `rope_freqs.weight` tensor — Llama-3.1/3.2's "llama3" long-context
 /// scaling. Without them those models degrade past their original 8K
-/// window. `pos_scale`: linear position scaling (`rope.scaling.type =
-/// "linear"`, positions divided by the factor).
+/// window.
 fn precomput_freqs_cis(
     head_dim: usize,
     freq_base: f32,
     device: &Device,
     max_seq: usize,
     freq_factors: Option<&[f32]>,
-    pos_scale: f32,
+    scaling: RopeScaling,
 ) -> Result<(Tensor, Tensor)> {
     let mut theta: Vec<f32> = (0..head_dim)
         .step_by(2)
@@ -580,9 +595,37 @@ fn precomput_freqs_cis(
             }
         }
     }
-    if pos_scale != 1.0 {
-        for t in theta.iter_mut() {
-            *t *= pos_scale;
+    let mut mscale = 1.0f32;
+    match scaling {
+        RopeScaling::None => {}
+        RopeScaling::Linear(factor) => {
+            let s = 1.0 / factor.max(1e-6);
+            for t in theta.iter_mut() {
+                *t *= s;
+            }
+        }
+        RopeScaling::Yarn { factor, orig_ctx } => {
+            // ggml's rope_yarn_corr_dim: the pair index at which a
+            // dimension completes `beta` rotations over the original
+            // context. Dims below `low` (high frequency) extrapolate,
+            // above `high` interpolate, ramped in between.
+            let d = head_dim as f32;
+            let corr = |beta: f32| -> f32 {
+                d * (orig_ctx as f32 / (beta * 2.0 * std::f32::consts::PI)).ln()
+                    / (2.0 * freq_base.ln())
+            };
+            let low = corr(YARN_BETA_FAST).floor().max(0.0);
+            let high = corr(YARN_BETA_SLOW).ceil().min(d - 1.0);
+            let denom = (high - low).max(0.001);
+            let s = factor.max(1e-6);
+            for (pair_idx, t) in theta.iter_mut().enumerate() {
+                let y = (pair_idx as f32 - low) / denom;
+                let extrap_mix = 1.0 - y.clamp(0.0, 1.0); // 1 = pure extrapolation
+                *t = (*t / s) * (1.0 - extrap_mix) + *t * extrap_mix;
+            }
+            // Both q and k read these tables, so scores scale by
+            // mscale² — matching ggml applying mscale to cos/sin once.
+            mscale = 1.0 + 0.1 * s.ln();
         }
     }
     let theta = Tensor::new(theta.as_slice(), device)?;
@@ -590,8 +633,8 @@ fn precomput_freqs_cis(
         .to_dtype(DType::F32)?
         .reshape((max_seq, 1))?
         .matmul(&theta.reshape((1, theta.elem_count()))?)?;
-    let cos = idx_theta.cos()?;
-    let sin = idx_theta.sin()?;
+    let cos = (idx_theta.cos()? * mscale as f64)?;
+    let sin = (idx_theta.sin()? * mscale as f64)?;
     Ok((cos, sin))
 }
 
@@ -666,20 +709,15 @@ impl ModelWeights {
         let cap = max_seq_cap_from_env(max_seq_cap).max(512);
         let model_ctx = hp.context_length.unwrap_or(4096);
         let max_seq = model_ctx.min(cap);
-        // Linear position scaling ("linear"); "yarn" is approximated as
-        // linear with a LOUD warning until a validation model lands —
-        // silently ignoring it would be worse (positions past the
-        // original window would alias).
-        let pos_scale = match hp.rope_scaling_type.as_deref() {
-            Some("linear") => 1.0 / hp.rope_scaling_factor.unwrap_or(1.0).max(1e-6),
+        let scaling = match hp.rope_scaling_type.as_deref() {
+            Some("linear") => RopeScaling::Linear(hp.rope_scaling_factor.unwrap_or(1.0)),
             Some("yarn") => {
-                tracing::warn!(
-                    "rope.scaling.type=yarn approximated as linear (factor {}) — long-context quality may differ",
-                    hp.rope_scaling_factor.unwrap_or(1.0)
-                );
-                1.0 / hp.rope_scaling_factor.unwrap_or(1.0).max(1e-6)
+                let factor = hp.rope_scaling_factor.unwrap_or(1.0);
+                let orig_ctx = hp.rope_orig_ctx.unwrap_or(model_ctx);
+                tracing::info!("RoPE: YaRN scaling — factor {factor}, original context {orig_ctx}");
+                RopeScaling::Yarn { factor, orig_ctx }
             }
-            _ => 1.0,
+            _ => RopeScaling::None,
         };
         // Llama-3.1/3.2 "llama3" long-context scaling ships as a
         // rope_freqs.weight tensor (head_dim/2 per-dimension divisors).
@@ -700,7 +738,7 @@ impl ModelWeights {
             device,
             max_seq,
             freq_factors.as_deref(),
-            pos_scale,
+            scaling,
         )?;
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
 

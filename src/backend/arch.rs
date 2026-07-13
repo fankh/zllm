@@ -93,6 +93,9 @@ pub struct HParams {
     pub rope_scaling_type: Option<String>,
     /// `{p}.rope.scaling.factor` — position/frequency stretch.
     pub rope_scaling_factor: Option<f32>,
+    /// `{p}.rope.scaling.original_context_length` — the pre-extension
+    /// window YaRN interpolates against.
+    pub rope_orig_ctx: Option<usize>,
     /// 0 = dense. MoE (`> 1`) is rejected by the candle fork at load.
     pub n_expert: usize,
     pub vocab_size: Option<usize>,
@@ -130,6 +133,7 @@ impl HParams {
                 .get(&format!("{p}.rope.scaling.type"))
                 .and_then(|v| v.to_string().ok().map(|s| s.to_string())),
             rope_scaling_factor: opt_f(format!("{p}.rope.scaling.factor")),
+            rope_orig_ctx: opt_u(format!("{p}.rope.scaling.original_context_length")),
             n_expert: opt_u(format!("{p}.expert_count")).unwrap_or(0),
             vocab_size: opt_u(format!("{p}.vocab_size")),
         })
