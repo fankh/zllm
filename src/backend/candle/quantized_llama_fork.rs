@@ -392,12 +392,19 @@ struct LayerWeights {
     attention_wk: QMatMul,
     attention_wv: QMatMul,
     attention_wo: QMatMul,
+    /// Additive Q/K/V biases (qwen2-family GGUFs); None for llama.
+    attention_bq: Option<Tensor>,
+    attention_bk: Option<Tensor>,
+    attention_bv: Option<Tensor>,
     attention_norm: RmsNorm,
     mlp: Mlp,
     ffn_norm: RmsNorm,
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
+    /// NEOX (non-interleaved) RoPE vs llama's interleaved rope_i — set
+    /// from the ArchSpec; GGUF weights are permuted per family.
+    rope_neox: bool,
     cos: Tensor,
     sin: Tensor,
     neg_inf: Tensor,
@@ -423,7 +430,11 @@ impl LayerWeights {
         let sin = self.sin.narrow(0, index_pos, seq_len)?;
         // The call to contiguous below is only necessary when processing the prompt.
         // When the seq_len is 1 in the inference loop, this is a no-op.
-        candle_nn::rotary_emb::rope_i(&x.contiguous()?, &cos, &sin)
+        if self.rope_neox {
+            candle_nn::rotary_emb::rope(&x.contiguous()?, &cos, &sin)
+        } else {
+            candle_nn::rotary_emb::rope_i(&x.contiguous()?, &cos, &sin)
+        }
     }
 
     fn forward_attn(
@@ -434,9 +445,18 @@ impl LayerWeights {
     ) -> Result<Tensor> {
         let _enter = self.span_attn.enter();
         let (b_sz, seq_len, _n_embd) = x.dims3()?;
-        let q = self.attention_wq.forward(x)?;
-        let k = self.attention_wk.forward(x)?;
-        let v = self.attention_wv.forward(x)?;
+        let mut q = self.attention_wq.forward(x)?;
+        let mut k = self.attention_wk.forward(x)?;
+        let mut v = self.attention_wv.forward(x)?;
+        if let Some(b) = &self.attention_bq {
+            q = q.broadcast_add(b)?;
+        }
+        if let Some(b) = &self.attention_bk {
+            k = k.broadcast_add(b)?;
+        }
+        if let Some(b) = &self.attention_bv {
+            v = v.broadcast_add(b)?;
+        }
 
         let q = q
             .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
@@ -558,17 +578,20 @@ impl ModelWeights {
         device: &Device,
         requant: &dyn Fn(&str) -> Option<GgmlDType>,
     ) -> Result<Self> {
-        // Hyperparameters via the shared arch registry (backend::arch) —
-        // the single owner of GGUF key names across all loaders.
-        let hp = crate::backend::arch::HParams::read(&ct.metadata, &crate::backend::arch::LLAMA)
+        // Architecture + hyperparameters via the shared registry
+        // (backend::arch) — the single owner of GGUF key names. The spec's
+        // block flags (qkv_bias, rope_neox) parameterize this one dense
+        // forward across families instead of forking per model.
+        let spec = crate::backend::arch::detect(&ct.metadata).map_err(candle_core::Error::Msg)?;
+        let hp = crate::backend::arch::HParams::read(&ct.metadata, spec)
             .map_err(candle_core::Error::Msg)?;
-        // MoE (Mixtral-class GGUFs: arch "llama" + expert_count > 1) was
-        // inherited from candle but cut in v0.9.3 — zllm's installed-app
-        // stance is dense 1B–8B models, and the GPU/VK engines are
-        // dense-only. Fail loudly rather than half-support it.
+        // MoE (expert_count > 1) was inherited from candle but cut in
+        // v0.9.3 — zllm's installed-app stance is dense models, and the
+        // GPU/VK engines are dense-only. Fail loudly rather than
+        // half-support it.
         if hp.n_expert > 1 {
             candle_core::bail!(
-                "MoE GGUF (expert_count = {}) is not supported — zllm serves dense llama-arch models only",
+                "MoE GGUF (expert_count = {}) is not supported — zllm serves dense models only",
                 hp.n_expert
             );
         }
@@ -579,12 +602,15 @@ impl ModelWeights {
         // Mistral-Nemo / Mistral-Small-3 carry an explicit key_length that
         // differs from n_embd / n_head — the accessor prefers it.
         let head_dim = hp.head_dim();
-        let rope_dim = hp
-            .rope_dim
-            .ok_or_else(|| candle_core::Error::Msg("GGUF metadata missing llama.rope.dimension_count".into()))?;
+        // Some families (qwen2) omit rope.dimension_count; full-head RoPE
+        // is the correct default.
+        let rope_dim = hp.rope_dim.unwrap_or(head_dim);
         // Strangely this value is generally 1e-6 in GGUF file but used to be 1e-5 by default.
         let rms_norm_eps = hp.rms_eps.ok_or_else(|| {
-            candle_core::Error::Msg("GGUF metadata missing llama.attention.layer_norm_rms_epsilon".into())
+            candle_core::Error::Msg(format!(
+                "GGUF metadata missing {}.attention.layer_norm_rms_epsilon",
+                spec.prefix
+            ))
         })? as f64;
         let rope_freq_base = hp.rope_freq_base;
         let (cos, sin) = precomput_freqs_cis(rope_dim, rope_freq_base, device)?;
@@ -617,6 +643,15 @@ impl ModelWeights {
             let attention_wk = get(reader, &format!("{prefix}.attn_k.weight"))?;
             let attention_wv = get(reader, &format!("{prefix}.attn_v.weight"))?;
             let attention_wo = get(reader, &format!("{prefix}.attn_output.weight"))?;
+            // Qwen2-family GGUFs carry additive Q/K/V biases (stored F32).
+            let (attention_bq, attention_bk, attention_bv) = if spec.qkv_bias {
+                let bq = ct.tensor(reader, &format!("{prefix}.attn_q.bias"), device)?.dequantize(device)?;
+                let bk = ct.tensor(reader, &format!("{prefix}.attn_k.bias"), device)?.dequantize(device)?;
+                let bv = ct.tensor(reader, &format!("{prefix}.attn_v.bias"), device)?.dequantize(device)?;
+                (Some(bq), Some(bk), Some(bv))
+            } else {
+                (None, None, None)
+            };
             let feed_forward_w1 = get(reader, &format!("{prefix}.ffn_gate.weight"))?;
             let feed_forward_w2 = get(reader, &format!("{prefix}.ffn_down.weight"))?;
             let feed_forward_w3 = get(reader, &format!("{prefix}.ffn_up.weight"))?;
@@ -636,12 +671,16 @@ impl ModelWeights {
                 attention_wk: QMatMul::from_qtensor(attention_wk)?,
                 attention_wv: QMatMul::from_qtensor(attention_wv)?,
                 attention_wo: QMatMul::from_qtensor(attention_wo)?,
+                attention_bq,
+                attention_bk,
+                attention_bv,
                 attention_norm: RmsNorm::from_qtensor(attention_norm, rms_norm_eps)?,
                 mlp,
                 ffn_norm: RmsNorm::from_qtensor(ffn_norm, rms_norm_eps)?,
                 n_head: head_count,
                 n_kv_head: head_count_kv,
                 head_dim,
+                rope_neox: spec.rope_neox,
                 cos: cos.clone(),
                 sin: sin.clone(),
                 neg_inf: neg_inf.clone(),

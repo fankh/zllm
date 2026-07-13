@@ -132,7 +132,8 @@ impl CandleCpuBackend {
             .map_err(|e| ZllmError::Model(format!("cannot open model file: {e}")))?;
         let content = gguf_file::Content::read(&mut file)
             .map_err(|e| ZllmError::Model(format!("invalid GGUF file: {e}")))?;
-        let hp = crate::backend::arch::HParams::read(&content.metadata, &crate::backend::arch::LLAMA)
+        let spec = crate::backend::arch::detect(&content.metadata).map_err(ZllmError::Model)?;
+        let hp = crate::backend::arch::HParams::read(&content.metadata, spec)
             .map_err(ZllmError::Model)?;
         let model = ModelWeights::from_gguf_requant(content, &mut file, &self.device, requant)
             .map_err(|e| ZllmError::Model(format!("failed to load model weights: {e}")))?;
@@ -309,13 +310,15 @@ impl Backend for CandleCpuBackend {
         let content = gguf_file::Content::read(&mut file)
             .map_err(|e| ZllmError::Model(format!("invalid GGUF file: {e}")))?;
 
-        // Hyperparameters via the shared arch registry — missing mandatory
-        // keys are a hard load error (this loader previously defaulted to
-        // 32/4096 silently and ran on garbage dimensions).
-        let hp = crate::backend::arch::HParams::read(&content.metadata, &crate::backend::arch::LLAMA)
+        // Arch + hyperparameters via the shared registry — missing
+        // mandatory keys are a hard load error (this loader previously
+        // defaulted to 32/4096 silently and ran on garbage dimensions).
+        let spec = crate::backend::arch::detect(&content.metadata).map_err(ZllmError::Model)?;
+        let hp = crate::backend::arch::HParams::read(&content.metadata, spec)
             .map_err(ZllmError::Model)?;
         tracing::info!(
-            "Model metadata: layers={}, hidden={}, vocab={:?}",
+            "Model metadata: arch={}, layers={}, hidden={}, vocab={:?}",
+            spec.prefix,
             hp.n_layers,
             hp.n_embd,
             hp.vocab_size

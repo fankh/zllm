@@ -15,21 +15,52 @@ use std::collections::HashMap;
 
 /// One supported GGUF model family. The `prefix` is the arch name GGUF
 /// uses both in `general.architecture` and as the metadata key prefix
-/// (`llama.block_count`, `qwen2.block_count`, …).
+/// (`llama.block_count`, `qwen2.block_count`, …). Block-structure deltas
+/// are flags the dense forward consumes — a family whose differences fit
+/// in flags needs no new fork.
 pub struct ArchSpec {
     pub prefix: &'static str,
+    /// Q/K/V projections carry additive biases (Qwen2/2.5).
+    pub qkv_bias: bool,
+    /// NEOX (non-interleaved) RoPE ordering instead of llama's
+    /// interleaved `rope_i` — GGUF weights are permuted per family, so
+    /// applying the wrong ordering produces garbage, not noise.
+    pub rope_neox: bool,
 }
 
-pub const LLAMA: ArchSpec = ArchSpec { prefix: "llama" };
+pub const LLAMA: ArchSpec = ArchSpec {
+    prefix: "llama",
+    qkv_bias: false,
+    rope_neox: false,
+};
+
+pub const QWEN2: ArchSpec = ArchSpec {
+    prefix: "qwen2",
+    qkv_bias: true,
+    rope_neox: true,
+};
 
 /// Look up the spec for a `general.architecture` value. `None` = the
 /// family is not supported; callers surface that as a load/swap error.
 pub fn spec_for(arch: &str) -> Option<&'static ArchSpec> {
     if arch.eq_ignore_ascii_case(LLAMA.prefix) {
         Some(&LLAMA)
+    } else if arch.eq_ignore_ascii_case(QWEN2.prefix) {
+        Some(&QWEN2)
     } else {
         None
     }
+}
+
+/// Detect the spec from GGUF metadata (`general.architecture`). A GGUF
+/// without the key predates the field and is treated as llama — the only
+/// family that ever shipped without it.
+pub fn detect(md: &HashMap<String, gguf_file::Value>) -> Result<&'static ArchSpec, String> {
+    let arch = md
+        .get("general.architecture")
+        .and_then(|v| v.to_string().ok().map(|s| s.to_string()))
+        .unwrap_or_else(|| "llama".to_string());
+    spec_for(&arch).ok_or_else(|| format!("unsupported GGUF architecture {arch:?}"))
 }
 
 /// Hyperparameters read from GGUF metadata under an arch prefix.
@@ -158,6 +189,22 @@ mod tests {
     fn unknown_arch_is_unsupported() {
         assert!(spec_for("llama").is_some());
         assert!(spec_for("LLaMA").is_some());
+        assert!(spec_for("qwen2").is_some());
         assert!(spec_for("mamba").is_none());
+    }
+
+    #[test]
+    fn qwen2_flags_and_detection() {
+        let spec = spec_for("qwen2").unwrap();
+        assert!(spec.qkv_bias && spec.rope_neox);
+        let llama = spec_for("llama").unwrap();
+        assert!(!llama.qkv_bias && !llama.rope_neox);
+
+        let m = md(&[("general.architecture", Value::String("qwen2".into()))]);
+        assert_eq!(detect(&m).unwrap().prefix, "qwen2");
+        // Missing key predates the field — treated as llama.
+        assert_eq!(detect(&HashMap::new()).unwrap().prefix, "llama");
+        let bad = md(&[("general.architecture", Value::String("rwkv".into()))]);
+        assert!(detect(&bad).is_err());
     }
 }
