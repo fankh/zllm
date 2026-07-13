@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.10.0 — 2026-07-13 (V1_PLAN M1: "no silent lies")
+
+The OpenAI surface now honors what it accepts and rejects what it can't
+honor. CI gates every push. Exit criterion met: a scripted conformance
+run against a live spawned server passes end-to-end
+(`tests/test_openai_conformance.rs`, model-gated).
+
+- **CI** (`.github/workflows/ci.yml`): lib + smoke tests and full compile
+  surface (default and gpu,vulkan) on ubuntu + windows for every push/PR.
+- **DecodeControl** (`engine/decode_ctrl.rs`): one per-request owner of
+  penalties, logit_bias, seeded RNG, and stop-string state, wired
+  identically into every decode loop — candle blocking + streaming, GPU
+  and VK fast lanes, PLD/spec commit paths.
+- **`stop` strings** (string or array): matched on a re-decoded tail
+  window (never per-token decodes — SPM-safe), trimmed from blocking
+  output, checked before each streamed chunk so a completed stop never
+  reaches the client.
+- **Sampling**: `presence_penalty` / `frequency_penalty` (OpenAI),
+  `repeat_penalty` (llama.cpp-style, alias `repetition_penalty`),
+  `min_p`, `logit_bias` (±100 clamp), `seed` on all lanes (was CB-only).
+  Fast paths stay honest: GPU argmax readback only when nothing adjusts
+  the distribution; spec-decode/PLD gate off under penalties/bias
+  (drafts verify against unadjusted rows); the CB lane rejects to the
+  candle path rather than silently dropping parameters.
+- **Loud 400s** for recognized-but-unsupported params: `tools` /
+  `tool_choice`, `n > 1`, `best_of > 1`, non-text `response_format`.
+- **New endpoints**: `/v1/embeddings` (mean-pooled, L2-normalized — same
+  space as the GoalManager encoder), `/tokenize`, `/detokenize`
+  (llama.cpp-compatible shapes).
+- Live-verified on Llama-3.2-1B: stop strings cut at " four" mid-count;
+  seed 42 reproduces byte-identical sampled output; banning the first
+  answer token via logit_bias reroutes the greedy continuation.
+
 ## v0.9.3 — 2026-07-13
 
 Dead-code purge driven by the project's own history (~500 lines net).
