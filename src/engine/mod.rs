@@ -1,4 +1,5 @@
 pub mod confidence;
+pub mod decode_ctrl;
 pub mod difficulty;
 pub mod hallucination;
 pub mod hooks;
