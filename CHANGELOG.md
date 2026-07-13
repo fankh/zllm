@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.9.3 — 2026-07-13
+
+Dead-code purge driven by the project's own history (~500 lines net).
+
+- **Deleted, zero callers:** `ModelWeights::from_ggml` (pre-GGUF GGML
+  loader inherited from candle), `engine::layer_stepper`, the
+  `create_backend` factory (its unknown-string arm silently served random
+  DummyBackend logits), `MemoryStore::decay_relevance`, and the fake
+  `Backend` trait surface (`alloc_kv_block`/`free_kv_block` counter no-ops,
+  `read_hidden_state`/`write_hidden_state` zeros) plus `BlockId`.
+- **Test-only public API removed:** `query_by_similarity`,
+  `build_injection_vector_by_categories` (never-wired successor; the hook
+  still uses the legacy builder), `EarlyExitHook` (prod early exit is the
+  `ConfidenceHead` closure over `forward_logits_early_exit`; registry
+  EarlyExit mechanics covered by a local test hook). `DeviceInfo` slimmed
+  to `{name, backend}` — the fp8/fp4/memory fields were never read.
+- **Vestiges:** `generate_token` returns a bare token id (the empty
+  hidden-states Vec was reserved for a fork that shipped in v0.7);
+  `QuantConfig` dropped from `load_model` (all impls ignored it); the CLI's
+  silent HF-download fallback (gated meta-llama repo, 401 without a token)
+  is now an explicit `--tokenizer` error; GoalManager's zero-vector
+  fallback width follows the loaded model's real hidden size.
+- **MoE cut from the fork:** Mixtral-class support (`MlpOrMoe::MoE`,
+  expert-tensor loading) was inherited from candle but out of scope for
+  the dense 1B–8B installed-app stance (GPU/VK engines are dense-only).
+  `expert_count > 1` GGUFs now fail loudly at load instead of running on
+  an untested CPU-only path. Hot-loop match indirection removed.
+
 ## v0.9.2 — 2026-07-13
 
 Follow-up audit of the serving stack for residual mock/temp semantics; the
