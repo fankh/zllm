@@ -34,6 +34,7 @@ fn test_sampler_temperature() {
         temperature: 2.0,
         top_k: 10,
         top_p: 0.9,
+        min_p: 0.0,
     };
     let token = sample(&logits, &config);
     assert!(token < 1000);

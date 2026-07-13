@@ -19,11 +19,12 @@ use crate::backend::candle::tokenizer::LlamaTokenizer;
 use crate::backend::traits::Backend;
 use crate::config::EngineConfig;
 use crate::control_plane::goal_manager::{GoalManager, TaskStatus};
+use crate::engine::decode_ctrl::{DecodeControl, PenaltyConfig};
 use crate::engine::hooks::registry::HookRegistry;
 use crate::engine::logit_fsm::LogitFSM;
 use crate::engine::memory_store::{MemoryCategory, MemoryMetadata, MemoryStore};
 use crate::engine::runner_observer::RunnerObserver;
-use crate::engine::sampler::{SamplerConfig, sample};
+use crate::engine::sampler::SamplerConfig;
 
 const CHAT_UI_HTML: &str = include_str!("chat_ui.html");
 
@@ -166,6 +167,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/models/download", post(download_model))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(text_completions))
+        .route("/v1/embeddings", post(embeddings))
+        .route("/tokenize", post(tokenize))
+        .route("/detokenize", post(detokenize))
         .route("/v1/cb/completions", post(cb_completions))
         // Goal CRUD
         .route("/v1/goal/state", get(get_state))
@@ -679,6 +683,23 @@ async fn select_model(
     Json(json!({"success": true, "current": req.id})).into_response()
 }
 
+/// OpenAI `stop`: a single string or an array of strings.
+#[derive(Deserialize, Clone)]
+#[serde(untagged)]
+enum StopParam {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl StopParam {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            StopParam::One(s) => vec![s],
+            StopParam::Many(v) => v,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct ChatRequest {
     #[serde(default)]
@@ -695,9 +716,37 @@ struct ChatRequest {
     top_p: Option<f32>,
     #[serde(default)]
     top_k: Option<usize>,
-    /// Optional RNG seed for reproducible sampling (continuous-batching lane).
     #[serde(default)]
-    #[cfg_attr(not(feature = "gpu"), allow(dead_code))] seed: Option<u32>, // consumed by the CB fast lane (feature = "gpu")
+    min_p: Option<f32>,
+    /// Optional RNG seed for reproducible sampling (all lanes).
+    #[serde(default)]
+    seed: Option<u32>,
+    /// OpenAI stop strings: generation halts when the decoded tail
+    /// contains any of them; the match is trimmed from the output.
+    #[serde(default)]
+    stop: Option<StopParam>,
+    #[serde(default)]
+    presence_penalty: Option<f32>,
+    #[serde(default)]
+    frequency_penalty: Option<f32>,
+    /// llama.cpp-style repetition penalty (divide/multiply), 1.0 = off.
+    /// `repetition_penalty` accepted as an alias.
+    #[serde(default, alias = "repetition_penalty")]
+    repeat_penalty: Option<f32>,
+    /// OpenAI logit_bias: stringified token id → additive bias (±100
+    /// effectively bans/forces).
+    #[serde(default)]
+    logit_bias: Option<std::collections::HashMap<String, f32>>,
+    // --- Recognized-but-unsupported OpenAI params: rejected with 400
+    // instead of silently ignored (V1_PLAN M1 "no silent lies") ---
+    #[serde(default)]
+    tools: Option<serde_json::Value>,
+    #[serde(default)]
+    tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    n: Option<u32>,
+    #[serde(default)]
+    response_format: Option<serde_json::Value>,
     /// Optional logit-constraint string. v0.5 supports `"ban:<id>,<id>,…"`;
     /// see `engine::logit_fsm::LogitFSM` for the full list of modes.
     /// Non-OpenAI-standard but cheap to add and useful for the
@@ -727,7 +776,55 @@ fn sampler_from_request(
         temperature: temperature.unwrap_or(engine.default_temperature),
         top_k: top_k.unwrap_or(engine.default_top_k),
         top_p: top_p.unwrap_or(engine.default_top_p),
+        min_p: 0.0,
     }
+}
+
+/// Build the per-request DecodeControl from OpenAI-style params. Stop
+/// strings are capped at 8 (OpenAI allows 4); logit_bias values are
+/// clamped to ±100 per the OpenAI contract.
+fn build_decode_ctrl(
+    stop: Option<StopParam>,
+    presence_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    repeat_penalty: Option<f32>,
+    logit_bias: Option<std::collections::HashMap<String, f32>>,
+    seed: Option<u32>,
+) -> DecodeControl {
+    let stops: Vec<String> = stop
+        .map(|s| s.into_vec())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .take(8)
+        .collect();
+    let bias: Vec<(u32, f32)> = logit_bias
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(k, v)| k.trim().parse::<u32>().ok().map(|id| (id, v.clamp(-100.0, 100.0))))
+        .collect();
+    DecodeControl::new(
+        PenaltyConfig {
+            repeat: repeat_penalty.unwrap_or(1.0),
+            presence: presence_penalty.unwrap_or(0.0),
+            frequency: frequency_penalty.unwrap_or(0.0),
+        },
+        bias,
+        seed.map(u64::from),
+        stops,
+    )
+}
+
+/// Decode the generated tail into text for stop-string matching. Always
+/// a window re-decode — per-token decodes drop SentencePiece space
+/// markers and would miss stops spanning token boundaries.
+fn stop_window_text(s: &AppState, generated: &[u32], window: usize) -> String {
+    let start = generated.len().saturating_sub(window);
+    s.tokenizer
+        .read()
+        .unwrap()
+        .decode(&generated[start..])
+        .unwrap_or_default()
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -762,7 +859,36 @@ async fn chat_completions(
     let id = format!("chatcmpl-{}", Uuid::new_v4());
     let model_id = s.current_model.read().unwrap().clone();
     let max_tokens = req.max_tokens;
-    let sampler_cfg = sampler_from_request(&s.engine, req.temperature, req.top_p, req.top_k);
+    // Recognized-but-unsupported OpenAI params fail loudly (V1_PLAN M1:
+    // accepting a parameter and ignoring it is a silent lie).
+    if req.tools.is_some() || req.tool_choice.is_some() {
+        return (StatusCode::BAD_REQUEST, Json(json!({
+            "error": "tools / tool_choice are not supported"
+        }))).into_response();
+    }
+    if req.n.unwrap_or(1) > 1 {
+        return (StatusCode::BAD_REQUEST, Json(json!({
+            "error": "n > 1 is not supported"
+        }))).into_response();
+    }
+    if let Some(rf) = &req.response_format {
+        let ty = rf.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if !ty.is_empty() && ty != "text" {
+            return (StatusCode::BAD_REQUEST, Json(json!({
+                "error": format!("response_format {ty:?} is not supported (use the `grammar` extension for constrained output)")
+            }))).into_response();
+        }
+    }
+    let mut sampler_cfg = sampler_from_request(&s.engine, req.temperature, req.top_p, req.top_k);
+    sampler_cfg.min_p = req.min_p.unwrap_or(0.0);
+    let mut ctrl = build_decode_ctrl(
+        req.stop.clone(),
+        req.presence_penalty,
+        req.frequency_penalty,
+        req.repeat_penalty,
+        req.logit_bias.clone(),
+        req.seed,
+    );
     // Grammar compile errors (bad regex, unimplemented mode) fail loudly —
     // silently returning unconstrained output to a caller who asked for a
     // constraint is worse than an error.
@@ -794,7 +920,18 @@ async fn chat_completions(
     // the candle-only features (grammar / spec-decode / PLD / early-exit) are on,
     // since the CB engine doesn't implement those. Greedy or temp/top-k/top-p.
     #[cfg(feature = "gpu")]
-    if let Some(server) = cb_chat_server(&s, fsm.is_none() && !req.detect_hallucination.unwrap_or(false) && !req.logprobs.unwrap_or(false)) {
+    if let Some(server) = cb_chat_server(
+        &s,
+        fsm.is_none()
+            && !req.detect_hallucination.unwrap_or(false)
+            && !req.logprobs.unwrap_or(false)
+            // The CB engine samples on its own thread and implements
+            // none of penalties / logit_bias / stop strings / min_p —
+            // such requests fall through to the candle/fast-lane paths.
+            && !ctrl.modifies_logits()
+            && !ctrl.has_stops()
+            && req.min_p.is_none(),
+    ) {
         let prompt_tokens = tokens.len();
         let temp = sampler_cfg.temperature;
         let params = if temp <= 0.0 {
@@ -829,7 +966,7 @@ async fn chat_completions(
     }
 
     if req.stream {
-        let stream = chat_stream(s.clone(), tokens, max_tokens, sampler_cfg, fsm, id.clone(), model_id);
+        let stream = chat_stream(s.clone(), tokens, max_tokens, sampler_cfg, fsm, id.clone(), model_id, ctrl);
         Sse::new(stream).into_response()
     } else {
         let mut detector = req.detect_hallucination.unwrap_or(false)
@@ -838,7 +975,7 @@ async fn chat_completions(
             crate::engine::logprobs::LogprobsCollector::new(req.top_logprobs.unwrap_or(0) as usize)
         });
         let (text, prompt_tokens, completion_tokens, finish_reason) =
-            generate_blocking(&s, tokens, max_tokens, &sampler_cfg, fsm.as_ref(), &id, detector.as_mut(), lp.as_mut());
+            generate_blocking(&s, tokens, max_tokens, &sampler_cfg, fsm.as_ref(), &id, detector.as_mut(), lp.as_mut(), &mut ctrl);
         let hallu = detector.map(|d| hallucination_json(&d.report()));
         let logprobs_json = lp.map(|c| chat_logprobs_json(&s, &c));
         let now = unix_secs();
@@ -885,6 +1022,25 @@ struct CompletionRequest {
     top_p: Option<f32>,
     #[serde(default)]
     top_k: Option<usize>,
+    #[serde(default)]
+    min_p: Option<f32>,
+    #[serde(default)]
+    seed: Option<u32>,
+    #[serde(default)]
+    stop: Option<StopParam>,
+    #[serde(default)]
+    presence_penalty: Option<f32>,
+    #[serde(default)]
+    frequency_penalty: Option<f32>,
+    #[serde(default, alias = "repetition_penalty")]
+    repeat_penalty: Option<f32>,
+    #[serde(default)]
+    logit_bias: Option<std::collections::HashMap<String, f32>>,
+    // Recognized-but-unsupported → 400, not silence.
+    #[serde(default)]
+    n: Option<u32>,
+    #[serde(default)]
+    best_of: Option<u32>,
     #[serde(default)]
     grammar: Option<String>,
     /// Attach an output-distribution hallucination/uncertainty report to the
@@ -956,7 +1112,21 @@ async fn text_completions(
         }
     };
     let id = format!("cmpl-{}", Uuid::new_v4());
-    let sampler_cfg = sampler_from_request(&s.engine, req.temperature, req.top_p, req.top_k);
+    if req.n.unwrap_or(1) > 1 || req.best_of.unwrap_or(1) > 1 {
+        return (StatusCode::BAD_REQUEST, Json(json!({
+            "error": "n > 1 / best_of > 1 are not supported"
+        }))).into_response();
+    }
+    let mut sampler_cfg = sampler_from_request(&s.engine, req.temperature, req.top_p, req.top_k);
+    sampler_cfg.min_p = req.min_p.unwrap_or(0.0);
+    let mut ctrl = build_decode_ctrl(
+        req.stop.clone(),
+        req.presence_penalty,
+        req.frequency_penalty,
+        req.repeat_penalty,
+        req.logit_bias.clone(),
+        req.seed,
+    );
     // Grammar compile errors fail loudly (silent unconstrained output is worse
     // than an error) — same contract as the chat endpoint.
     let fsm = match req.grammar.as_deref() {
@@ -972,7 +1142,7 @@ async fn text_completions(
         .then(|| crate::engine::hallucination::Detector::new(Default::default()));
     let mut lp = req.logprobs
         .map(|n| crate::engine::logprobs::LogprobsCollector::new(n as usize));
-    let (text, p, c, finish_reason) = generate_blocking(&s, tokens, req.max_tokens, &sampler_cfg, fsm.as_ref(), &id, detector.as_mut(), lp.as_mut());
+    let (text, p, c, finish_reason) = generate_blocking(&s, tokens, req.max_tokens, &sampler_cfg, fsm.as_ref(), &id, detector.as_mut(), lp.as_mut(), &mut ctrl);
     let hallu = detector.map(|d| hallucination_json(&d.report()));
     let logprobs_json = lp.map(|col| legacy_logprobs_json(&s, &col));
     let now = unix_secs();
@@ -1000,6 +1170,114 @@ async fn text_completions(
         resp["choices"][0]["logprobs"] = l;
     }
     Json(resp).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EmbeddingsInput {
+    One(String),
+    Many(Vec<String>),
+}
+
+#[derive(Deserialize)]
+struct EmbeddingsRequest {
+    #[serde(default)]
+    #[allow(dead_code)]
+    model: Option<String>,
+    input: EmbeddingsInput,
+}
+
+/// OpenAI-compatible `/v1/embeddings`: mean-pooled, L2-normalized token
+/// embeddings from the loaded model (embedding lookup only — no
+/// transformer layers). The same construction the GoalManager encoder
+/// uses, so goal-similarity and API embeddings live in one space.
+async fn embeddings(
+    State(s): State<AppState>,
+    Json(req): Json<EmbeddingsRequest>,
+) -> impl IntoResponse {
+    let inputs = match req.input {
+        EmbeddingsInput::One(t) => vec![t],
+        EmbeddingsInput::Many(v) => v,
+    };
+    if inputs.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "input is empty"}))).into_response();
+    }
+    let mut data: Vec<Value> = Vec::with_capacity(inputs.len());
+    let mut total_tokens = 0usize;
+    let slot = acquire_slot(&s.pool);
+    for (i, text) in inputs.iter().enumerate() {
+        let ids = match s.tokenizer.read().unwrap().encode(text) {
+            Ok(v) if !v.is_empty() => v,
+            Ok(_) => {
+                return (StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("input {i} tokenized to nothing")}))).into_response();
+            }
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("tokenize input {i}: {e}")}))).into_response();
+            }
+        };
+        total_tokens += ids.len();
+        let flat = match slot.backend.embed_tokens(&ids) {
+            Ok(f) => f,
+            Err(e) => {
+                return (StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": format!("embedding lookup: {e}")}))).into_response();
+            }
+        };
+        let d = flat.len() / ids.len();
+        let mut mean = vec![0f32; d];
+        for chunk in flat.chunks_exact(d) {
+            for (m, v) in mean.iter_mut().zip(chunk) {
+                *m += v;
+            }
+        }
+        let inv_n = 1.0 / ids.len() as f32;
+        for m in &mut mean {
+            *m *= inv_n;
+        }
+        let norm = mean.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for m in &mut mean {
+                *m /= norm;
+            }
+        }
+        data.push(json!({"object": "embedding", "index": i, "embedding": mean}));
+    }
+    drop(slot);
+    Json(json!({
+        "object": "list",
+        "data": data,
+        "model": s.current_model.read().unwrap().clone(),
+        "usage": {"prompt_tokens": total_tokens, "total_tokens": total_tokens}
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct TokenizeRequest {
+    content: String,
+}
+
+/// llama.cpp-compatible `/tokenize`.
+async fn tokenize(State(s): State<AppState>, Json(req): Json<TokenizeRequest>) -> impl IntoResponse {
+    match s.tokenizer.read().unwrap().encode(&req.content) {
+        Ok(tokens) => Json(json!({"tokens": tokens})).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": format!("tokenize: {e}")}))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct DetokenizeRequest {
+    tokens: Vec<u32>,
+}
+
+/// llama.cpp-compatible `/detokenize`.
+async fn detokenize(State(s): State<AppState>, Json(req): Json<DetokenizeRequest>) -> impl IntoResponse {
+    match s.tokenizer.read().unwrap().decode(&req.tokens) {
+        Ok(content) => Json(json!({"content": content})).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": format!("detokenize: {e}")}))).into_response(),
+    }
 }
 
 /// OpenAI CHAT logprobs shape: `{"content": [{token, logprob, bytes,
@@ -1453,6 +1731,7 @@ fn generate_spec_decode(
     prompt_tokens: Vec<u32>,
     max_tokens: usize,
     _sampler_cfg: &SamplerConfig,
+    ctrl: &mut DecodeControl,
 ) -> (String, usize, usize, &'static str) {
     let prompt_len = prompt_tokens.len();
     let stops = s.tokenizer.read().unwrap().stop_token_ids();
@@ -1509,6 +1788,12 @@ fn generate_spec_decode(
             generated_ids.push(t);
             if generated_ids.len() >= max_tokens { break; }
         }
+        // Stop-string check over the committed batch (spec runs greedy on
+        // unadjusted logits; ctrl only contributes stops here).
+        if !hit_eos && ctrl.has_stops() {
+            let w = stop_window_text(s, &generated_ids, ctrl.window_tokens());
+            if ctrl.stop_hit_in(&w) { hit_eos = true; }
+        }
         if hit_eos { break; }
     }
 
@@ -1519,7 +1804,8 @@ fn generate_spec_decode(
     draft_prompt_cache.extend_from_slice(&all_tokens);
     drop(slot);
 
-    let text = s.tokenizer.read().unwrap().decode(&generated_ids).unwrap_or_default();
+    let mut text = s.tokenizer.read().unwrap().decode(&generated_ids).unwrap_or_default();
+    ctrl.truncate_at_stop(&mut text);
     (text, prompt_len, generated_ids.len(), finish_reason)
 }
 
@@ -1536,13 +1822,16 @@ fn generate_gpu(
     prompt_tokens: &[u32],
     max_tokens: usize,
     sampler_cfg: &SamplerConfig,
+    ctrl: &mut DecodeControl,
 ) -> (String, usize, usize, &'static str) {
     let prompt_len = prompt_tokens.len();
     let stops = s.tokenizer.read().unwrap().stop_token_ids();
     // Greedy decode (temperature 0) can use the GPU argmax path, which reads
     // back 4 bytes instead of the 128k-wide logit vector each token (~40% more
-    // decode tok/s). Sampling needs the full logits on the CPU.
-    let greedy = sampler_cfg.temperature == 0.0;
+    // decode tok/s). Sampling — or any logit adjustment (penalties /
+    // logit_bias) — needs the full logits on the CPU.
+    let greedy = sampler_cfg.temperature == 0.0 && !ctrl.modifies_logits();
+    ctrl.observe_prompt_tail(prompt_tokens, 64);
     // Prefill the whole prompt in one batched pass; returns the last token's
     // logits (the first sample) and leaves the KV cache filled for 0..M.
     let t_prefill = std::time::Instant::now();
@@ -1552,20 +1841,28 @@ fn generate_gpu(
     let mut finish_reason: &'static str = "length";
     let mut pos = prompt_len;
     let t_decode = std::time::Instant::now();
-    let mut next = sample(&first_logits, sampler_cfg);
+    let mut next = ctrl.sample_token(&first_logits, sampler_cfg);
     loop {
         if stops.contains(&next) {
             finish_reason = "stop";
             break;
         }
         generated.push(next);
+        ctrl.observe(next);
+        if ctrl.has_stops() {
+            let w = stop_window_text(s, &generated, ctrl.window_tokens());
+            if ctrl.stop_hit_in(&w) {
+                finish_reason = "stop";
+                break;
+            }
+        }
         if generated.len() >= max_tokens {
             break;
         }
         next = if greedy {
             model.forward_argmax(next, pos) // GPU argmax, 4-byte readback
         } else {
-            sample(&model.forward(next, pos), sampler_cfg)
+            ctrl.sample_token(&model.forward(next, pos), sampler_cfg)
         };
         pos += 1;
     }
@@ -1576,7 +1873,10 @@ fn generate_gpu(
         generated.len(),
         generated.len() as f64 / dec_s.max(1e-6),
     );
-    let text = s.tokenizer.read().unwrap().decode(&generated).unwrap_or_default();
+    let mut text = s.tokenizer.read().unwrap().decode(&generated).unwrap_or_default();
+    if ctrl.truncate_at_stop(&mut text) {
+        finish_reason = "stop";
+    }
     (text, prompt_len, generated.len(), finish_reason)
 }
 
@@ -1591,16 +1891,19 @@ fn generate_vk(
     prompt_tokens: &[u32],
     max_tokens: usize,
     sampler_cfg: &SamplerConfig,
+    ctrl: &mut DecodeControl,
 ) -> (String, usize, usize, &'static str) {
     let prompt_len = prompt_tokens.len();
     let stops = s.tokenizer.read().unwrap().stop_token_ids();
-    let greedy = sampler_cfg.temperature == 0.0;
+    // GPU argmax readback only when nothing adjusts the distribution.
+    let greedy = sampler_cfg.temperature == 0.0 && !ctrl.modifies_logits();
+    ctrl.observe_prompt_tail(prompt_tokens, 64);
     let t_prefill = std::time::Instant::now();
     // Prefill with cross-request prefix reuse: K/V for the longest common prefix
     // with the previous request (system prompt, prior chat turns) is already
     // resident; only the suffix is computed (sequential when short, chunked
     // batched otherwise). Cold prompts take the plain batched path inside.
-    let mut next = sample(&model.prefill_cached(prompt_tokens), sampler_cfg);
+    let mut next = ctrl.sample_token(&model.prefill_cached(prompt_tokens), sampler_cfg);
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1e3;
     let mut generated: Vec<u32> = Vec::new();
     let mut finish_reason: &'static str = "length";
@@ -1609,8 +1912,13 @@ fn generate_vk(
     loop {
         if stops.contains(&next) { finish_reason = "stop"; break; }
         generated.push(next);
+        ctrl.observe(next);
+        if ctrl.has_stops() {
+            let w = stop_window_text(s, &generated, ctrl.window_tokens());
+            if ctrl.stop_hit_in(&w) { finish_reason = "stop"; break; }
+        }
         if generated.len() >= max_tokens { break; }
-        next = if greedy { model.forward_argmax(next, pos) } else { sample(&model.forward(next, pos), sampler_cfg) };
+        next = if greedy { model.forward_argmax(next, pos) } else { ctrl.sample_token(&model.forward(next, pos), sampler_cfg) };
         pos += 1;
     }
     // Extend the reusable prefix with the decoded tokens whose KV is resident:
@@ -1624,7 +1932,10 @@ fn generate_vk(
         "Vulkan fast-lane: prefill {prompt_len} tok in {prefill_ms:.0} ms, decoded {} tok at {:.0} tok/s",
         generated.len(), generated.len() as f64 / dec_s.max(1e-6),
     );
-    let text = s.tokenizer.read().unwrap().decode(&generated).unwrap_or_default();
+    let mut text = s.tokenizer.read().unwrap().decode(&generated).unwrap_or_default();
+    if ctrl.truncate_at_stop(&mut text) {
+        finish_reason = "stop";
+    }
     (text, prompt_len, generated.len(), finish_reason)
 }
 
@@ -1637,18 +1948,21 @@ fn generate_blocking(
     request_id: &str,
     mut detect: Option<&mut crate::engine::hallucination::Detector>,
     mut lp: Option<&mut crate::engine::logprobs::LogprobsCollector>,
+    ctrl: &mut DecodeControl,
 ) -> (String, usize, usize, &'static str) {
     // Spec-decode fast path: redirect to the dedicated handler if every
     // precondition holds. Keeps the main generate_blocking unchanged.
     // Hallucination detection and logprobs collection force the candle path
     // (they need full per-token logits, one token per forward) — like
-    // inspection, they disable the fast lanes.
+    // inspection, they disable the fast lanes. Penalties/logit_bias also
+    // disable spec: drafts are verified against UNADJUSTED greedy rows.
     let inspect_on = s.inspection_enabled.load(Ordering::Relaxed);
     let spec_on = s.spec_decode_enabled.load(Ordering::Relaxed)
         && !inspect_on
         && detect.is_none()
         && lp.is_none()
         && sampler_cfg.temperature == 0.0
+        && !ctrl.modifies_logits()
         && fsm.is_none();
     if spec_on {
         // Peek at slot 0 for a draft — if any slot is missing the draft
@@ -1657,7 +1971,7 @@ fn generate_blocking(
             m.try_lock().map(|g| g.draft.is_some()).unwrap_or(true)
         });
         if has_draft {
-            return generate_spec_decode(s, prompt_tokens, max_tokens, sampler_cfg);
+            return generate_spec_decode(s, prompt_tokens, max_tokens, sampler_cfg, ctrl);
         }
     }
     // iGPU fast-lane: run the whole request on the resident GPU engine
@@ -1676,7 +1990,7 @@ fn generate_blocking(
         if gpu_eligible {
             if let Ok(guard) = s.gpu.lock() {
                 if let Some(model) = guard.as_ref() {
-                    return generate_gpu(s, model, &prompt_tokens, max_tokens, sampler_cfg);
+                    return generate_gpu(s, model, &prompt_tokens, max_tokens, sampler_cfg, ctrl);
                 }
             }
         }
@@ -1700,13 +2014,14 @@ fn generate_blocking(
         if vk_eligible {
             if let Ok(guard) = s.vk.lock() {
                 if let Some(model) = guard.as_ref() {
-                    return generate_vk(s, model, &prompt_tokens, max_tokens, sampler_cfg);
+                    return generate_vk(s, model, &prompt_tokens, max_tokens, sampler_cfg, ctrl);
                 }
             }
         }
     }
     let prompt_len = prompt_tokens.len();
     let stops = s.tokenizer.read().unwrap().stop_token_ids();
+    ctrl.observe_prompt_tail(&prompt_tokens, 64);
     let mut all_tokens = prompt_tokens;
     let mut generated_ids: Vec<u32> = Vec::new();
     // Acquire any free backend slot — falls back to round-robin block
@@ -1820,7 +2135,7 @@ fn generate_blocking(
                 fsm.apply_mask(&mut logits);
             }
         }
-        let next = sample(&logits, sampler_cfg);
+        let next = ctrl.sample_token(&logits, sampler_cfg);
         // Stateful grammars (regex): feed the sampled token so the next step
         // masks from the advanced DFA state.
         if let Some(fsm) = fsm {
@@ -1845,6 +2160,13 @@ fn generate_blocking(
         }
         all_tokens.push(next);
         generated_ids.push(next);
+        ctrl.observe(next);
+        if ctrl.has_stops() {
+            let w = stop_window_text(s, &generated_ids, ctrl.window_tokens());
+            if ctrl.stop_hit_in(&w) {
+                break;
+            }
+        }
 
         // ── Prompt-lookup decoding (PLD) ──
         // Greedy-only fast path: when temperature=0 + PLD enabled, look
@@ -1859,6 +2181,7 @@ fn generate_blocking(
             && detect.is_none()
             && lp.is_none()
             && fsm.is_none()
+            && !ctrl.modifies_logits() // drafts verify against unadjusted rows
             && sampler_cfg.temperature == 0.0;
         if pld_on && generated_ids.len() < max_tokens {
             const LOOKUP_LEN: usize = 2;
@@ -1895,7 +2218,13 @@ fn generate_blocking(
                     if stops.contains(d) { early_eos = true; break; }
                     all_tokens.push(*d);
                     generated_ids.push(*d);
+                    ctrl.observe(*d);
                     if generated_ids.len() >= max_tokens { break; }
+                }
+                // Stop strings over the batch-committed tokens.
+                if !early_eos && ctrl.has_stops() {
+                    let w = stop_window_text(s, &generated_ids, ctrl.window_tokens());
+                    if ctrl.stop_hit_in(&w) { early_eos = true; }
                 }
                 // Truncate the KV cache to drop any rejected draft
                 // tokens (they're in KV but not in our output). The
@@ -1913,6 +2242,7 @@ fn generate_blocking(
                 {
                     all_tokens.push(verify.bonus);
                     generated_ids.push(verify.bonus);
+                    ctrl.observe(verify.bonus);
                     // bonus is NOT in KV yet — next iteration's top-of-loop
                     // forward will commit it. So we *don't* update KV here;
                     // we rely on the next iteration to forward [bonus].
@@ -1935,7 +2265,8 @@ fn generate_blocking(
     prompt_cache.clear();
     prompt_cache.extend_from_slice(&all_tokens);
     drop(slot);
-    let text = s.tokenizer.read().unwrap().decode(&generated_ids).unwrap_or_default();
+    let mut text = s.tokenizer.read().unwrap().decode(&generated_ids).unwrap_or_default();
+    ctrl.truncate_at_stop(&mut text);
     (text, prompt_len, generated_ids.len(), finish_reason)
 }
 
@@ -1950,6 +2281,7 @@ fn chat_stream(
     fsm: Option<LogitFSM>,
     id: String,
     model_id: String,
+    mut ctrl: DecodeControl,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     use futures::channel::mpsc;
     use futures::StreamExt;
@@ -1989,20 +2321,32 @@ fn chat_stream(
             if gpu_eligible {
                 if let Ok(guard) = s.gpu.lock() {
                     if let Some(model) = guard.as_ref() {
-                        let greedy = sampler_cfg.temperature == 0.0;
+                        let greedy = sampler_cfg.temperature == 0.0 && !ctrl.modifies_logits();
+                        ctrl.observe_prompt_tail(&prompt_tokens, 64);
                         let prompt_len = prompt_tokens.len();
                         let t_prefill = std::time::Instant::now();
                         let first_logits = model.prefill_forward(&prompt_tokens);
                         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1e3;
                         let mut finish_reason: &'static str = "length";
                         let mut pos = prompt_len;
-                        let mut generated = 0usize;
-                        let mut next = sample(&first_logits, &sampler_cfg);
+                        let mut gen_ids: Vec<u32> = Vec::new();
+                        let mut next = ctrl.sample_token(&first_logits, &sampler_cfg);
                         let t_decode = std::time::Instant::now();
                         loop {
                             if stops.contains(&next) {
                                 finish_reason = "stop";
                                 break;
+                            }
+                            gen_ids.push(next);
+                            ctrl.observe(next);
+                            // Stop-string check BEFORE emitting the chunk so a
+                            // completed stop sequence is never streamed.
+                            if ctrl.has_stops() {
+                                let w = stop_window_text(&s, &gen_ids, ctrl.window_tokens());
+                                if ctrl.stop_hit_in(&w) {
+                                    finish_reason = "stop";
+                                    break;
+                                }
                             }
                             let text = s.tokenizer.read().unwrap().decode(&[next]).unwrap_or_default();
                             let chunk = json!({
@@ -2013,17 +2357,17 @@ fn chat_stream(
                             if tx.unbounded_send(Ok(Event::default().data(chunk.to_string()))).is_err() {
                                 break;
                             }
-                            generated += 1;
-                            if generated >= max_tokens {
+                            if gen_ids.len() >= max_tokens {
                                 break;
                             }
                             next = if greedy {
                                 model.forward_argmax(next, pos)
                             } else {
-                                sample(&model.forward(next, pos), &sampler_cfg)
+                                ctrl.sample_token(&model.forward(next, pos), &sampler_cfg)
                             };
                             pos += 1;
                         }
+                        let generated = gen_ids.len();
                         let dec_s = t_decode.elapsed().as_secs_f64();
                         tracing::info!(
                             "GPU fast-lane (stream): prefill {prompt_len} tok in {prefill_ms:.0} ms ({:.0} tok/s), streamed {generated} tok at {:.0} tok/s",
@@ -2056,21 +2400,28 @@ fn chat_stream(
             if vk_eligible {
                 if let Ok(guard) = s.vk.lock() {
                     if let Some(model) = guard.as_ref() {
-                        let greedy = sampler_cfg.temperature == 0.0;
+                        let greedy = sampler_cfg.temperature == 0.0 && !ctrl.modifies_logits();
+                        ctrl.observe_prompt_tail(&prompt_tokens, 64);
                         let prompt_len = prompt_tokens.len();
                         let t_decode = std::time::Instant::now();
                         let mut next = if prompt_len > 32 {
-                            sample(&model.prefill_forward(&prompt_tokens), &sampler_cfg)
+                            ctrl.sample_token(&model.prefill_forward(&prompt_tokens), &sampler_cfg)
                         } else {
                             for (i, &tk) in prompt_tokens[..prompt_len - 1].iter().enumerate() { model.prefill_step(tk, i); }
                             let last = prompt_tokens[prompt_len - 1];
-                            if greedy { model.forward_argmax(last, prompt_len - 1) } else { sample(&model.forward(last, prompt_len - 1), &sampler_cfg) }
+                            if greedy { model.forward_argmax(last, prompt_len - 1) } else { ctrl.sample_token(&model.forward(last, prompt_len - 1), &sampler_cfg) }
                         };
                         let mut finish_reason: &'static str = "length";
                         let mut pos = prompt_len;
-                        let mut generated = 0usize;
+                        let mut gen_ids: Vec<u32> = Vec::new();
                         loop {
                             if stops.contains(&next) { finish_reason = "stop"; break; }
+                            gen_ids.push(next);
+                            ctrl.observe(next);
+                            if ctrl.has_stops() {
+                                let w = stop_window_text(&s, &gen_ids, ctrl.window_tokens());
+                                if ctrl.stop_hit_in(&w) { finish_reason = "stop"; break; }
+                            }
                             let text = s.tokenizer.read().unwrap().decode(&[next]).unwrap_or_default();
                             let chunk = json!({
                                 "id": id, "object": "chat.completion.chunk",
@@ -2078,11 +2429,11 @@ fn chat_stream(
                                 "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
                             });
                             if tx.unbounded_send(Ok(Event::default().data(chunk.to_string()))).is_err() { break; }
-                            generated += 1;
-                            if generated >= max_tokens { break; }
-                            next = if greedy { model.forward_argmax(next, pos) } else { sample(&model.forward(next, pos), &sampler_cfg) };
+                            if gen_ids.len() >= max_tokens { break; }
+                            next = if greedy { model.forward_argmax(next, pos) } else { ctrl.sample_token(&model.forward(next, pos), &sampler_cfg) };
                             pos += 1;
                         }
+                        let generated = gen_ids.len();
                         let dec_s = t_decode.elapsed().as_secs_f64();
                         tracing::info!("Vulkan fast-lane (stream): streamed {generated} tok at {:.0} tok/s", generated as f64 / dec_s.max(1e-6));
                         let final_chunk = json!({
@@ -2099,6 +2450,8 @@ fn chat_stream(
             }
         }
 
+        ctrl.observe_prompt_tail(&prompt_tokens, 64);
+        let stream_prompt_len = prompt_tokens.len();
         let mut all_tokens = prompt_tokens;
         let mut slot = acquire_slot(&s.pool);
         let BackendSlot { backend, prompt_cache, .. } = &mut *slot;
@@ -2163,7 +2516,7 @@ fn chat_stream(
                     fsm.apply_mask(&mut logits);
                 }
             }
-            let next = sample(&logits, &sampler_cfg);
+            let next = ctrl.sample_token(&logits, &sampler_cfg);
             // Stateful grammars: advance the DFA on the sampled token.
             if let Some(fsm) = &fsm {
                 if fsm.is_active() {
@@ -2179,6 +2532,15 @@ fn chat_stream(
             }
             all_tokens.push(next);
             generated += 1;
+            ctrl.observe(next);
+            // Stop-string check BEFORE emitting so a completed stop
+            // sequence is never streamed to the client.
+            if ctrl.has_stops() {
+                let w = stop_window_text(&s, &all_tokens[stream_prompt_len..], ctrl.window_tokens());
+                if ctrl.stop_hit_in(&w) {
+                    break;
+                }
+            }
             // Helper: emit one token as an SSE delta chunk.
             let send_tok = |tok: u32, tx: &mut futures::channel::mpsc::UnboundedSender<Result<Event, Infallible>>| -> bool {
                 if let Ok(text) = s.tokenizer.read().unwrap().decode(&[tok]) {
@@ -2198,6 +2560,7 @@ fn chat_stream(
             let pld_on = s.pld_enabled.load(Ordering::Relaxed)
                 && !inspect_on
                 && fsm.is_none()
+                && !ctrl.modifies_logits() // drafts verify against unadjusted rows
                 && sampler_cfg.temperature == 0.0;
             if pld_on && generated < max_tokens {
                 const LOOKUP_LEN: usize = 2;
@@ -2222,6 +2585,11 @@ fn chat_stream(
                     for d in &draft[..verify.accepted] {
                         if stops.contains(d) { early_eos = true; break; }
                         all_tokens.push(*d); generated += 1;
+                        ctrl.observe(*d);
+                        if ctrl.has_stops() {
+                            let w = stop_window_text(&s, &all_tokens[stream_prompt_len..], ctrl.window_tokens());
+                            if ctrl.stop_hit_in(&w) { early_eos = true; break; }
+                        }
                         if !send_tok(*d, &mut tx) { early_eos = true; break; }
                         if generated >= max_tokens { break; }
                     }
@@ -2236,6 +2604,7 @@ fn chat_stream(
                         && generated < max_tokens
                     {
                         all_tokens.push(verify.bonus); generated += 1;
+                        ctrl.observe(verify.bonus);
                         let _ = send_tok(verify.bonus, &mut tx);
                     }
                 }
@@ -2640,7 +3009,7 @@ async fn layer_agreement(
     let mut agreement = vec![0u32; n_layers];
     let mut last_token = *tokens.last().unwrap_or(&0);
     let sampler_cfg = crate::engine::sampler::SamplerConfig {
-        temperature: 0.0, top_k: 0, top_p: 1.0,
+        temperature: 0.0, top_k: 0, top_p: 1.0, min_p: 0.0,
     };
     let mut generated: Vec<u32> = Vec::new();
     for _ in 0..n_tokens {
