@@ -1343,8 +1343,8 @@ impl VkModel {
             let wo = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.wo, attn, x_buf, n_embd, true);
             let w13 = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, r.w13_q3.as_ref().unwrap_or(&r.w13), normed, gu, n_inter * 2, false);
             let w2 = vk_mk_mv(&ctx, desc_pool, mv_sl, q6k_sl, &mut bufs, &r.w2, hbuf, x_buf, n_embd, true);
-            let wqb = match &r.wq { VkWeight::Q4 { buf, .. } => *buf, _ => panic!("wq not Q4") };
-            let wkb = match &r.wk { VkWeight::Q4 { buf, .. } => *buf, _ => panic!("wk not Q4") };
+            let wqb = match &r.wq { VkWeight::Q4 { buf, .. } => *buf, _ => return Err("raw-Vulkan lane requires Q4_K attn_q weights (this GGUF quantizes attn_q differently); use a Q4_K_M model or run without ZLLM_VK".into()) };
+            let wkb = match &r.wk { VkWeight::Q4 { buf, .. } => *buf, _ => return Err("raw-Vulkan lane requires Q4_K attn_k weights (this GGUF quantizes attn_k differently); use a Q4_K_M model or run without ZLLM_VK".into()) };
             let u_wqr = vk_uni8(&ctx, &mut bufs, [n_embd as u32, n_embd as u32, (n_embd / 256) as u32, gxof(n_embd / 2), half as u32, 0, 0, 0]);
             let u_wkr = vk_uni8(&ctx, &mut bufs, [kv_dim as u32, n_embd as u32, (n_embd / 256) as u32, gxof(kv_dim / 2), half as u32, 0, 0, 0]);
             let wq_rope = mkset(mvr_sl, &[wqb, normed, cos_buf, sin_buf, q], u_wqr);
@@ -1377,7 +1377,7 @@ impl VkModel {
 
         // --- Batched prefill resources (option b: Q6 wv/ffn_down dequant -> f16 dense GEMM) ---
         let prefill = {
-        let q4buf = |w: &VkWeight| -> vk::Buffer { match *w { VkWeight::Q4 { buf, .. } => buf, _ => panic!("prefill: expected Q4 weight") } };
+        let q4buf = |w: &VkWeight| -> Result<vk::Buffer, String> { match *w { VkWeight::Q4 { buf, .. } => Ok(buf), _ => Err("raw-Vulkan prefill requires Q4_K weights for attn_q/k/o and ffn_gate+up (this GGUF differs); use a Q4_K_M model or run without ZLLM_VK".into()) } };
         let mut pw: Vec<PrefillW> = Vec::with_capacity(n_layers);
         for (i, r) in raw.iter().enumerate() {
             let lp = format!("blk.{i}");
@@ -1385,7 +1385,7 @@ impl VkModel {
             let w2_deq: Vec<f32> = ct.tensor(&mut file, &format!("{lp}.ffn_down.weight"), &dev).map_err(|e| e.to_string())?.dequantize(&dev).map_err(|e| e.to_string())?.flatten_all().map_err(|e| e.to_string())?.to_vec1().map_err(|e| e.to_string())?;
             let wv_f16 = vk_up_f16t(&ctx, &mut bufs, &wv_deq, kv_dim, n_embd);
             let w2_f16 = vk_up_f16t(&ctx, &mut bufs, &w2_deq, n_embd, n_inter);
-            pw.push(PrefillW { wq: q4buf(&r.wq), wk: q4buf(&r.wk), wqk: r.wqk, wo: q4buf(&r.wo), w13: q4buf(&r.w13), wv_f16, w2_f16, attn_norm: r.an, ffn_norm: r.fn_, kc: r.kc, vc: r.vc });
+            pw.push(PrefillW { wq: q4buf(&r.wq)?, wk: q4buf(&r.wk)?, wqk: r.wqk, wo: q4buf(&r.wo)?, w13: q4buf(&r.w13)?, wv_f16, w2_f16, attn_norm: r.an, ffn_norm: r.fn_, kc: r.kc, vc: r.vc });
         }
         let mut mkp = |spv: &[u8], n: u32, coop: bool| -> Pipe3 {
             let (p, l, sl, m) = if coop { ctx.make_pipeline_coopmat(spv, n) } else { ctx.make_pipeline_raw(spv, n) };
