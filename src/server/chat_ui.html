@@ -2150,9 +2150,9 @@ function renderPickerMenu() {
       const a = document.createElement('span');
       a.textContent = 'arch: ' + m.architecture;
       a.style.fontFamily = 'var(--mono)';
-      if (m.loadable === false && m.architecture.toLowerCase() !== 'llama') {
+      if (m.loadable === false && !['llama', 'qwen2'].includes(m.architecture.toLowerCase())) {
         a.style.color = 'var(--warn)';
-        a.title = 'zllm v0.7 only supports llama-architecture GGUFs';
+        a.title = 'zllm loads the llama (incl. Mistral) and qwen2 families';
       }
       meta.appendChild(a);
     }
@@ -2176,9 +2176,10 @@ function renderPickerMenu() {
       row.style.cursor = 'help';
       row.onclick = async () => {
         const arch = m.architecture || 'unknown';
-        const reason = arch.toLowerCase() === 'llama'
+        const supported = ['llama', 'qwen2'];
+        const reason = supported.includes(arch.toLowerCase())
           ? `Missing tokenizer.json next to the GGUF file.`
-          : `Architecture "${arch}" is not supported by zllm v0.7. Only "llama"-architecture GGUFs work today. Other architectures (qwen2, mistral, gemma, phi, …) need their own backend fork — see src/backend/candle/quantized_llama_fork.rs for the template.`;
+          : `Architecture "${arch}" is not supported. zllm loads the "llama" (incl. Mistral) and "qwen2" families today. Other architectures (gemma, phi, …) need their own backend fork — see src/backend/candle/quantized_llama_fork.rs for the template.`;
         await showAlert(`Can't load ${m.id}`, reason);
       };
     } else {

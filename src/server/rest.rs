@@ -651,7 +651,7 @@ async fn select_model(
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "error": format!(
-                    "architecture {:?} is not supported by zllm v0.7 — only \"llama\" GGUFs work today. Other arches need their own backend fork (parallel to src/backend/candle/quantized_llama_fork.rs).",
+                    "architecture {:?} is not supported — zllm loads the \"llama\" (incl. Mistral) and \"qwen2\" families today. Other arches need their own backend fork (parallel to src/backend/candle/quantized_llama_fork.rs).",
                     arch
                 )
             })),
