@@ -20,7 +20,7 @@ regex-automata = "0.4"
 # REST server (axum). gRPC was removed in v0.4 — installed-app surface
 # is REST + chat UI only.
 axum = "0.8"
-tower = "0.5"
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "catch-panic"] }
 futures = "0.3"
 

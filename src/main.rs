@@ -118,7 +118,10 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or(std::path::Path::new("."))
                     .join("tokenizer.json");
                 if next_to.exists() {
-                    LlamaTokenizer::from_file(next_to.to_str().unwrap())?
+                    let p = next_to.to_str().ok_or_else(|| {
+                        anyhow::anyhow!("tokenizer path is not valid UTF-8: {}", next_to.display())
+                    })?;
+                    LlamaTokenizer::from_file(p)?
                 } else if model_path.exists() {
                     tracing::info!("no sibling tokenizer.json — using the GGUF-embedded vocab");
                     LlamaTokenizer::from_gguf_file(&model_path)?
@@ -473,10 +476,16 @@ async fn main() -> anyhow::Result<()> {
             let rest_addr = format!("{bind_host}:{}", cfg.server.rest_port);
             let router = server::rest::router(state);
 
+            // Bind before spawning so a port conflict is a clean error
+            // (exit with a message) instead of a panic in a detached task.
+            let listener = tokio::net::TcpListener::bind(&rest_addr).await.map_err(|e| {
+                anyhow::anyhow!("could not bind {rest_addr}: {e} — is the port already in use, or the address unavailable?")
+            })?;
+            tracing::info!("REST server listening on {rest_addr}");
             let rest_handle = tokio::spawn(async move {
-                let listener = tokio::net::TcpListener::bind(&rest_addr).await.unwrap();
-                tracing::info!("REST server listening on {rest_addr}");
-                axum::serve(listener, router).await.unwrap();
+                if let Err(e) = axum::serve(listener, router).await {
+                    tracing::error!("REST server stopped with error: {e}");
+                }
             });
 
             tokio::select! {
@@ -504,7 +513,10 @@ async fn main() -> anyhow::Result<()> {
                 // Try to find tokenizer.json next to model file
                 let tok_path = model.parent().unwrap_or(std::path::Path::new(".")).join("tokenizer.json");
                 if tok_path.exists() {
-                    LlamaTokenizer::from_file(tok_path.to_str().unwrap())?
+                    let p = tok_path.to_str().ok_or_else(|| {
+                        anyhow::anyhow!("tokenizer path is not valid UTF-8: {}", tok_path.display())
+                    })?;
+                    LlamaTokenizer::from_file(p)?
                 } else {
                     tracing::info!("no sibling tokenizer.json — using the GGUF-embedded vocab");
                     LlamaTokenizer::from_gguf_file(&model)?

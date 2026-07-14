@@ -3313,3 +3313,39 @@ fn unix_secs() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower::ServiceExt; // for `oneshot`
+
+    // handle_panic maps every panic payload kind to a 500.
+    #[test]
+    fn handle_panic_maps_any_panic_to_500() {
+        assert_eq!(handle_panic(Box::new("boom")).status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(handle_panic(Box::new(String::from("boom"))).status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(handle_panic(Box::new(42u8)).status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // The catch-panic layer turns a panicking handler into a clean 500
+    // instead of dropping the connection — the production resilience claim.
+    #[tokio::test]
+    async fn catch_panic_layer_turns_handler_panic_into_500() {
+        async fn boom() -> axum::response::Response {
+            panic!("kaboom")
+        }
+        let app = axum::Router::new()
+            .route("/boom", axum::routing::get(boom))
+            .layer(tower_http::catch_panic::CatchPanicLayer::custom(handle_panic));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/boom")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}
