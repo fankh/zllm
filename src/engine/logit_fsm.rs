@@ -64,12 +64,20 @@ impl RegexEngine {
         // Anchored: the generated text must match from its first byte.
         // MatchKind::All: acceptance semantics (no leftmost-first priority) —
         // we're testing "does the whole text match", not searching.
+        // Bound determinization so a pathological pattern (e.g. a deeply nested
+        // JSON schema that would explode the state graph) fails FAST with a
+        // clean error the handler turns into a 400 — rather than spending
+        // minutes-to-hours building an enormous DFA and hanging a worker. 24 MB
+        // comfortably fits every legitimate schema/regex we compile.
+        const DFA_LIMIT: usize = 24 * 1024 * 1024;
         let dfa = dense::Builder::new()
             .configure(
                 dense::Config::new()
                     .start_kind(StartKind::Anchored)
                     .match_kind(MatchKind::All)
-                    .minimize(true),
+                    .minimize(true)
+                    .dfa_size_limit(Some(DFA_LIMIT))
+                    .determinize_size_limit(Some(DFA_LIMIT)),
             )
             .build(pattern)
             .map_err(|e| format!("regex compile failed: {e}"))?;

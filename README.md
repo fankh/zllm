@@ -16,9 +16,14 @@ White-box LLM inference engine with zero-copy latent intercept.
   [zllm-probe](https://github.com/fankh/zllm-probe) drop-in proxy
 - OpenAI-compatible **logprobs** (`logprobs: true` + `top_logprobs: N` on chat;
   integer `logprobs` on legacy completions)
-- **Grammar-constrained decoding**: `regex:<pattern>` (anchored byte-DFA token
-  masking — output is guaranteed to match) and `ban:<ids>` token banning.
-  *JSON-schema/BNF modes not yet implemented (requests are rejected with 400).*
+- **Structured outputs**: OpenAI `response_format` — `json_object` (any JSON
+  object) and `json_schema` (a concrete schema, strict: every declared property
+  emitted in order). Compiled to an anchored byte-DFA so the output is
+  *guaranteed* to parse and conform — no post-hoc validation/retry.
+- **Grammar-constrained decoding** (extension): `regex:<pattern>` (anchored
+  byte-DFA token masking — output is guaranteed to match), `json_schema:<schema>`
+  / `json:` (same engine as `response_format`), and `ban:<ids>` token banning.
+  *BNF mode not yet implemented (requests are rejected with 400).*
 - Paged-KV **continuous batching** (vLLM-style: prefix cache, preemption,
   chunked prefill, batched spec-decode) on the GPU backend, `ZLLM_CB=1`
 - Goal / task / status API (REST `/v1/goal/*`), disk-persisted, backed by the

@@ -1029,14 +1029,6 @@ async fn chat_completions(
             "error": "n > 1 is not supported"
         }))).into_response();
     }
-    if let Some(rf) = &req.response_format {
-        let ty = rf.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        if !ty.is_empty() && ty != "text" {
-            return (StatusCode::BAD_REQUEST, Json(json!({
-                "error": format!("response_format {ty:?} is not supported (use the `grammar` extension for constrained output)")
-            }))).into_response();
-        }
-    }
     let mut sampler_cfg = sampler_from_request(&s.engine, req.temperature, req.top_p, req.top_k);
     sampler_cfg.min_p = req.min_p.unwrap_or(0.0);
     let mut ctrl = build_decode_ctrl(
@@ -1047,10 +1039,16 @@ async fn chat_completions(
         req.logit_bias.clone(),
         req.seed,
     );
-    // Grammar compile errors (bad regex, unimplemented mode) fail loudly —
-    // silently returning unconstrained output to a caller who asked for a
-    // constraint is worse than an error.
-    let fsm = match req.grammar.as_deref() {
+    // A single decoding constraint may come from the OpenAI `response_format`
+    // (json_object / json_schema) or the `grammar` extension. Resolve to one
+    // grammar string, then compile. Compile errors (bad regex/schema,
+    // unimplemented mode) fail loudly — silently returning unconstrained output
+    // to a caller who asked for a constraint is worse than an error.
+    let grammar = match resolve_constraint(&req.grammar, &req.response_format) {
+        Ok(g) => g,
+        Err(msg) => return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response(),
+    };
+    let fsm = match grammar.as_deref() {
         Some(g) => match fsm_from_grammar(&s, g) {
             Ok(f) => Some(f),
             Err(msg) => {
@@ -1214,11 +1212,15 @@ struct CompletionRequest {
 }
 
 /// Build a LogitFSM from a request's `grammar` string, supplying the cached
-/// vocab byte table for `regex:` mode (built on first use, ~one decode per
-/// vocab entry; invalidated on model swap). `Err` = user-facing 400 message
-/// (bad pattern / unimplemented mode / no EOS).
+/// vocab byte table for the DFA modes (`regex:` / `json_schema:` / `json:`),
+/// built on first use (~one decode per vocab entry; invalidated on model
+/// swap). `Err` = user-facing 400 message (bad pattern / bad schema /
+/// unimplemented mode / no EOS).
 fn fsm_from_grammar(s: &AppState, grammar: &str) -> Result<LogitFSM, String> {
-    let table = if grammar.trim_start().starts_with("regex:") {
+    let g = grammar.trim_start();
+    let needs_table =
+        g.starts_with("regex:") || g.starts_with("json_schema:") || g.starts_with("json:");
+    let table = if needs_table {
         if let Some(t) = s.token_table.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
             Some(t.clone())
         } else {
@@ -1238,6 +1240,56 @@ fn fsm_from_grammar(s: &AppState, grammar: &str) -> Result<LogitFSM, String> {
         None
     };
     LogitFSM::compile(grammar, table)
+}
+
+/// Map an OpenAI `response_format` object to a grammar string, or `None` for
+/// the unconstrained (`text`) case. `json_object` → any well-formed JSON;
+/// `json_schema` → the embedded schema compiled to a constraint. `Err` is a
+/// user-facing 400 message.
+fn grammar_from_response_format(rf: &serde_json::Value) -> Result<Option<String>, String> {
+    let ty = rf.get("type").and_then(|t| t.as_str()).unwrap_or("text");
+    match ty {
+        "" | "text" => Ok(None),
+        // OpenAI json_object means a JSON *object* specifically (not any JSON
+        // value). An empty-properties object schema compiles to exactly that:
+        // a top-level `{...}` with arbitrary keys/values. (The shapeless
+        // any-value `json:` grammar remains available as an extension.)
+        "json_object" => Ok(Some("json_schema:{\"type\":\"object\"}".to_string())),
+        "json_schema" => {
+            // OpenAI nests the schema at response_format.json_schema.schema.
+            let schema = rf
+                .get("json_schema")
+                .and_then(|j| j.get("schema"))
+                .ok_or("response_format \"json_schema\" requires a json_schema.schema object")?;
+            let schema_str = serde_json::to_string(schema)
+                .map_err(|e| format!("response_format schema: {e}"))?;
+            Ok(Some(format!("json_schema:{schema_str}")))
+        }
+        other => Err(format!(
+            "response_format {other:?} is not supported (supported: text, json_object, json_schema)"
+        )),
+    }
+}
+
+/// Resolve the single decoding constraint for a request from either the
+/// `grammar` extension or the OpenAI `response_format` — at most one may
+/// constrain output. `Err` is a user-facing 400 message.
+fn resolve_constraint(
+    grammar: &Option<String>,
+    response_format: &Option<serde_json::Value>,
+) -> Result<Option<String>, String> {
+    let rf_grammar = match response_format {
+        Some(rf) => grammar_from_response_format(rf)?,
+        None => None,
+    };
+    match (grammar, rf_grammar) {
+        (Some(g), Some(_)) if !g.trim().is_empty() => Err(
+            "cannot combine the `grammar` extension with a constraining `response_format`; use one"
+                .to_string(),
+        ),
+        (Some(g), _) if !g.trim().is_empty() => Ok(Some(g.clone())),
+        (_, rf) => Ok(rf),
+    }
 }
 
 /// Compact JSON view of a hallucination report (the per-token detail is omitted —
@@ -3325,6 +3377,63 @@ mod tests {
         assert_eq!(handle_panic(Box::new("boom")).status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(handle_panic(Box::new(String::from("boom"))).status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(handle_panic(Box::new(42u8)).status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn response_format_maps_to_grammar() {
+        // text / absent -> no constraint
+        assert_eq!(grammar_from_response_format(&json!({"type": "text"})).unwrap(), None);
+        assert_eq!(grammar_from_response_format(&json!({})).unwrap(), None);
+        // json_object -> a JSON object specifically
+        assert_eq!(
+            grammar_from_response_format(&json!({"type": "json_object"})).unwrap(),
+            Some("json_schema:{\"type\":\"object\"}".to_string())
+        );
+        // json_schema -> json_schema:<schema>
+        let rf = json!({
+            "type": "json_schema",
+            "json_schema": {"name": "s", "schema": {"type": "boolean"}}
+        });
+        assert_eq!(
+            grammar_from_response_format(&rf).unwrap(),
+            Some("json_schema:{\"type\":\"boolean\"}".to_string())
+        );
+        // json_schema without a schema -> error
+        assert!(grammar_from_response_format(&json!({"type": "json_schema"})).is_err());
+        // unknown type -> error
+        assert!(grammar_from_response_format(&json!({"type": "yaml"})).is_err());
+    }
+
+    #[test]
+    fn resolve_constraint_precedence_and_conflict() {
+        // neither
+        assert_eq!(resolve_constraint(&None, &None).unwrap(), None);
+        // grammar only
+        assert_eq!(
+            resolve_constraint(&Some("regex:a+".into()), &None).unwrap(),
+            Some("regex:a+".into())
+        );
+        // response_format only
+        assert_eq!(
+            resolve_constraint(&None, &Some(json!({"type": "json_object"}))).unwrap(),
+            Some("json_schema:{\"type\":\"object\"}".into())
+        );
+        // an empty grammar string is not a constraint — response_format wins
+        assert_eq!(
+            resolve_constraint(&Some("".into()), &Some(json!({"type": "json_object"}))).unwrap(),
+            Some("json_schema:{\"type\":\"object\"}".into())
+        );
+        // both constraining -> conflict error
+        assert!(resolve_constraint(
+            &Some("regex:a+".into()),
+            &Some(json!({"type": "json_object"}))
+        )
+        .is_err());
+        // grammar + non-constraining response_format (text) -> grammar wins
+        assert_eq!(
+            resolve_constraint(&Some("regex:a+".into()), &Some(json!({"type": "text"}))).unwrap(),
+            Some("regex:a+".into())
+        );
     }
 
     // The catch-panic layer turns a panicking handler into a clean 500

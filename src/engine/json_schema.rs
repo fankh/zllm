@@ -218,9 +218,14 @@ fn compile_object(
         Some(Value::Object(p)) => p,
         // An object with no declared properties → any bounded JSON object.
         _ => {
+            // An object with arbitrary keys and bounded-depth values. Values
+            // are one level shallower than the surrounding budget (the `- 1`)
+            // so this is exactly the object arm of `any_value` — proven to fit
+            // the DFA size limit — rather than one level deeper (which blows it
+            // up and is pathologically slow to reject).
             return Ok(format!(
                 r"\{{{SP}({STRING}{SP}:{SP}{v}({SP},{SP}{STRING}{SP}:{SP}{v})*)?{SP}\}}",
-                v = any_value(ANY_JSON_DEFAULT_DEPTH.saturating_sub(depth.min(ANY_JSON_DEFAULT_DEPTH)))
+                v = any_value(ANY_JSON_DEFAULT_DEPTH.saturating_sub(depth).saturating_sub(1))
             ))
         }
     };
@@ -251,7 +256,20 @@ mod tests {
     /// Compile `pattern` to an anchored DFA and test whether `text` is a
     /// complete match — mirrors how `LogitFSM` accepts a finished generation.
     fn full_match(pattern: &str, text: &str) -> bool {
-        let dfa = dense::DFA::new(pattern).expect("pattern compiles");
+        // Mirror the production DFA config (anchored, size-bounded) so a
+        // pattern that would blow the limit fails the test fast instead of
+        // determinizing for minutes.
+        let dfa = dense::Builder::new()
+            .configure(
+                dense::Config::new()
+                    .start_kind(regex_automata::dfa::StartKind::Anchored)
+                    .match_kind(regex_automata::MatchKind::All)
+                    .minimize(true)
+                    .dfa_size_limit(Some(24 * 1024 * 1024))
+                    .determinize_size_limit(Some(24 * 1024 * 1024)),
+            )
+            .build(pattern)
+            .expect("pattern compiles within size limit");
         let mut state = dfa
             .start_state_forward(&Input::new("").anchored(Anchored::Yes))
             .unwrap();
@@ -374,6 +392,30 @@ mod tests {
         assert!(schema_to_regex(&json!({"anyOf": [{"type":"string"}]})).is_err());
         assert!(schema_to_regex(&json!({"type": "object", "properties": {"x": {}}})).is_err()); // subschema has no type
         assert!(schema_to_regex(&json!(42)).is_err()); // not an object
+    }
+
+    #[test]
+    fn bare_object_type_is_object_only() {
+        // This is what `response_format: json_object` compiles to — it must
+        // force a top-level object, not accept any JSON value.
+        let s = json!({"type": "object"});
+        assert!(accepts(&s, "{}"));
+        assert!(accepts(&s, r#"{"a":1}"#));
+        assert!(accepts(&s, r#"{"a":1,"b":[true,null,"x"]}"#));
+        assert!(rejects(&s, r#""just a string""#));
+        assert!(rejects(&s, "42"));
+        assert!(rejects(&s, "[1,2]"));
+    }
+
+    #[test]
+    fn pathologically_deep_schema_is_rejected_fast() {
+        // Nest objects deeper than MAX_DEPTH. Must error in the compiler
+        // (before any DFA construction) rather than build a giant pattern.
+        let mut s = json!({"type": "boolean"});
+        for _ in 0..(MAX_DEPTH + 8) {
+            s = json!({"type": "object", "properties": {"x": s}});
+        }
+        assert!(schema_to_regex(&s).is_err());
     }
 
     #[test]
