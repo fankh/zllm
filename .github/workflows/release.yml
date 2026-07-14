@@ -15,6 +15,10 @@ jobs:
   build:
     name: Build ${{ matrix.target }} ${{ matrix.accel }}
     runs-on: ${{ matrix.os }}
+    # Windows CUDA is the finicky one (nvcc + MSVC + GPU-less runner) and
+    # its artifact is niche — let it fail without reddening the whole
+    # release. The `release` job below ships whatever subset built.
+    continue-on-error: ${{ matrix.os == 'windows-latest' && matrix.accel == 'cuda' }}
     strategy:
       fail-fast: false
       matrix:
@@ -184,3 +188,7 @@ jobs:
           generate_release_notes: true
           body_path: CHANGELOG.md
           fail_on_unmatched_files: true
+          # Semver pre-release tags (v1.0.0-rc.1, v1.2.0-beta) all carry a
+          # hyphen — mark those as pre-releases so they don't become the
+          # repo's "Latest". Final tags (v1.0.0) publish as full releases.
+          prerelease: ${{ contains(github.ref_name, '-') }}
