@@ -20,6 +20,11 @@ White-box LLM inference engine with zero-copy latent intercept.
   object) and `json_schema` (a concrete schema, strict: every declared property
   emitted in order). Compiled to an anchored byte-DFA so the output is
   *guaranteed* to parse and conform — no post-hoc validation/retry.
+- **Function calling**: OpenAI `tools` with a *forced* `tool_choice` (a named
+  function, or `"required"` with one tool). Arguments are constrained to the
+  tool's `parameters` schema — so the emitted `tool_calls[].arguments` is always
+  schema-valid. (`"auto"`/`"required"`-across-many, where the model decides
+  whether/which to call, are rejected with 400 for now.)
 - **Grammar-constrained decoding** (extension): `regex:<pattern>` (anchored
   byte-DFA token masking — output is guaranteed to match), `json_schema:<schema>`
   / `json:` (same engine as `response_format`), and `ban:<ids>` token banning.
