@@ -107,17 +107,24 @@ impl GpuContext {
     /// Bring up the high-performance adapter (the discrete/integrated GPU,
     /// not a software fallback). Prefers Vulkan. Returns an error string
     /// if no suitable adapter or device can be acquired.
+    ///
+    /// `ZLLM_GPU_FORCE_CPU=1` requests wgpu's software fallback adapter
+    /// (DX12 WARP on Windows, lavapipe/llvmpipe on Linux) instead — it
+    /// runs the same WGSL on a CPU rasterizer, so the bit-exact shader
+    /// tests validate correctness on a machine with no usable GPU (e.g.
+    /// CI). No performance meaning; a hardware GPU is used otherwise.
     pub fn new() -> Result<Self, String> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN | wgpu::Backends::DX12,
             ..Default::default()
         });
 
+        let force_cpu = std::env::var("ZLLM_GPU_FORCE_CPU").is_ok();
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: None,
-                force_fallback_adapter: false,
+                force_fallback_adapter: force_cpu,
             })
             .block_on()
             .ok_or_else(|| "no suitable GPU adapter found".to_string())?;
