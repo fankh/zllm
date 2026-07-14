@@ -889,12 +889,10 @@ pub fn quantize_mat_q8_k_4x8_scalar(x: &[f32], y: &mut [BlockQ8Kx4], k: usize) {
         // each row. ggml's `bsums[64]` is 4 rows × 16 sums. The SIMD
         // path stores these in a shuffled order for later vectorized
         // reduce; here we mirror that storage.
-        // Layout: bsums[row * 16 + group] but ggml's actual stored
-        // layout interleaves rows in groups of 4. Since the matmul
-        // kernels read bsums via shuffles, the LAYOUT must match
-        // byte-for-byte with the AVX2 path. Phase 1 leaves bsums
-        // unimplemented as a TODO — the matmul kernels in later
-        // phases need it; the quantizer's tests cover qs only.
+        // Layout: bsums[row * 16 + group], matching the AVX2 path's
+        // stored order byte-for-byte so the matmul kernels can read it
+        // via the same shuffles. Each bsum is the signed sum of the 16
+        // q8 values in its group.
         y[i].bsums = [0i16; QK_K / 4];
         for row in 0..4 {
             for group in 0..16 {
