@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.0.0-rc.2 — 2026-07-14
+
+Release-workflow hardening (no engine changes) plus the rc soak continues.
+
+- **Release CI**: pre-release tags (any tag carrying a hyphen, e.g.
+  `-rc.2`) now publish as GitHub pre-releases instead of becoming the
+  repo's "Latest"; final `vX.Y.Z` tags still publish as full releases.
+- **Release CI**: the Windows-CUDA matrix build is now
+  `continue-on-error` — its finicky nvcc/MSVC toolchain failure no
+  longer reds the whole Release run; the release job still ships every
+  artifact that built.
+- Feature surface re-verified end-to-end against the running server
+  (chat, streaming, seeded sampling, penalties, logit_bias, regex
+  grammar, logprobs, embeddings, multilingual tokenizer roundtrip,
+  hallucination detection, goal API, OpenAI error semantics).
+
 ## v1.0.0-rc.1 — 2026-07-13 (V1_PLAN M5: "installable")
 
 Release-candidate artifacts. The remaining gate to 1.0.0 is the RC soak
