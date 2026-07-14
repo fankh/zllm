@@ -219,7 +219,8 @@ impl LogitFSM {
         } else if !trimmed.is_empty() {
             let mode = Self::mode_name(trimmed).unwrap_or("unknown");
             return Err(format!(
-                "grammar mode {mode:?} is not implemented yet; supported: \"ban:<id>,<id>,...\", \"regex:<pattern>\""
+                "grammar mode {mode:?} is not implemented yet; supported: \"ban:<id>,<id>,...\", \
+                 \"regex:<pattern>\", \"json_schema:<schema>\", \"json:\""
             ));
         }
 
@@ -404,7 +405,12 @@ mod tests {
     fn bnf_mode_still_unimplemented() {
         // bnf is the one remaining reserved-but-stubbed mode.
         let g = "bnf:root ::= x";
-        assert!(LogitFSM::compile(g, None).is_err(), "{g} should be a compile error");
+        let err = LogitFSM::compile(g, None).err().expect("bnf must be a compile error");
+        // The "unsupported mode" message must advertise the modes that ARE
+        // implemented, so it can't silently drift stale as modes are added.
+        for mode in ["ban", "regex", "json_schema", "json"] {
+            assert!(err.contains(mode), "unsupported-mode error should mention {mode:?}: {err}");
+        }
         let f = LogitFSM::new(g); // lenient path degrades to inactive
         assert_eq!(f.unsupported_mode(), Some("bnf"));
         assert!(!f.is_active());
