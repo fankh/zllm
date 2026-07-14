@@ -90,6 +90,27 @@ pub fn any_json_regex_default() -> String {
     any_json_regex(ANY_JSON_DEFAULT_DEPTH)
 }
 
+/// Regex matching a `{"name":"<tool>","arguments":<args>}` envelope for a
+/// forced multi-tool call (`tool_choice: "required"` across several tools).
+/// It's an alternation over the candidates — each branch pins `name` to that
+/// tool's literal and constrains `arguments` to that tool's schema — so the
+/// generated JSON both *identifies* the chosen tool and carries schema-valid
+/// arguments. Not wrapped in `regex:`.
+pub fn tool_call_envelope_regex(tools: &[(String, Value)]) -> Result<String, String> {
+    if tools.is_empty() {
+        return Err("no tools to build a call envelope from".to_string());
+    }
+    let mut alts = Vec::with_capacity(tools.len());
+    for (name, params) in tools {
+        let name_lit = literal_regex(&Value::String(name.clone()))?;
+        let args = compile(params, 0)?;
+        alts.push(format!(
+            r#"\{{{SP}"name"{SP}:{SP}{name_lit}{SP},{SP}"arguments"{SP}:{SP}{args}{SP}\}}"#
+        ));
+    }
+    Ok(format!("({})", alts.join("|")))
+}
+
 fn any_value(depth: usize) -> String {
     let mut alts = vec![STRING.to_string(), NUMBER.to_string(), BOOL.to_string(), NULL.to_string()];
     if depth > 0 {
@@ -428,6 +449,28 @@ mod tests {
         assert!(full_match(&re, "[]"));
         assert!(full_match(&re, "{}"));
         assert!(!full_match(&re, "{not json")); // malformed
+    }
+
+    #[test]
+    fn tool_call_envelope_selects_and_constrains() {
+        let tools = vec![
+            (
+                "get_weather".to_string(),
+                json!({"type":"object","properties":{"city":{"type":"string"}}}),
+            ),
+            ("get_time".to_string(), json!({"type":"object","properties":{}})),
+        ];
+        let re = tool_call_envelope_regex(&tools).unwrap();
+        assert!(full_match(&re, r#"{"name":"get_weather","arguments":{"city":"Paris"}}"#));
+        assert!(full_match(&re, r#"{"name":"get_time","arguments":{}}"#));
+        // wrong args for the chosen tool (strict: city required) -> rejected
+        assert!(!full_match(&re, r#"{"name":"get_weather","arguments":{}}"#));
+        // unknown tool name -> rejected
+        assert!(!full_match(&re, r#"{"name":"nope","arguments":{}}"#));
+        // envelope key order is fixed
+        assert!(!full_match(&re, r#"{"arguments":{},"name":"get_time"}"#));
+        // empty tool list -> error, not a hang
+        assert!(tool_call_envelope_regex(&[]).is_err());
     }
 
     #[test]

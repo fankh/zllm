@@ -1055,14 +1055,23 @@ async fn chat_completions(
                 "error": "cannot combine a forced tool call with `grammar`/`response_format`"
             }))).into_response()
         }
-        (Some(plan), None) => match serde_json::to_string(&plan.params) {
-            Ok(schema) => Some(format!("json_schema:{schema}")),
-            Err(e) => {
-                return (StatusCode::BAD_REQUEST, Json(json!({
-                    "error": format!("tool parameters schema: {e}")
-                }))).into_response()
+        (Some(plan), None) => {
+            let built = match plan {
+                ToolPlan::Forced { params, .. } => serde_json::to_string(params)
+                    .map_err(|e| format!("tool parameters schema: {e}"))
+                    .map(|s| format!("json_schema:{s}")),
+                ToolPlan::Choose { tools } => {
+                    crate::engine::json_schema::tool_call_envelope_regex(tools)
+                        .map(|r| format!("regex:{r}"))
+                }
+            };
+            match built {
+                Ok(g) => Some(g),
+                Err(e) => {
+                    return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response()
+                }
             }
-        },
+        }
         (None, g) => g,
     };
     let fsm = match grammar.as_deref() {
@@ -1163,18 +1172,37 @@ async fn chat_completions(
         // JSON — wrap it as an OpenAI tool_calls message (content null,
         // finish_reason "tool_calls") instead of a plain content message.
         let (message, finish) = match &tool_plan {
-            Some(plan) => (
-                json!({
-                    "role": "assistant",
-                    "content": serde_json::Value::Null,
-                    "tool_calls": [{
-                        "id": format!("call_{}", id.trim_start_matches("chatcmpl-")),
-                        "type": "function",
-                        "function": {"name": plan.name, "arguments": text}
-                    }]
-                }),
-                "tool_calls",
-            ),
+            Some(plan) => {
+                // Forced: `text` is the arguments JSON, name known. Choose: the
+                // grammar guaranteed a {"name","arguments"} envelope — split it.
+                let (name, arguments) = match plan {
+                    ToolPlan::Forced { name, .. } => (name.clone(), text.clone()),
+                    ToolPlan::Choose { .. } => match serde_json::from_str::<serde_json::Value>(&text) {
+                        Ok(v) => {
+                            let n = v.get("name").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                            let a = v
+                                .get("arguments")
+                                .map(|x| serde_json::to_string(x).unwrap_or_else(|_| "{}".to_string()))
+                                .unwrap_or_else(|| "{}".to_string());
+                            (n, a)
+                        }
+                        // The grammar makes this unreachable, but never panic on output.
+                        Err(_) => (String::new(), text.clone()),
+                    },
+                };
+                (
+                    json!({
+                        "role": "assistant",
+                        "content": serde_json::Value::Null,
+                        "tool_calls": [{
+                            "id": format!("call_{}", id.trim_start_matches("chatcmpl-")),
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments}
+                        }]
+                    }),
+                    "tool_calls",
+                )
+            }
             None => (json!({"role": "assistant", "content": text}), finish_reason),
         };
         let mut resp = json!({
@@ -1333,39 +1361,43 @@ fn resolve_constraint(
     }
 }
 
-/// A resolved forced function call: the tool the model must call and the JSON
-/// Schema its arguments must satisfy. Generation is constrained to that schema
-/// (via `json_schema:`), then the output is wrapped as an OpenAI `tool_calls`.
-struct ToolPlan {
-    name: String,
-    params: serde_json::Value,
+/// A resolved forced tool call. Generation is constrained (via the grammar
+/// engine) so the output is always a schema-valid call, then wrapped as an
+/// OpenAI `tool_calls`.
+enum ToolPlan {
+    /// Exactly one tool is forced — the name is known, so we constrain to its
+    /// arguments schema directly and the generated text *is* the arguments.
+    Forced { name: String, params: serde_json::Value },
+    /// The model must call one of several tools (`required` across many) — we
+    /// constrain to a `{"name","arguments"}` envelope alternation and read the
+    /// chosen tool + arguments back out of the generated JSON.
+    Choose { tools: Vec<(String, serde_json::Value)> },
 }
 
-/// Extract `(name, parameters-schema)` from one `tools[]` entry.
-fn tool_plan_from(tool: &serde_json::Value) -> Result<ToolPlan, String> {
+/// Extract `(name, parameters-schema)` from one `tools[]` entry. A function
+/// with no `parameters` still constrains to an (empty) object.
+fn tool_name_params(tool: &serde_json::Value) -> Result<(String, serde_json::Value), String> {
     let func = tool.get("function").ok_or("tool entry missing \"function\"")?;
     let name = func
         .get("name")
         .and_then(|n| n.as_str())
         .ok_or("tool function missing \"name\"")?
         .to_string();
-    // A function with no parameters still constrains to an (empty) object.
     let params = func
         .get("parameters")
         .cloned()
         .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
-    Ok(ToolPlan { name, params })
+    Ok((name, params))
 }
 
-/// Resolve OpenAI `tools` + `tool_choice` into a *forced* tool call, or `None`
+/// Resolve OpenAI `tools` + `tool_choice` into a forced tool call, or `None`
 /// when no call should be made. `Err` is a user-facing 400.
 ///
-/// Supported today: a specific function (`tool_choice: {type:function,
-/// function:{name}}`) and `"required"` with a single tool — both reduce to
-/// "call this tool", constrained to its schema. `"none"` disables calls.
-/// `"auto"` (model decides whether/which to call) and `"required"` across
-/// multiple tools need free-or-call / name selection and are not implemented
-/// yet — rejected loudly rather than silently ignored.
+/// Supported: a specific function (`tool_choice: {type:function,
+/// function:{name}}`) and `"required"` (single tool → that tool; multiple →
+/// the model picks one, each schema-constrained). `"none"` disables calls.
+/// `"auto"` (model decides *whether* to call — needs a free-text-or-call
+/// grammar) is the one mode still rejected loudly rather than silently ignored.
 fn resolve_tool_call(
     tools: &Option<serde_json::Value>,
     tool_choice: &Option<serde_json::Value>,
@@ -1380,12 +1412,14 @@ fn resolve_tool_call(
     match tool_choice {
         Some(serde_json::Value::String(s)) => match s.as_str() {
             "none" => Ok(None),
-            "required" if tools.len() == 1 => Ok(Some(tool_plan_from(&tools[0])?)),
-            "required" => Err(
-                "tool_choice \"required\" with multiple tools is not supported yet; name a \
-                 specific function via tool_choice {\"type\":\"function\",\"function\":{\"name\":..}}"
-                    .to_string(),
-            ),
+            "required" if tools.len() == 1 => {
+                let (name, params) = tool_name_params(&tools[0])?;
+                Ok(Some(ToolPlan::Forced { name, params }))
+            }
+            "required" => {
+                let resolved: Result<Vec<_>, _> = tools.iter().map(tool_name_params).collect();
+                Ok(Some(ToolPlan::Choose { tools: resolved? }))
+            }
             "auto" => Err(
                 "tool_choice \"auto\" (model decides whether to call) is not supported yet; set \
                  tool_choice to a specific function or \"required\""
@@ -1408,7 +1442,8 @@ fn resolve_tool_call(
                         == Some(name)
                 })
                 .ok_or_else(|| format!("tool_choice names function {name:?}, not present in tools"))?;
-            Ok(Some(tool_plan_from(tool)?))
+            let (name, params) = tool_name_params(tool)?;
+            Ok(Some(ToolPlan::Forced { name, params }))
         }
         // tools present but tool_choice omitted → OpenAI defaults to "auto".
         None => Err(
@@ -3583,23 +3618,41 @@ mod tests {
         // explicit "none"
         assert!(resolve_tool_call(&Some(tools.clone()), &Some(json!("none"))).unwrap().is_none());
 
-        // specific function by name
-        let p = resolve_tool_call(&Some(tools.clone()),
-            &Some(json!({"type":"function","function":{"name":"get_weather"}}))).unwrap().unwrap();
-        assert_eq!(p.name, "get_weather");
-        assert_eq!(p.params["properties"]["city"]["type"], "string");
+        // specific function by name -> Forced
+        match resolve_tool_call(&Some(tools.clone()),
+            &Some(json!({"type":"function","function":{"name":"get_weather"}}))).unwrap().unwrap() {
+            ToolPlan::Forced { name, params } => {
+                assert_eq!(name, "get_weather");
+                assert_eq!(params["properties"]["city"]["type"], "string");
+            }
+            _ => panic!("expected Forced"),
+        }
 
-        // required + single tool -> that tool; params default to empty object
-        let p = resolve_tool_call(&Some(one), &Some(json!("required"))).unwrap().unwrap();
-        assert_eq!(p.name, "get_weather");
+        // required + single tool -> Forced on that tool
+        match resolve_tool_call(&Some(one), &Some(json!("required"))).unwrap().unwrap() {
+            ToolPlan::Forced { name, .. } => assert_eq!(name, "get_weather"),
+            _ => panic!("expected Forced"),
+        }
 
         // function with no parameters defaults to an object schema
-        let p = resolve_tool_call(&Some(json!([clock])),
-            &Some(json!({"type":"function","function":{"name":"get_time"}}))).unwrap().unwrap();
-        assert_eq!(p.params, json!({"type": "object", "properties": {}}));
+        match resolve_tool_call(&Some(json!([clock])),
+            &Some(json!({"type":"function","function":{"name":"get_time"}}))).unwrap().unwrap() {
+            ToolPlan::Forced { params, .. } => {
+                assert_eq!(params, json!({"type": "object", "properties": {}}))
+            }
+            _ => panic!("expected Forced"),
+        }
+
+        // required + multiple tools -> Choose over all, order preserved
+        match resolve_tool_call(&Some(tools.clone()), &Some(json!("required"))).unwrap().unwrap() {
+            ToolPlan::Choose { tools } => {
+                let names: Vec<&str> = tools.iter().map(|(n, _)| n.as_str()).collect();
+                assert_eq!(names, vec!["get_weather", "get_time"]);
+            }
+            _ => panic!("expected Choose"),
+        }
 
         // unsupported / erroneous
-        assert!(resolve_tool_call(&Some(tools.clone()), &Some(json!("required"))).is_err()); // multi
         assert!(resolve_tool_call(&Some(tools.clone()), &Some(json!("auto"))).is_err());
         assert!(resolve_tool_call(&Some(tools.clone()), &None).is_err()); // omitted == auto
         assert!(resolve_tool_call(&Some(tools.clone()),
