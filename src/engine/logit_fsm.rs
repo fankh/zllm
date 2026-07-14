@@ -19,11 +19,17 @@ use std::sync::Arc;
 ///   drive the DFA into a dead state, and EOS is only allowed when the text so
 ///   far is a complete match. Requires a [`TokenByteTable`] (tokenizer vocab →
 ///   surface bytes), so use [`LogitFSM::compile`] with a table.
+/// - `grammar = "json_schema:<schema>"`  → the text must be a JSON document
+///   satisfying `<schema>` (a JSON string). The schema is compiled to an
+///   anchored regex by [`crate::engine::json_schema`] and enforced by the same
+///   DFA engine as `regex:`. Also needs a [`TokenByteTable`].
+/// - `grammar = "json:"`  → the text must be any bounded, well-formed JSON
+///   value (no fixed shape). Also needs a [`TokenByteTable`].
 ///
-/// Reserved-but-unimplemented modes (`json:`, `json_schema:`, `bnf:`) are
-/// reported via [`unsupported_mode`](LogitFSM::unsupported_mode) /
-/// [`compile`](LogitFSM::compile) errors so handlers can reject them loudly
-/// instead of silently generating unconstrained output.
+/// Reserved-but-unimplemented mode (`bnf:`) is reported via
+/// [`unsupported_mode`](LogitFSM::unsupported_mode) / [`compile`](LogitFSM::compile)
+/// errors so handlers can reject it loudly instead of silently generating
+/// unconstrained output.
 pub struct LogitFSM {
     grammar: String,
     banned: Vec<u32>,
@@ -187,6 +193,21 @@ impl LogitFSM {
         } else if let Some(pattern) = trimmed.strip_prefix("regex:") {
             let table = table.ok_or("regex grammar needs a tokenizer byte table")?;
             regex = Some(RegexEngine::compile(pattern, table)?);
+        } else if let Some(schema_json) = trimmed.strip_prefix("json_schema:") {
+            // Concrete schema → anchored regex (OpenAI structured-outputs strict
+            // mode). The schema compiler owns the subset/limits; its errors are
+            // user-facing 400 strings.
+            let table = table.ok_or("json_schema grammar needs a tokenizer byte table")?;
+            let schema: serde_json::Value = serde_json::from_str(schema_json.trim())
+                .map_err(|e| format!("json_schema: invalid JSON schema: {e}"))?;
+            let pattern = crate::engine::json_schema::schema_to_regex(&schema)?;
+            regex = Some(RegexEngine::compile(&pattern, table)?);
+        } else if trimmed.strip_prefix("json:").is_some() {
+            // json_object mode: any bounded, well-formed JSON value (no fixed
+            // shape). Any payload after `json:` is ignored — there's no schema.
+            let table = table.ok_or("json grammar needs a tokenizer byte table")?;
+            let pattern = crate::engine::json_schema::any_json_regex_default();
+            regex = Some(RegexEngine::compile(&pattern, table)?);
         } else if !trimmed.is_empty() {
             let mode = Self::mode_name(trimmed).unwrap_or("unknown");
             return Err(format!(
@@ -286,7 +307,7 @@ impl LogitFSM {
     /// via [`compile`](Self::compile) with a byte table.)
     pub fn unsupported_mode(&self) -> Option<&str> {
         match Self::mode_name(&self.grammar) {
-            Some("regex") => None,
+            Some("regex") | Some("json_schema") | Some("json") => None,
             other => other,
         }
     }
@@ -372,14 +393,38 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_modes_error_in_compile_and_report_in_new() {
-        for g in ["json:{}", "json_schema:{\"type\":\"object\"}", "bnf:root ::= x"] {
-            assert!(LogitFSM::compile(g, None).is_err(), "{g} should be a compile error");
-            let f = LogitFSM::new(g); // lenient path degrades to inactive
-            assert!(f.unsupported_mode().is_some(), "{g} should report unsupported");
-            assert!(!f.is_active());
-        }
-        // supported forms are NOT flagged
+    fn bnf_mode_still_unimplemented() {
+        // bnf is the one remaining reserved-but-stubbed mode.
+        let g = "bnf:root ::= x";
+        assert!(LogitFSM::compile(g, None).is_err(), "{g} should be a compile error");
+        let f = LogitFSM::new(g); // lenient path degrades to inactive
+        assert_eq!(f.unsupported_mode(), Some("bnf"));
+        assert!(!f.is_active());
+    }
+
+    #[test]
+    fn json_and_json_schema_are_implemented() {
+        // Need a byte table (they compile to regex); without one they error on
+        // the missing table, not because the mode is unimplemented.
+        assert!(LogitFSM::compile("json:", None).is_err());
+        assert!(LogitFSM::compile("json_schema:{\"type\":\"boolean\"}", None).is_err());
+
+        let j = LogitFSM::compile("json:", Some(tiny_table())).unwrap();
+        assert!(j.is_active());
+        assert_eq!(j.unsupported_mode(), None);
+
+        let s = LogitFSM::compile("json_schema:{\"type\":\"boolean\"}", Some(tiny_table())).unwrap();
+        assert!(s.is_active());
+        assert_eq!(s.unsupported_mode(), None);
+
+        // A malformed schema payload is a compile error even with a table.
+        assert!(LogitFSM::compile("json_schema:{not json}", Some(tiny_table())).is_err());
+        // An unsupported schema construct is a compile error.
+        assert!(LogitFSM::compile("json_schema:{\"$ref\":\"#/x\"}", Some(tiny_table())).is_err());
+    }
+
+    #[test]
+    fn supported_forms_not_flagged() {
         assert_eq!(LogitFSM::new("ban:1,2").unsupported_mode(), None);
         assert_eq!(LogitFSM::new("").unsupported_mode(), None);
         let f = LogitFSM::compile("regex:a", Some(tiny_table())).unwrap();

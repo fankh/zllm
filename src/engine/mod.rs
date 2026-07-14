@@ -3,6 +3,7 @@ pub mod decode_ctrl;
 pub mod difficulty;
 pub mod hallucination;
 pub mod hooks;
+pub mod json_schema;
 pub mod logit_fsm;
 pub mod logprobs;
 pub mod memory_store;
