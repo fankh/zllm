@@ -21,7 +21,7 @@ regex-automata = "0.4"
 # is REST + chat UI only.
 axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "catch-panic"] }
 futures = "0.3"
 
 # Serialization

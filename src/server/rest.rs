@@ -220,7 +220,7 @@ pub fn acquire_slot<'a>(pool: &'a [Mutex<BackendSlot>]) -> std::sync::MutexGuard
         }
     }
     let i = POOL_FALLBACK_RR.fetch_add(1, Ordering::Relaxed) % pool.len();
-    pool[i].lock().expect("backend slot poisoned")
+    pool[i].lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub fn router(state: AppState) -> Router {
@@ -263,7 +263,29 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/debug/matmul_bench", get(matmul_bench))
         .route("/v1/inspect/{request_id}", get(get_trace))
         .layer(axum::middleware::from_fn(require_api_key))
+        // Outermost: any unexpected panic in a handler (or an inner layer)
+        // is caught and turned into a clean 500 so one bad request can't
+        // drop the connection abruptly or wedge the worker. Explicit
+        // panics are already gone from production paths; this backstops
+        // the rest (indexing, arithmetic, third-party code).
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(handle_panic))
         .with_state(state)
+}
+
+/// Turn a caught handler panic into a 500 JSON error and log it, instead
+/// of the default abrupt connection drop.
+fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> axum::response::Response {
+    let msg = err
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| err.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string());
+    tracing::error!("caught handler panic: {msg}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": "internal server error"})),
+    )
+        .into_response()
 }
 
 // --- UI + ops ---
@@ -390,7 +412,7 @@ fn arch_is_supported(arch: &str) -> bool {
 
 async fn list_models(State(s): State<AppState>) -> Json<Value> {
     let now = unix_secs();
-    let current = s.current_model.read().unwrap().clone();
+    let current = s.current_model.read().unwrap_or_else(|e| e.into_inner()).clone();
     let mut entries: Vec<Value> = Vec::new();
 
     // Scan models_dir for additional .gguf files. Each becomes a
@@ -676,7 +698,7 @@ async fn select_model(
     let mut guards: Vec<_> = s
         .pool
         .iter()
-        .map(|m| m.lock().expect("backend slot poisoned"))
+        .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()))
         .collect();
     for g in guards.iter_mut() {
         let _ = g.backend.unload_model();
@@ -712,11 +734,11 @@ async fn select_model(
             .and_then(|ctx| crate::backend::gpu::GpuModel::load(&path_str, ctx));
         match loaded {
             Ok(m) => {
-                *s.gpu.lock().expect("gpu poisoned") = Some(m);
+                *s.gpu.lock().unwrap_or_else(|e| e.into_inner()) = Some(m);
                 tracing::info!("GPU engine reloaded for swapped model");
             }
             Err(e) => {
-                *s.gpu.lock().expect("gpu poisoned") = None;
+                *s.gpu.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 tracing::warn!("GPU reload failed ({e}); GPU fast-lane disabled for this model");
             }
         }
@@ -738,17 +760,17 @@ async fn select_model(
         let loaded = crate::backend::vulkan::VkContext::new()
             .and_then(|ctx| crate::backend::vulkan::VkModel::load(&path_str, ctx));
         match loaded {
-            Ok(m) => { *s.vk.lock().expect("vk poisoned") = Some(m); tracing::info!("Vulkan engine reloaded for swapped model"); }
-            Err(e) => { *s.vk.lock().expect("vk poisoned") = None; tracing::warn!("Vulkan reload failed ({e}); fast-lane disabled for this model"); }
+            Ok(m) => { *s.vk.lock().unwrap_or_else(|e| e.into_inner()) = Some(m); tracing::info!("Vulkan engine reloaded for swapped model"); }
+            Err(e) => { *s.vk.lock().unwrap_or_else(|e| e.into_inner()) = None; tracing::warn!("Vulkan reload failed ({e}); fast-lane disabled for this model"); }
         }
     }
 
-    *s.tokenizer.write().expect("tokenizer poisoned") = new_tok;
-    *s.current_model.write().expect("current_model poisoned") = req.id.clone();
+    *s.tokenizer.write().unwrap_or_else(|e| e.into_inner()) = new_tok;
+    *s.current_model.write().unwrap_or_else(|e| e.into_inner()) = req.id.clone();
     // Grammar byte table is tokenizer-specific — rebuild lazily on next use.
-    *s.token_table.write().expect("token_table poisoned") = None;
+    *s.token_table.write().unwrap_or_else(|e| e.into_inner()) = None;
     // Chat template + declared stop ids follow the new GGUF.
-    *s.chat_meta.write().expect("chat_meta poisoned") =
+    *s.chat_meta.write().unwrap_or_else(|e| e.into_inner()) =
         crate::server::chat_template::read_gguf_chat_meta(&gguf_path);
 
     // Selectively clear Context captures — they have an n_embd from
@@ -921,8 +943,8 @@ fn request_timeout() -> std::time::Duration {
 /// (ground truth) unioned with the vocab probe (covers GGUFs that
 /// predate the declared fields).
 fn stop_set(s: &AppState) -> Vec<u32> {
-    let mut ids = s.chat_meta.read().unwrap().stop_ids.clone();
-    for id in s.tokenizer.read().unwrap().stop_token_ids() {
+    let mut ids = s.chat_meta.read().unwrap_or_else(|e| e.into_inner()).stop_ids.clone();
+    for id in s.tokenizer.read().unwrap_or_else(|e| e.into_inner()).stop_token_ids() {
         if !ids.contains(&id) {
             ids.push(id);
         }
@@ -937,7 +959,7 @@ fn stop_window_text(s: &AppState, generated: &[u32], window: usize) -> String {
     let start = generated.len().saturating_sub(window);
     s.tokenizer
         .read()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .decode(&generated[start..])
         .unwrap_or_default()
 }
@@ -959,7 +981,7 @@ async fn chat_completions(
     // Build the rendered prompt with goal-prefix injected as the system
     // message.
     let prompt = render_chat_prompt(&s, &req.messages);
-    let tokens = match s.tokenizer.read().unwrap().encode(&prompt) {
+    let tokens = match s.tokenizer.read().unwrap_or_else(|e| e.into_inner()).encode(&prompt) {
         Ok(t) => t,
         Err(e) => {
             return (
@@ -987,7 +1009,7 @@ async fn chat_completions(
         Err(resp) => return resp,
     };
     let id = format!("chatcmpl-{}", Uuid::new_v4());
-    let model_id = s.current_model.read().unwrap().clone();
+    let model_id = s.current_model.read().unwrap_or_else(|e| e.into_inner()).clone();
     // Clamp generation to the remaining window so the KV cache can never
     // be asked to grow past what it preallocated.
     let max_tokens = if ctx > 0 {
@@ -1077,7 +1099,7 @@ async fn chat_completions(
         };
         let seed = req.seed.unwrap_or(0);
         let (eos, stop_eot) = {
-            let tok = s.tokenizer.read().unwrap();
+            let tok = s.tokenizer.read().unwrap_or_else(|e| e.into_inner());
             let eos = tok.eos_token_id().unwrap_or(128001);
             // End-of-turn stop derived from the vocab (Llama-3 <|eot_id|>,
             // ChatML <|im_end|>) instead of a hardcoded Llama-3 id; falls
@@ -1197,10 +1219,10 @@ struct CompletionRequest {
 /// (bad pattern / unimplemented mode / no EOS).
 fn fsm_from_grammar(s: &AppState, grammar: &str) -> Result<LogitFSM, String> {
     let table = if grammar.trim_start().starts_with("regex:") {
-        if let Some(t) = s.token_table.read().unwrap().as_ref() {
+        if let Some(t) = s.token_table.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
             Some(t.clone())
         } else {
-            let tok = s.tokenizer.read().unwrap();
+            let tok = s.tokenizer.read().unwrap_or_else(|e| e.into_inner());
             let eos = tok.eos_token_id().ok_or("tokenizer has no EOS token; regex grammar unavailable")?;
             let t0 = std::time::Instant::now();
             let table = Arc::new(crate::engine::logit_fsm::TokenByteTable {
@@ -1209,7 +1231,7 @@ fn fsm_from_grammar(s: &AppState, grammar: &str) -> Result<LogitFSM, String> {
             });
             tracing::info!("built grammar byte table ({} tokens) in {:.0} ms",
                 table.bytes.len(), t0.elapsed().as_secs_f64() * 1e3);
-            *s.token_table.write().unwrap() = Some(table.clone());
+            *s.token_table.write().unwrap_or_else(|e| e.into_inner()) = Some(table.clone());
             Some(table)
         }
     } else {
@@ -1238,7 +1260,7 @@ async fn text_completions(
 ) -> impl IntoResponse {
     let prefix = s.goals.build_prompt_prefix();
     let prompt = format!("{prefix}{}", req.prompt);
-    let tokens = match s.tokenizer.read().unwrap().encode(&prompt) {
+    let tokens = match s.tokenizer.read().unwrap_or_else(|e| e.into_inner()).encode(&prompt) {
         Ok(t) => t,
         Err(e) => {
             return (
@@ -1306,7 +1328,7 @@ async fn text_completions(
         "id": id,
         "object": "text_completion",
         "created": now,
-        "model": s.current_model.read().unwrap().clone(),
+        "model": s.current_model.read().unwrap_or_else(|e| e.into_inner()).clone(),
         "choices": [{
             "index": 0,
             "text": text,
@@ -1362,7 +1384,7 @@ async fn embeddings(
     let mut total_tokens = 0usize;
     let slot = acquire_slot(&s.pool);
     for (i, text) in inputs.iter().enumerate() {
-        let ids = match s.tokenizer.read().unwrap().encode(text) {
+        let ids = match s.tokenizer.read().unwrap_or_else(|e| e.into_inner()).encode(text) {
             Ok(v) if !v.is_empty() => v,
             Ok(_) => {
                 return (StatusCode::BAD_REQUEST,
@@ -1404,7 +1426,7 @@ async fn embeddings(
     Json(json!({
         "object": "list",
         "data": data,
-        "model": s.current_model.read().unwrap().clone(),
+        "model": s.current_model.read().unwrap_or_else(|e| e.into_inner()).clone(),
         "usage": {"prompt_tokens": total_tokens, "total_tokens": total_tokens}
     }))
     .into_response()
@@ -1417,7 +1439,7 @@ struct TokenizeRequest {
 
 /// llama.cpp-compatible `/tokenize`.
 async fn tokenize(State(s): State<AppState>, Json(req): Json<TokenizeRequest>) -> impl IntoResponse {
-    match s.tokenizer.read().unwrap().encode(&req.content) {
+    match s.tokenizer.read().unwrap_or_else(|e| e.into_inner()).encode(&req.content) {
         Ok(tokens) => Json(json!({"tokens": tokens})).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": format!("tokenize: {e}")}))).into_response(),
     }
@@ -1430,7 +1452,7 @@ struct DetokenizeRequest {
 
 /// llama.cpp-compatible `/detokenize`.
 async fn detokenize(State(s): State<AppState>, Json(req): Json<DetokenizeRequest>) -> impl IntoResponse {
-    match s.tokenizer.read().unwrap().decode(&req.tokens) {
+    match s.tokenizer.read().unwrap_or_else(|e| e.into_inner()).decode(&req.tokens) {
         Ok(content) => Json(json!({"content": content})).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": format!("detokenize: {e}")}))).into_response(),
     }
@@ -1439,7 +1461,7 @@ async fn detokenize(State(s): State<AppState>, Json(req): Json<DetokenizeRequest
 /// OpenAI CHAT logprobs shape: `{"content": [{token, logprob, bytes,
 /// top_logprobs: [{token, logprob, bytes}]}]}`.
 fn chat_logprobs_json(s: &AppState, c: &crate::engine::logprobs::LogprobsCollector) -> serde_json::Value {
-    let tok = s.tokenizer.read().unwrap();
+    let tok = s.tokenizer.read().unwrap_or_else(|e| e.into_inner());
     let dec = |id: u32| tok.decode(&[id]).unwrap_or_default();
     let content: Vec<serde_json::Value> = c.entries.iter().map(|e| {
         let t = dec(e.token_id);
@@ -1459,7 +1481,7 @@ fn chat_logprobs_json(s: &AppState, c: &crate::engine::logprobs::LogprobsCollect
 /// Legacy COMPLETIONS logprobs shape: `{tokens, token_logprobs,
 /// top_logprobs: [{token: logprob}]}`.
 fn legacy_logprobs_json(s: &AppState, c: &crate::engine::logprobs::LogprobsCollector) -> serde_json::Value {
-    let tok = s.tokenizer.read().unwrap();
+    let tok = s.tokenizer.read().unwrap_or_else(|e| e.into_inner());
     let dec = |id: u32| tok.decode(&[id]).unwrap_or_default();
     let tokens: Vec<String> = c.entries.iter().map(|e| dec(e.token_id)).collect();
     let token_logprobs: Vec<f32> = c.entries.iter().map(|e| e.logprob).collect();
@@ -1512,12 +1534,12 @@ async fn cb_completions(
             None => return (StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": "continuous-batching server not enabled (start with ZLLM_CB=1)"}))).into_response(),
         };
-        let tokens = match s.tokenizer.read().unwrap().encode(&req.prompt) {
+        let tokens = match s.tokenizer.read().unwrap_or_else(|e| e.into_inner()).encode(&req.prompt) {
             Ok(t) => t,
             Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("tokenize: {e}")}))).into_response(),
         };
         let (eos, stop_eot) = {
-            let tok = s.tokenizer.read().unwrap();
+            let tok = s.tokenizer.read().unwrap_or_else(|e| e.into_inner());
             let eos = tok.eos_token_id().unwrap_or(128001);
             // Chat-turn stop token from the vocab (<|eot_id|> / <|im_end|>),
             // not the hardcoded Llama-3 128009; falls back to EOS.
@@ -1539,7 +1561,7 @@ async fn cb_completions(
             Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "server unavailable"}))).into_response(),
         };
         let tok = s.tokenizer.clone();
-        let model_id = s.current_model.read().unwrap().clone();
+        let model_id = s.current_model.read().unwrap_or_else(|e| e.into_inner()).clone();
 
         if req.stream {
             use futures::channel::mpsc;
@@ -1550,7 +1572,7 @@ async fn cb_completions(
                 while let Some(item) = tok_rx.recv().await {
                     let t = match item { Some(t) => t, None => break }; // None = done sentinel
                     if t == eos || t == stop_eot { break; }
-                    let text = tok.read().unwrap().decode(&[t]).unwrap_or_default();
+                    let text = tok.read().unwrap_or_else(|e| e.into_inner()).decode(&[t]).unwrap_or_default();
                     let chunk = json!({"id": id, "object": "text_completion.chunk", "created": now,
                         "model": model_id, "choices": [{"text": text, "index": 0, "finish_reason": null}]});
                     if tx.unbounded_send(Ok(Event::default().data(chunk.to_string()))).is_err() { break; }
@@ -1565,7 +1587,7 @@ async fn cb_completions(
                 if t == eos || t == stop_eot { break; }
                 out_ids.push(t);
             }
-            let text = tok.read().unwrap().decode(&out_ids).unwrap_or_default();
+            let text = tok.read().unwrap_or_else(|e| e.into_inner()).decode(&out_ids).unwrap_or_default();
             Json(json!({
                 "id": format!("cmpl-{}", Uuid::new_v4()),
                 "object": "text_completion", "created": unix_secs(), "model": model_id,
@@ -1613,7 +1635,7 @@ fn cb_chat_stream(
         while let Some(item) = rx.recv().await {
             let t = match item { Some(t) => t, None => break };
             if t == eos || t == stop { break; }
-            let text = s.tokenizer.read().unwrap().decode(&[t]).unwrap_or_default();
+            let text = s.tokenizer.read().unwrap_or_else(|e| e.into_inner()).decode(&[t]).unwrap_or_default();
             let chunk = json!({"id": id, "object": "chat.completion.chunk", "created": now, "model": model_id,
                 "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]});
             if tx.unbounded_send(Ok(Event::default().data(chunk.to_string()))).is_err() { break; }
@@ -1639,7 +1661,7 @@ async fn cb_chat_blocking(
         if t == eos || t == stop { break; }
         ids.push(t);
     }
-    let text = s.tokenizer.read().unwrap().decode(&ids).unwrap_or_default();
+    let text = s.tokenizer.read().unwrap_or_else(|e| e.into_inner()).decode(&ids).unwrap_or_default();
     let completion = ids.len();
     Json(json!({
         "id": id, "object": "chat.completion", "created": unix_secs(), "model": model_id,
@@ -1771,9 +1793,9 @@ fn render_chat_prompt(s: &AppState, messages: &[ChatMessage]) -> String {
     }
 
     // GGUF-embedded template first.
-    let meta = s.chat_meta.read().unwrap().clone();
+    let meta = s.chat_meta.read().unwrap_or_else(|e| e.into_inner()).clone();
     if let Some(tpl) = &meta.template {
-        let tok = s.tokenizer.read().unwrap();
+        let tok = s.tokenizer.read().unwrap_or_else(|e| e.into_inner());
         let bos = meta.bos_id.and_then(|id| tok.id_to_token(id)).unwrap_or_default();
         let eos = meta
             .stop_ids
@@ -1794,7 +1816,7 @@ fn render_chat_prompt(s: &AppState, messages: &[ChatMessage]) -> String {
         }
     }
 
-    let family = ChatFamily::detect(&s.tokenizer.read().unwrap());
+    let family = ChatFamily::detect(&s.tokenizer.read().unwrap_or_else(|e| e.into_inner()));
     let mut out = String::new();
     match family {
         ChatFamily::Llama3 => {
@@ -1986,7 +2008,7 @@ fn generate_spec_decode(
     draft_prompt_cache.extend_from_slice(&all_tokens);
     drop(slot);
 
-    let mut text = s.tokenizer.read().unwrap().decode(&generated_ids).unwrap_or_default();
+    let mut text = s.tokenizer.read().unwrap_or_else(|e| e.into_inner()).decode(&generated_ids).unwrap_or_default();
     ctrl.truncate_at_stop(&mut text);
     (text, prompt_len, generated_ids.len(), finish_reason)
 }
@@ -2055,7 +2077,7 @@ fn generate_gpu(
         generated.len(),
         generated.len() as f64 / dec_s.max(1e-6),
     );
-    let mut text = s.tokenizer.read().unwrap().decode(&generated).unwrap_or_default();
+    let mut text = s.tokenizer.read().unwrap_or_else(|e| e.into_inner()).decode(&generated).unwrap_or_default();
     if ctrl.truncate_at_stop(&mut text) {
         finish_reason = "stop";
     }
@@ -2114,7 +2136,7 @@ fn generate_vk(
         "Vulkan fast-lane: prefill {prompt_len} tok in {prefill_ms:.0} ms, decoded {} tok at {:.0} tok/s",
         generated.len(), generated.len() as f64 / dec_s.max(1e-6),
     );
-    let mut text = s.tokenizer.read().unwrap().decode(&generated).unwrap_or_default();
+    let mut text = s.tokenizer.read().unwrap_or_else(|e| e.into_inner()).decode(&generated).unwrap_or_default();
     if ctrl.truncate_at_stop(&mut text) {
         finish_reason = "stop";
     }
@@ -2342,7 +2364,7 @@ fn generate_blocking(
             c.observe(&logits, next);
         }
         if inspect_on {
-            let tok_text = s.tokenizer.read().unwrap().decode(&[next]).unwrap_or_default();
+            let tok_text = s.tokenizer.read().unwrap_or_else(|e| e.into_inner()).decode(&[next]).unwrap_or_default();
             observer.record_token(generated_ids.len(), next, tok_text, &logits, 5);
         }
         if stops.contains(&next) {
@@ -2455,7 +2477,7 @@ fn generate_blocking(
     prompt_cache.clear();
     prompt_cache.extend_from_slice(&all_tokens);
     drop(slot);
-    let mut text = s.tokenizer.read().unwrap().decode(&generated_ids).unwrap_or_default();
+    let mut text = s.tokenizer.read().unwrap_or_else(|e| e.into_inner()).decode(&generated_ids).unwrap_or_default();
     ctrl.truncate_at_stop(&mut text);
     (text, prompt_len, generated_ids.len(), finish_reason)
 }
@@ -2543,7 +2565,7 @@ fn chat_stream(
                                     break;
                                 }
                             }
-                            let text = s.tokenizer.read().unwrap().decode(&[next]).unwrap_or_default();
+                            let text = s.tokenizer.read().unwrap_or_else(|e| e.into_inner()).decode(&[next]).unwrap_or_default();
                             let chunk = json!({
                                 "id": id, "object": "chat.completion.chunk",
                                 "created": now, "model": model_id,
@@ -2617,7 +2639,7 @@ fn chat_stream(
                                 let w = stop_window_text(&s, &gen_ids, ctrl.window_tokens());
                                 if ctrl.stop_hit_in(&w) { finish_reason = "stop"; break; }
                             }
-                            let text = s.tokenizer.read().unwrap().decode(&[next]).unwrap_or_default();
+                            let text = s.tokenizer.read().unwrap_or_else(|e| e.into_inner()).decode(&[next]).unwrap_or_default();
                             let chunk = json!({
                                 "id": id, "object": "chat.completion.chunk",
                                 "created": now, "model": model_id,
@@ -2725,7 +2747,7 @@ fn chat_stream(
                 }
             }
             if inspect_on {
-                let tok_text = s.tokenizer.read().unwrap().decode(&[next]).unwrap_or_default();
+                let tok_text = s.tokenizer.read().unwrap_or_else(|e| e.into_inner()).decode(&[next]).unwrap_or_default();
                 observer.record_token(generated, next, tok_text, &logits, 5);
             }
             if stops.contains(&next) {
@@ -2744,7 +2766,7 @@ fn chat_stream(
             }
             // Helper: emit one token as an SSE delta chunk.
             let send_tok = |tok: u32, tx: &mut futures::channel::mpsc::UnboundedSender<Result<Event, Infallible>>| -> bool {
-                if let Ok(text) = s.tokenizer.read().unwrap().decode(&[tok]) {
+                if let Ok(text) = s.tokenizer.read().unwrap_or_else(|e| e.into_inner()).decode(&[tok]) {
                     let chunk = json!({
                         "id": id, "object": "chat.completion.chunk",
                         "created": now, "model": model_id,
@@ -3190,7 +3212,7 @@ async fn layer_agreement(
     State(s): State<AppState>,
     Json(req): Json<LayerAgreementReq>,
 ) -> impl IntoResponse {
-    let tokens = match s.tokenizer.read().unwrap().encode(&req.prompt) {
+    let tokens = match s.tokenizer.read().unwrap_or_else(|e| e.into_inner()).encode(&req.prompt) {
         Ok(t) => t,
         Err(e) => return (StatusCode::BAD_REQUEST,
             Json(json!({"error": format!("tokenize: {e}")}))).into_response(),
@@ -3233,7 +3255,7 @@ async fn layer_agreement(
         "n_tokens_measured": generated.len(),
         "n_layers": n_layers,
         "agreement_pct_per_layer": pct,
-        "generated_preview": s.tokenizer.read().unwrap().decode(&generated).unwrap_or_default().chars().take(120).collect::<String>(),
+        "generated_preview": s.tokenizer.read().unwrap_or_else(|e| e.into_inner()).decode(&generated).unwrap_or_default().chars().take(120).collect::<String>(),
     })).into_response()
 }
 
@@ -3254,7 +3276,7 @@ async fn get_settings(State(s): State<AppState>) -> Json<Value> {
 }
 
 async fn list_traces(State(s): State<AppState>) -> Json<Value> {
-    let store = s.memory.read().unwrap();
+    let store = s.memory.read().unwrap_or_else(|e| e.into_inner());
     let traces = store.get_traces(20);
     let summaries: Vec<Value> = traces.iter().map(|t| json!({
         "request_id": t.request_id,
@@ -3268,7 +3290,7 @@ async fn get_trace(
     State(s): State<AppState>,
     Path(request_id): Path<String>,
 ) -> impl IntoResponse {
-    let store = s.memory.read().unwrap();
+    let store = s.memory.read().unwrap_or_else(|e| e.into_inner());
     match store.get_trace_by_request(&request_id) {
         Some(t) => Json(trace_to_json(t)).into_response(),
         None => (StatusCode::NOT_FOUND, Json(json!({"error": "trace not found"}))).into_response(),

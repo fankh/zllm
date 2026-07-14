@@ -62,7 +62,7 @@ impl RunnerObserver {
     }
 
     pub fn last_hidden(&self) -> Vec<f32> {
-        self.last_hidden.read().unwrap().clone()
+        self.last_hidden.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Called once per layer by `forward_logits_with_observer`. Mean-pools
@@ -96,19 +96,19 @@ impl RunnerObserver {
         let action = self.hooks.fire(layer_idx, 0, &mut staging, &self.context);
         if let HookAction::EarlyExit { reason } = action {
             self.early_exit_signal.set(true);
-            *self.early_exit_reason.write().unwrap() = Some(reason);
+            *self.early_exit_reason.write().unwrap_or_else(|e| e.into_inner()) = Some(reason);
         }
 
         if self.enable_inspection {
             self.layer_snapshots
                 .write()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .push(LayerSnapshot::from_hidden_state(layer_idx, 0, &pooled));
         }
         // Write-back channel: a hook may add a d_model delta (computed from the
         // pooled state), broadcast over tokens, to the full residual stream.
         let writeback = self.apply_residual_delta(layer_idx, hidden, &pooled);
-        *self.last_hidden.write().unwrap() = pooled;
+        *self.last_hidden.write().unwrap_or_else(|e| e.into_inner()) = pooled;
         writeback
     }
 
@@ -136,8 +136,8 @@ impl RunnerObserver {
         }
         Some(InspectionTrace {
             request_id: self.context.request_id,
-            layers: self.layer_snapshots.into_inner().unwrap(),
-            tokens: self.token_snapshots.into_inner().unwrap(),
+            layers: self.layer_snapshots.into_inner().unwrap_or_else(|e| e.into_inner()),
+            tokens: self.token_snapshots.into_inner().unwrap_or_else(|e| e.into_inner()),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -156,8 +156,8 @@ impl RunnerObserver {
         if !self.enable_inspection {
             return None;
         }
-        let layers = std::mem::take(&mut *self.layer_snapshots.write().unwrap());
-        let tokens = std::mem::take(&mut *self.token_snapshots.write().unwrap());
+        let layers = std::mem::take(&mut *self.layer_snapshots.write().unwrap_or_else(|e| e.into_inner()));
+        let tokens = std::mem::take(&mut *self.token_snapshots.write().unwrap_or_else(|e| e.into_inner()));
         if layers.is_empty() && tokens.is_empty() {
             return None;
         }
@@ -206,7 +206,7 @@ impl RunnerObserver {
             .collect();
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         indexed.truncate(top_k);
-        self.token_snapshots.write().unwrap().push(TokenSnapshot {
+        self.token_snapshots.write().unwrap_or_else(|e| e.into_inner()).push(TokenSnapshot {
             step,
             token_id,
             token_text,
@@ -245,7 +245,7 @@ mod tests {
             observer.on_layer(layer, &fake_hidden(4, 16, 0.5));
         }
 
-        let store = memory.read().unwrap();
+        let store = memory.read().unwrap_or_else(|e| e.into_inner());
         let captured = store.query_by_category(&MemoryCategory::Context);
         assert_eq!(captured.len(), 1, "capture_layer 3 should have written exactly one entry");
         assert_eq!(captured[0].metadata.layer_captured, 3);

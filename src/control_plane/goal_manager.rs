@@ -207,7 +207,7 @@ impl GoalManager {
     }
 
     fn snapshot_for_save(&self) -> PersistedState {
-        let store = self.store.read().expect("memory store poisoned");
+        let store = self.store.read().unwrap_or_else(|e| e.into_inner());
         let goals: Vec<Goal> = store
             .query_by_category(&MemoryCategory::Goal)
             .into_iter()
@@ -244,7 +244,7 @@ impl GoalManager {
     }
 
     fn restore_goal(&self, g: &Goal) {
-        let mut store = self.store.write().expect("memory store poisoned");
+        let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
         let mut tags = vec![format!("goal:{}", g.goal_id)];
         if g.is_current { tags.push(TAG_CURRENT.to_string()); }
         let metadata = MemoryMetadata {
@@ -263,7 +263,7 @@ impl GoalManager {
     }
 
     fn restore_task(&self, t: &Task) {
-        let mut store = self.store.write().expect("memory store poisoned");
+        let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
         let tags = vec![
             format!("goal:{}", t.goal_id),
             format!("task:{}", t.task_id),
@@ -289,7 +289,7 @@ impl GoalManager {
     }
 
     fn restore_status(&self, s: &StatusEntry) {
-        let mut store = self.store.write().expect("memory store poisoned");
+        let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
         let key = "status:current".to_string();
         let metadata = MemoryMetadata {
             source_request_id: key.clone(),
@@ -315,7 +315,7 @@ impl GoalManager {
 
     pub fn set_goal(&self, text: &str) -> String {
         let goal_id = Uuid::new_v4().to_string();
-        let mut store = self.store.write().expect("memory store poisoned");
+        let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
 
         // Clear the "current" tag on any existing current goal.
         let to_clear: Vec<String> = store
@@ -354,7 +354,7 @@ impl GoalManager {
     }
 
     pub fn list_goals(&self) -> Vec<Goal> {
-        let store = self.store.read().expect("memory store poisoned");
+        let store = self.store.read().unwrap_or_else(|e| e.into_inner());
         store
             .query_by_category(&MemoryCategory::Goal)
             .into_iter()
@@ -367,7 +367,7 @@ impl GoalManager {
     }
 
     pub fn set_current(&self, goal_id: &str) -> bool {
-        let mut store = self.store.write().expect("memory store poisoned");
+        let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
         let goal_key = format!("goal:{goal_id}");
 
         // Verify target exists.
@@ -410,7 +410,7 @@ impl GoalManager {
     }
 
     pub fn current_goal(&self) -> Option<Goal> {
-        let store = self.store.read().expect("memory store poisoned");
+        let store = self.store.read().unwrap_or_else(|e| e.into_inner());
         store
             .query_by_category(&MemoryCategory::Goal)
             .into_iter()
@@ -426,7 +426,7 @@ impl GoalManager {
 
     pub fn add_task(&self, goal_id: &str, text: &str) -> String {
         let task_id = Uuid::new_v4().to_string();
-        let mut store = self.store.write().expect("memory store poisoned");
+        let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
         let metadata = MemoryMetadata {
             source_request_id: format!("task:{task_id}"),
             layer_captured: 0,
@@ -451,7 +451,7 @@ impl GoalManager {
     }
 
     pub fn update_task(&self, task_id: &str, status: TaskStatus) -> bool {
-        let mut store = self.store.write().expect("memory store poisoned");
+        let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
         let key = format!("task:{task_id}");
         let ok = if let Some(e) = store.get(&key) {
             let mut new_meta = e.metadata.clone();
@@ -477,7 +477,7 @@ impl GoalManager {
     }
 
     pub fn list_tasks(&self, goal_id: &str) -> Vec<Task> {
-        let store = self.store.read().expect("memory store poisoned");
+        let store = self.store.read().unwrap_or_else(|e| e.into_inner());
         let tag = format!("goal:{goal_id}");
         store
             .query_by_tag(&tag)
@@ -500,7 +500,7 @@ impl GoalManager {
     // --- Status ---
 
     pub fn set_status(&self, text: &str) -> bool {
-        let mut store = self.store.write().expect("memory store poisoned");
+        let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
 
         // Find current goal id under the already-acquired write lock.
         let goal_id = store
@@ -533,7 +533,7 @@ impl GoalManager {
     }
 
     pub fn latest_status(&self) -> Option<StatusEntry> {
-        let store = self.store.read().expect("memory store poisoned");
+        let store = self.store.read().unwrap_or_else(|e| e.into_inner());
         let entries = store.query_by_category(&MemoryCategory::Status);
         entries
             .into_iter()
@@ -716,7 +716,7 @@ mod tests {
         let _goal_id = m.set_goal("the only goal that matters");
         // Flood Context — goal must survive because it's pinned.
         {
-            let mut store = m.store.write().unwrap();
+            let mut store = m.store.write().unwrap_or_else(|e| e.into_inner());
             for i in 0..50 {
                 let _ = store.store_with_options(
                     format!("noise{i}"),
@@ -744,7 +744,7 @@ mod tests {
         let t = m.add_task(&goal_id, "the task");
         // While active + pinned: check the entry exists and is pinned.
         {
-            let store = m.store.read().unwrap();
+            let store = m.store.read().unwrap_or_else(|e| e.into_inner());
             let key = format!("task:{t}");
             let entry = store.query_by_tag(&format!("task:{t}"));
             assert_eq!(entry.len(), 1);
@@ -754,7 +754,7 @@ mod tests {
         // Mark done → unpinned.
         assert!(m.update_task(&t, TaskStatus::Done));
         {
-            let store = m.store.read().unwrap();
+            let store = m.store.read().unwrap_or_else(|e| e.into_inner());
             let entry = store.query_by_tag(&format!("task:{t}"));
             assert_eq!(entry.len(), 1);
             assert!(!entry[0].pinned, "done task must be unpinned");
