@@ -93,6 +93,55 @@ cargo build --release --features metal
 CUDA builds without a local GPU should set `CUDA_COMPUTE_CAP` explicitly (e.g.
 `CUDA_COMPUTE_CAP=89`) so `candle-kernels` doesn't try to autodetect via `nvidia-smi`.
 
+### Fully-static / isolated build
+
+zllm is a **single self-contained process** — no Python, no llama.cpp, no
+external runtime or SDK. The tokenizer and chat template are read from inside
+the GGUF (for byte-level BPE models), and all shaders are baked into the
+binary (SPIR-V via `include_bytes!`, WGSL compiled in-process by `naga`). So
+the minimal deployment is literally **one executable + one `.gguf` file**.
+
+For a locked-down or air-gapped box, statically link the C runtime so the
+binary depends on nothing but core OS libraries. Use the **CPU-only** (default)
+build — the GPU fast lanes require the GPU driver's DLLs and so can't be fully
+static; CPU-only is the right target for an isolated deployment anyway.
+
+**Windows (static MSVC CRT):**
+
+```powershell
+$env:RUSTFLAGS = "-C target-feature=+crt-static -C target-cpu=native"
+# separate target dir so it doesn't clobber a normal build:
+$env:CARGO_TARGET_DIR = "target-static"
+cargo build --release
+# -> target-static\release\zllm.exe  (~13 MB)
+```
+
+The result links **only guaranteed-present core Windows DLLs** (`kernel32`,
+`ntdll`, `ws2_32`, `bcrypt`, `advapi32`, …) — no `VCRUNTIME140`, no
+`api-ms-win-crt-*`, no GPU DLLs. It runs on a bare Windows install with **no
+MSVC redistributable** required. Verify with
+`dumpbin /dependents target-static\release\zllm.exe`.
+
+**Linux (fully-static ELF via musl — zero dynamic deps):**
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+RUSTFLAGS="-C target-cpu=native" \
+  cargo build --release --target x86_64-unknown-linux-musl
+# -> target/x86_64-unknown-linux-musl/release/zllm
+# `ldd` reports "not a dynamic executable" — copy it anywhere and run.
+```
+
+Drop that one binary plus a single `.gguf` into an empty directory and run —
+no sidecar files needed for BPE models:
+
+```bash
+./zllm serve --config config.toml     # or: ./zllm generate --model model.gguf --prompt "..."
+```
+
+(For portability across machines, drop `target-cpu=native` — see the CI note
+above — so the binary doesn't require the build host's exact SIMD level.)
+
 ## Run
 
 ```bash
