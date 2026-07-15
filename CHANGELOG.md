@@ -1,5 +1,36 @@
 # Changelog
 
+## v1.0.0-rc.3 — 2026-07-15
+
+Structured outputs + function calling land on the byte-DFA grammar
+engine, plus a mock/stale-surface audit with hardening fixes.
+
+- **Structured outputs**: OpenAI `response_format` — `json_object` (any
+  JSON object) and `json_schema` (strict: declared properties emitted in
+  order), compiled onto the anchored byte-DFA so output is guaranteed to
+  parse and conform. Built on the new JSON-schema→regex compiler
+  (`engine/json_schema.rs`), with a 24 MB DFA size bound so pathological
+  schemas 400 fast instead of hanging a worker.
+- **Function calling**: OpenAI `tools` with forced `tool_choice` — a
+  named function, or `"required"` with one or several tools (envelope
+  alternation lets the model pick; arguments are constrained to the
+  chosen tool's `parameters` schema). `"auto"` still 400s pending a
+  free-text-or-call grammar.
+- **Fix**: CPU SDPA dispatched any 16-aligned `head_dim` to the AVX-512
+  kernel, which asserts above 128 — a 256-wide model would panic
+  mid-decode. Oversized head dims now take the scalar path.
+- **Fix**: `engine.encoder_layers` was accepted and silently ignored
+  (inject/capture layer indices hardcoded 8); now wired. Dead
+  `model.quantization` config field removed (the GGUF determines
+  quantization; old configs still parse).
+- **Build/test**: `regex-automata`/`regex-syntax` compiled at opt-level 3
+  in dev builds — the two any-JSON DFA tests stalled the lib suite for
+  8+ minutes at opt-level 0; the full lib suite now finishes in ~12 s
+  locally and on both CI runners.
+- Conformance test updated for the new contract (response_format asserts
+  conforming output instead of 400); stale grammar-mode claims fixed in
+  SUMMARY/TESTING; arch-support and grammar-mode error messages corrected.
+
 ## v1.0.0-rc.2 — 2026-07-14
 
 Release-workflow hardening (no engine changes) plus the rc soak continues.

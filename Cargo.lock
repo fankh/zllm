@@ -4617,7 +4617,7 @@ dependencies = [
 
 [[package]]
 name = "zllm"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "anyhow",
  "ash",
