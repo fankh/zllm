@@ -2,6 +2,44 @@
 
 White-box LLM inference engine with zero-copy latent intercept.
 
+## What "white-box inference" means
+
+A conventional inference server is a black box: tokens in, text out. Everything
+the model computes on the way — per-layer hidden states, the residual stream,
+the full output distribution — is materialized for a few microseconds and
+thrown away. Any question you'd want to ask of that state ("how uncertain was
+the model on this token?", "what did layer 8 believe?") and any intervention
+you'd want to make on it (steering, constrained decoding, early exit) is
+impossible from outside the API.
+
+zllm is built the other way around: the forward pass itself is the API
+surface. Because the engine is written from scratch, every stage of the
+computation is an interception point — **zero-copy**, meaning hooks observe
+and edit the live tensors the model is actually computing with, not copies
+exported after the fact. Concretely, the intercept points and what runs on
+them today:
+
+| Forward-pass stage | Access | What's built on it |
+|---|---|---|
+| Per-layer hidden states | read (`RunnerObserver`) | `/v1/inspect` traces, memory **capture** |
+| Residual stream | **write-back** (hook `residual_delta`) | activation steering, memory **inject** (`memory_inject_alpha`, default off) |
+| Layer schedule | control | confidence-driven **early exit** (skip late layers when the answer has converged) |
+| Output distribution | read | **hallucination/uncertainty detection** (`detect_hallucination`), OpenAI `logprobs` |
+| Logits (pre-sampling) | **mask** (byte-DFA) | grammar-constrained decoding, `response_format`, function calling — output *guaranteed* to conform |
+
+Honest framing: the read paths are uncertainty *proxies*, not oracles — high
+entropy correlates with confabulation but doesn't prove it. The write-back
+paths are live and bit-exact-tested, but memory inject ships **off by
+default** (`memory_inject_alpha = 0.0`) because injecting uncurated captures
+measurably derails small models; opt in deliberately.
+
+The same idea degrades gracefully for engines you don't control:
+[zllm-probe](https://github.com/fankh/zllm-probe) applies the
+output-distribution tier to *any* OpenAI-compatible server via the `logprobs`
+field — no engine access needed, with the approximation that implies. zllm is
+the reference implementation for the deep tier, where the full forward pass
+is open.
+
 ## Features
 
 - From-scratch inference engine in Rust (zero Python) — CPU (AVX-512), plus
