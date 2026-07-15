@@ -74,7 +74,7 @@ curl.exe -s -X POST http://127.0.0.1:8090/v1/completions -H "Content-Type: appli
 curl.exe -s -X POST http://127.0.0.1:8090/v1/completions -H "Content-Type: application/json" -d '{\"prompt\":\"The capital of France is\",\"max_tokens\":8,\"temperature\":0,\"grammar\":\"ban:12366\"}'
 # loud failures
 curl.exe -s -X POST http://127.0.0.1:8090/v1/completions -H "Content-Type: application/json" -d '{\"prompt\":\"hi\",\"max_tokens\":4,\"grammar\":\"regex:a(\"}'   # 400 bad pattern
-curl.exe -s -X POST http://127.0.0.1:8090/v1/completions -H "Content-Type: application/json" -d '{\"prompt\":\"hi\",\"max_tokens\":4,\"grammar\":\"json:{}\"}'    # 400 not implemented
+curl.exe -s -X POST http://127.0.0.1:8090/v1/completions -H "Content-Type: application/json" -d '{\"prompt\":\"hi\",\"max_tokens\":4,\"grammar\":\"bnf:root\"}'    # 400 not implemented
 ```
 First grammar request logs `built grammar byte table (128256 tokens) in ~100 ms`
 (one-time per model). Grammar requests always run on the CPU path.

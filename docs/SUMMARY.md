@@ -103,7 +103,9 @@ as of the 2026-06 feature audit.)*
   prompt-lookahead drafting, real).
 - **Grammar-constrained decoding** (`logit_fsm.rs`) — **`regex:` is real** (anchored
   byte-DFA token masking; EOS only at a complete match; live-verified exact-shape
-  outputs) plus `ban:<ids>`. JSON-schema/BNF not implemented (rejected with 400).
+  outputs) plus `ban:<ids>`, `json_schema:<schema>` (compiled to the same DFA;
+  backs OpenAI `response_format` and function calling), and `json:` (any bounded
+  JSON value). BNF not implemented (rejected with 400).
   Gotcha: regex-automata doesn't merge match-unreachable states into dead —
   viability needs a match-reachability fixpoint, and use `MatchKind::All`.
 - **Goal/task/status API** (`control_plane/goal_manager.rs`) — REST `/v1/goal/*`,
