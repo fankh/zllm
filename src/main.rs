@@ -320,11 +320,13 @@ async fn main() -> anyhow::Result<()> {
             //     `engine.memory_inject_alpha > 0` — default 0.0 = OFF, because
             //     the live A/B showed alpha=0.3 derails generation (see
             //     config.rs). Capture is harmless and keeps inspection useful.
-            // The capture/inject layer indices match the InferenceRunner
-            // defaults so test parity holds.
+            // The capture/inject layer indices come from the config's zone
+            // widths; the shipped configs use encoder_layers = 8, matching
+            // the InferenceRunner defaults so test parity holds.
             let mut hook_registry = engine::hooks::registry::HookRegistry::new();
-            let inject_layer = 8usize.saturating_sub(1);
-            let capture_layer = 8 + cfg.engine.reasoning_layers.saturating_sub(1);
+            let inject_layer = cfg.engine.encoder_layers.saturating_sub(1);
+            let capture_layer =
+                cfg.engine.encoder_layers + cfg.engine.reasoning_layers.saturating_sub(1);
             hook_registry.register(Box::new(
                 engine::hooks::memory_inject::MemoryInjectHook {
                     memory: memory_store.clone(),

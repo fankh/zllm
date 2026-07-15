@@ -6,7 +6,6 @@ max_concurrent = 32
 # GGUF model (same files llama.cpp uses). Needs a HF tokenizer.json —
 # by default looked up next to `path`.
 path = "models/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
-quantization = "q4"
 max_seq_len = 8192
 # Optional: defaults to tokenizer.json next to `path`.
 tokenizer_path = ""

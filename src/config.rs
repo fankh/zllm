@@ -18,7 +18,6 @@ pub struct ServerConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct ModelConfig {
     pub path: String,
-    pub quantization: String,
     pub max_seq_len: usize,
     /// Optional path to tokenizer.json. If empty / absent, the server
     /// looks for `tokenizer.json` next to `path`.
@@ -34,6 +33,11 @@ pub struct ModelConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct EngineConfig {
+    /// Width of the encoder zone (layers `0..encoder_layers`) in the
+    /// 3-zone reasoning program. Its last layer is where the
+    /// MemoryInjectHook injects retrieved memories; capture happens at
+    /// `encoder_layers + reasoning_layers - 1`. The canonical split for
+    /// a 32-layer model is 8 / 8+N / 32.
     pub encoder_layers: usize,
     pub reasoning_layers: usize,
     pub max_loops: usize,

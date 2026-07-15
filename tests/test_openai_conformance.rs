@@ -46,7 +46,6 @@ max_concurrent = 8
 
 [model]
 path = "{model}"
-quantization = "q4"
 max_seq_len = 8192
 tokenizer_path = ""
 
