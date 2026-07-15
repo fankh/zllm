@@ -822,8 +822,13 @@ struct ChatRequest {
     messages: Vec<ChatMessage>,
     #[serde(default)]
     stream: bool,
-    #[serde(default = "default_max_tokens")]
-    max_tokens: usize,
+    #[serde(default)]
+    max_tokens: Option<usize>,
+    /// OpenAI's replacement for the deprecated `max_tokens` on chat.
+    /// Takes precedence when both are set (matches OpenAI, which rejects
+    /// the deprecated one only for reasoning models).
+    #[serde(default)]
+    max_completion_tokens: Option<usize>,
     #[serde(default)]
     temperature: Option<f32>,
     #[serde(default)]
@@ -861,6 +866,15 @@ struct ChatRequest {
     n: Option<u32>,
     #[serde(default)]
     response_format: Option<serde_json::Value>,
+    /// OpenAI `stream_options`: only `include_usage: false` is accepted —
+    /// usage in the final SSE chunk isn't wired yet, so asking for it 400s.
+    #[serde(default)]
+    stream_options: Option<serde_json::Value>,
+    /// OpenAI `parallel_tool_calls`: zllm emits exactly one tool call per
+    /// response, so `true` (the OpenAI default when omitted) 400s when
+    /// tools are present rather than silently under-delivering.
+    #[serde(default)]
+    parallel_tool_calls: Option<bool>,
     /// Optional logit-constraint string. v0.5 supports `"ban:<id>,<id>,…"`;
     /// see `engine::logit_fsm::LogitFSM` for the full list of modes.
     /// Non-OpenAI-standard but cheap to add and useful for the
@@ -1012,10 +1026,14 @@ async fn chat_completions(
     let model_id = s.current_model.read().unwrap_or_else(|e| e.into_inner()).clone();
     // Clamp generation to the remaining window so the KV cache can never
     // be asked to grow past what it preallocated.
+    let req_max_tokens = req
+        .max_completion_tokens
+        .or(req.max_tokens)
+        .unwrap_or_else(default_max_tokens);
     let max_tokens = if ctx > 0 {
-        req.max_tokens.min(ctx.saturating_sub(tokens.len()).max(1))
+        req_max_tokens.min(ctx.saturating_sub(tokens.len()).max(1))
     } else {
-        req.max_tokens
+        req_max_tokens
     };
     if req.n.unwrap_or(1) > 1 {
         return (StatusCode::BAD_REQUEST, Json(json!({
@@ -1099,6 +1117,22 @@ async fn chat_completions(
     if req.logprobs.unwrap_or(false) && req.stream {
         return (StatusCode::BAD_REQUEST, Json(json!({
             "error": "logprobs is not supported with stream=true yet; use stream=false"
+        }))).into_response();
+    }
+    if req
+        .stream_options
+        .as_ref()
+        .and_then(|o| o.get("include_usage"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return (StatusCode::BAD_REQUEST, Json(json!({
+            "error": "stream_options.include_usage is not supported yet; usage is returned on stream=false"
+        }))).into_response();
+    }
+    if req.parallel_tool_calls == Some(true) && req.tools.is_some() {
+        return (StatusCode::BAD_REQUEST, Json(json!({
+            "error": "parallel_tool_calls is not supported — zllm emits exactly one tool call per response; set parallel_tool_calls: false or omit it"
         }))).into_response();
     }
 

@@ -167,6 +167,12 @@ fn openai_conformance() {
     for (name, extra) in [
         ("tools sans tool_choice", serde_json::json!({"tools": [{"type": "function"}]})),
         ("n>1", serde_json::json!({"n": 2})),
+        ("parallel_tool_calls", serde_json::json!({
+            "tools": [{"type": "function"}], "parallel_tool_calls": true
+        })),
+        ("stream_options.include_usage", serde_json::json!({
+            "stream_options": {"include_usage": true}
+        })),
     ] {
         match chat(ask(extra)) {
             Err(400) => println!("400 OK for {name}"),
@@ -232,4 +238,11 @@ fn openai_conformance() {
     // 8. min_p accepted.
     assert!(chat(ask(serde_json::json!({"temperature": 0.8, "min_p": 0.1, "seed": 1}))).is_ok());
     println!("min_p OK");
+
+    // 9. max_completion_tokens (the non-deprecated OpenAI name) caps
+    //    generation, and takes precedence over the base body's max_tokens: 24.
+    let r = chat(ask(serde_json::json!({"max_completion_tokens": 3}))).expect("expected 200");
+    let used = r["usage"]["completion_tokens"].as_u64().unwrap();
+    assert!(used <= 3, "max_completion_tokens must cap generation, used {used}");
+    println!("max_completion_tokens OK: {used} tokens");
 }
