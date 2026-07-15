@@ -163,17 +163,41 @@ fn openai_conformance() {
     assert_ne!(baseline, banned, "banning the first token must change greedy output");
     println!("logit_bias OK: {baseline:?} -> {banned:?}");
 
-    // 5. Unsupported params fail loudly with 400.
+    // 5. Unsupported params fail loudly with 400. (`tools` without a
+    //    forced tool_choice implies "auto", which is still unsupported.)
     for (name, extra) in [
-        ("tools", serde_json::json!({"tools": [{"type": "function"}]})),
+        ("tools sans tool_choice", serde_json::json!({"tools": [{"type": "function"}]})),
         ("n>1", serde_json::json!({"n": 2})),
-        ("response_format", serde_json::json!({"response_format": {"type": "json_object"}})),
     ] {
         match chat(ask(extra)) {
             Err(400) => println!("400 OK for {name}"),
             other => panic!("{name} should 400, got {other:?}"),
         }
     }
+
+    // 5b. response_format is supported: json_object must yield a parseable
+    //     JSON object; json_schema output must conform to the schema.
+    let j = chat_text(ask(serde_json::json!({"response_format": {"type": "json_object"}})));
+    let v: serde_json::Value = serde_json::from_str(&j)
+        .unwrap_or_else(|e| panic!("json_object output must parse as JSON, got {j:?}: {e}"));
+    assert!(v.is_object(), "json_object output must be a JSON object: {j:?}");
+    println!("response_format json_object OK: {j:?}");
+
+    let s = chat_text(ask(serde_json::json!({"response_format": {
+        "type": "json_schema",
+        "json_schema": {"name": "count", "schema": {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"]
+        }}
+    }})));
+    let v: serde_json::Value = serde_json::from_str(&s)
+        .unwrap_or_else(|e| panic!("json_schema output must parse as JSON, got {s:?}: {e}"));
+    assert!(
+        v.get("answer").is_some_and(|a| a.is_string()),
+        "json_schema output must contain required string \"answer\": {s:?}"
+    );
+    println!("response_format json_schema OK: {s:?}");
 
     // 6. Embeddings: shape, count, unit norm.
     let emb: serde_json::Value = ureq::post(&format!("{}/v1/embeddings", base()))
