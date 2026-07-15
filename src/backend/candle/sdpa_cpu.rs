@@ -93,7 +93,7 @@ pub fn sdpa_gqa_decode(
 
     #[cfg(target_arch = "x86_64")]
     {
-        if head_dim % 16 == 0 && std::is_x86_feature_detected!("avx512f") {
+        if head_dim % 16 == 0 && head_dim <= 128 && std::is_x86_feature_detected!("avx512f") {
             unsafe {
                 sdpa_inner_avx512(
                     qd, q_off, q_head_s,
@@ -189,8 +189,9 @@ unsafe fn sdpa_inner_avx512(
     debug_assert_eq!(head_dim % LANES, 0);
     let n_vec = head_dim / LANES;
     // Cap at 8 to keep the register array bounded; head_dim=128
-    // (Llama-2 7B etc.) → 8 vecs. Asserts catch unsupported shapes.
-    assert!(n_vec <= 8, "head_dim {} > 128 not yet supported", head_dim);
+    // (Llama-2 7B etc.) → 8 vecs. Dispatch routes head_dim > 128 to the
+    // scalar path, which handles any width.
+    assert!(n_vec <= 8, "head_dim {} > 128 must go to the scalar path", head_dim);
 
     let qp = qd.as_ptr();
     let kp = kd.as_ptr();
@@ -358,6 +359,55 @@ mod tests {
         }
         assert!(max_err < 1e-4,
             "Llama-shape max error {} too high", max_err);
+    }
+
+    /// head_dim=256 (Gemma-class) is 16-aligned but exceeds the AVX-512
+    /// kernel's 8-register cap — dispatch must route it to the scalar
+    /// path instead of panicking.
+    #[test]
+    fn matches_reference_head_dim_over_128() {
+        let dev = Device::Cpu;
+        let n_head = 4;
+        let n_kv_head = 2;
+        let head_dim = 256;
+        let current_len = 9;
+        let inv_sqrt_d = 1.0_f32 / (head_dim as f32).sqrt();
+
+        let mk = |seed: u64, shape: &[usize]| -> Tensor {
+            let n: usize = shape.iter().product();
+            let mut x = vec![0.0_f32; n];
+            for i in 0..n {
+                let v = ((i as u64).wrapping_mul(seed).wrapping_add(1234)) & 0xff;
+                x[i] = (v as f32 / 128.0) - 1.0;
+            }
+            Tensor::from_vec(x, shape.to_vec(), &dev).unwrap()
+        };
+        let q = mk(7, &[1, n_head, 1, head_dim]);
+        let k = mk(11, &[1, n_kv_head, current_len, head_dim]);
+        let v = mk(13, &[1, n_kv_head, current_len, head_dim]);
+
+        let our = sdpa_gqa_decode(
+            &q, &k, &v, n_head, n_kv_head, head_dim, current_len,
+        ).unwrap();
+        let our_vec = our.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        let kv_repeat = n_head / n_kv_head;
+        let k_rep = candle_transformers::utils::repeat_kv(k.clone(), kv_repeat).unwrap();
+        let v_rep = candle_transformers::utils::repeat_kv(v.clone(), kv_repeat).unwrap();
+        let att = q.matmul(&k_rep.t().unwrap()).unwrap();
+        let att = (att * inv_sqrt_d as f64).unwrap();
+        let att = candle_nn::ops::softmax_last_dim(&att).unwrap();
+        let ref_out = att.matmul(&v_rep.contiguous().unwrap()).unwrap();
+        let ref_vec = ref_out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        assert_eq!(our_vec.len(), ref_vec.len());
+        let mut max_err = 0.0_f32;
+        for (a, b) in our_vec.iter().zip(ref_vec.iter()) {
+            let e = (a - b).abs();
+            if e > max_err { max_err = e; }
+        }
+        assert!(max_err < 1e-4,
+            "head_dim=256 max error {} too high", max_err);
     }
 
     /// Walks a strided narrow view (simulating what KvCache returns).
