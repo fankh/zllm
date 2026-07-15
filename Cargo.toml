@@ -80,6 +80,18 @@ half = { version = "2", optional = true }
 # environment. Profiling done via in-process timing instrumentation
 # behind the `profile` feature; see src/backend/candle/quantized_llama_fork.rs.)
 
+# Grammar-constrained decoding builds byte-DFAs (determinize + minimize)
+# at request time; unoptimized regex-automata is 10-50x slower at it, which
+# turns the two any-JSON DFA tests into multi-minute stalls in `cargo test`
+# (locally and on both CI runners). Optimize just the regex machinery in
+# dev/test builds — the zllm crate itself stays at opt-level 0 for fast
+# compiles and real debug info.
+[profile.dev.package.regex-automata]
+opt-level = 3
+
+[profile.dev.package.regex-syntax]
+opt-level = 3
+
 [profile.release]
 # Inference performance squeeze. LTO fat ~doubles release-mode build time
 # (2-4 min on a typical dev machine) but yields a tighter inner loop in the
